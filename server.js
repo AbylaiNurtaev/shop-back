@@ -12,6 +12,9 @@ const productRoutes = require('./routes/productRoutes');
 const offerRoutes = require('./routes/offerRoutes');
 const uploadRoutes = require('./routes/uploadRoutes');
 const customerRoutes = require('./routes/customerRoutes');
+const warehouseRoutes = require('./routes/warehouseRoutes');
+const posRoutes = require('./routes/posRoutes');
+const planRoutes = require('./routes/planRoutes');
 const { connectToDatabase } = require('./models/database');
 const { checkAndDisableExpiredPayments } = require('./utils/paymentExpiration');
 
@@ -35,6 +38,9 @@ app.use('/api/products', productRoutes);
 app.use('/api/offers', offerRoutes);
 app.use('/api/uploads', uploadRoutes);
 app.use('/api/customer', customerRoutes);
+app.use('/api/warehouse', warehouseRoutes);
+app.use('/api/pos', posRoutes);
+app.use('/api/plans', planRoutes);
 
 // Обработка ошибок
 app.use((err, req, res, next) => {
@@ -51,25 +57,51 @@ app.use((req, res) => {
 async function startServer() {
   try {
     await connectToDatabase();
-    
+
     // Проверяем истечение оплаты при старте сервера
-    await checkAndDisableExpiredPayments();
-    
+    try {
+      await checkAndDisableExpiredPayments();
+    } catch (error) {
+      console.warn('Ошибка при проверке истечения оплаты при старте:', error.message);
+    }
+
     // Настраиваем периодическую проверку истечения оплаты (каждый час)
     setInterval(async () => {
-      await checkAndDisableExpiredPayments();
+      try {
+        await checkAndDisableExpiredPayments();
+      } catch (error) {
+        console.warn('Ошибка при периодической проверке истечения оплаты:', error.message);
+      }
     }, 60 * 60 * 1000); // 1 час в миллисекундах
-    
+
     app.listen(PORT, () => {
       console.log(`Сервер запущен на порту ${PORT}`);
       console.log(`API доступен по адресу http://localhost:${PORT}/api`);
       console.log('Автоматическая проверка истечения оплаты товаров настроена (каждый час)');
     });
   } catch (error) {
-    console.error('Ошибка подключения к MongoDB:', error.message);
-    process.exit(1);
+    console.error('Критическая ошибка при запуске сервера:', error.message);
+    console.error('Детали ошибки:', error);
+    // Даем время для логирования перед завершением
+    setTimeout(() => {
+      process.exit(1);
+    }, 1000);
   }
 }
+
+// Обработка необработанных ошибок
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Необработанное отклонение промиса:', reason);
+  // Не завершаем процесс, чтобы сервер продолжал работать
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('Необработанное исключение:', error);
+  // Даем время для логирования перед завершением
+  setTimeout(() => {
+    process.exit(1);
+  }, 1000);
+});
 
 startServer();
 

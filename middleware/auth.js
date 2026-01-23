@@ -29,4 +29,40 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-module.exports = { authenticateToken, requireAdmin };
+function requireStoreOwner(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({ error: 'Требуется авторизация' });
+  }
+
+  if (req.user.role !== 'STORE') {
+    return res.status(403).json({ error: 'Доступ запрещен. Требуются права владельца магазина' });
+  }
+
+  next();
+}
+
+function requireSalesRep(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({ error: 'Требуется авторизация' });
+  }
+
+  if (req.user.role !== 'SALES_REPRESENTATIVE') {
+    return res.status(403).json({ error: 'Доступ запрещен. Требуются права торгового представителя' });
+  }
+
+  next();
+}
+
+function requireStoreSeller(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({ error: 'Требуется авторизация' });
+  }
+
+  if (req.user.role !== 'STORE_SELLER') {
+    return res.status(403).json({ error: 'Доступ запрещен. Требуются права продавца магазина' });
+  }
+
+  next();
+}
+
+module.exports = { authenticateToken, requireAdmin, requireStoreOwner, requireSalesRep, requireStoreSeller };

@@ -47,28 +47,143 @@ function normalizeText(value) {
   return String(value || '').trim().toLowerCase();
 }
 
+/**
+ * Транслитерация: русский -> латинский
+ */
+function transliterateToLatin(text) {
+  const map = {
+    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd',
+    'е': 'e', 'ё': 'yo', 'ж': 'zh', 'з': 'z', 'и': 'i',
+    'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n',
+    'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't',
+    'у': 'u', 'ф': 'f', 'х': 'h', 'ц': 'ts', 'ч': 'ch',
+    'ш': 'sh', 'щ': 'sch', 'ъ': '', 'ы': 'y', 'ь': '',
+    'э': 'e', 'ю': 'yu', 'я': 'ya'
+  };
+
+  return text
+    .toLowerCase()
+    .split('')
+    .map(char => map[char] || char)
+    .join('');
+}
+
+/**
+ * Транслитерация: латинский -> русский (основные варианты)
+ */
+function transliterateToCyrillic(text) {
+  const map = {
+    'a': 'а', 'b': 'б', 'v': 'в', 'g': 'г', 'd': 'д',
+    'e': 'е', 'yo': 'ё', 'zh': 'ж', 'z': 'з', 'i': 'и',
+    'y': 'й', 'k': 'к', 'l': 'л', 'm': 'м', 'n': 'н',
+    'o': 'о', 'p': 'п', 'r': 'р', 's': 'с', 't': 'т',
+    'u': 'у', 'f': 'ф', 'h': 'х', 'ts': 'ц', 'ch': 'ч',
+    'sh': 'ш', 'sch': 'щ', 'yu': 'ю', 'ya': 'я'
+  };
+
+  // Простая замена для коротких слов
+  let result = text.toLowerCase();
+  Object.entries(map).sort((a, b) => b[0].length - a[0].length).forEach(([lat, cyr]) => {
+    result = result.replace(new RegExp(lat, 'gi'), cyr);
+  });
+  return result;
+}
+
+/**
+ * Создает фонетические варианты для популярных товаров
+ * Например: "колу" -> "cola", "кока кола" -> "coca cola"
+ */
+function createPhoneticVariants(text) {
+  const normalized = normalizeText(text);
+  const variants = [];
+
+  // Популярные фонетические совпадения
+  const phoneticMap = {
+    'кола': ['cola', 'coca', 'coca cola', 'кока кола'],
+    'кока': ['coca', 'cola', 'coca cola', 'кока кола'],
+    'cola': ['кола', 'кока', 'coca', 'coca cola', 'кока кола'],
+    'coca': ['кока', 'кола', 'cola', 'coca cola', 'кока кола'],
+    'пепси': ['pepsi'],
+    'pepsi': ['пепси'],
+    'фанта': ['fanta'],
+    'fanta': ['фанта'],
+    'спрайт': ['sprite'],
+    'sprite': ['спрайт']
+  };
+
+  // Проверяем точные совпадения
+  if (phoneticMap[normalized]) {
+    variants.push(...phoneticMap[normalized]);
+  }
+
+  // Проверяем частичные совпадения
+  Object.entries(phoneticMap).forEach(([key, values]) => {
+    if (normalized.includes(key) || key.includes(normalized)) {
+      variants.push(...values);
+      variants.push(key);
+    }
+  });
+
+  return [...new Set(variants)];
+}
+
+/**
+ * Создает варианты поискового запроса с учетом транслитерации и фонетики
+ */
+function createSearchVariants(text) {
+  const normalized = normalizeText(text);
+  const variants = [normalized];
+
+  // Добавляем фонетические варианты
+  const phoneticVariants = createPhoneticVariants(text);
+  variants.push(...phoneticVariants);
+
+  // Если есть русские буквы - добавляем латинский вариант
+  if (/[а-яё]/i.test(normalized)) {
+    variants.push(transliterateToLatin(normalized));
+  }
+
+  // Если есть латинские буквы - добавляем русский вариант
+  if (/[a-z]/i.test(normalized)) {
+    variants.push(transliterateToCyrillic(normalized));
+  }
+
+  return [...new Set(variants)];
+}
+
 function extractBrandFromText(text, brands) {
   const normalized = normalizeText(text);
   return (brands || []).find(brand => normalized.includes(normalizeText(brand))) || null;
 }
 
 async function buildCandidatesByText(text) {
-  const searchTerm = normalizeText(text);
-  if (!searchTerm) return [];
-  return Product.find({
+  if (!text || !text.trim()) return [];
+
+  const searchVariants = createSearchVariants(text);
+  if (searchVariants.length === 0) return [];
+
+  // Создаем запрос с учетом всех вариантов транслитерации
+  // Используем $or для поиска по любому из вариантов
+  const searchRegex = searchVariants.map(v => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+
+  // Оптимизированный запрос - ищем по всем полям одновременно
+  const query = {
     $and: [
       {
         $or: [
-          { name: { $regex: searchTerm, $options: 'i' } },
-          { description: { $regex: searchTerm, $options: 'i' } },
-          { brandName: { $regex: searchTerm, $options: 'i' } },
-          { sku: { $regex: searchTerm, $options: 'i' } }
+          { name: { $regex: searchRegex, $options: 'i' } },
+          { description: { $regex: searchRegex, $options: 'i' } },
+          { brandName: { $regex: searchRegex, $options: 'i' } },
+          { sku: { $regex: searchRegex, $options: 'i' } }
         ]
       },
       { isPayed: true },
       { paymentExpiresAt: { $gt: new Date() } }
     ]
-  }).limit(50).lean();
+  };
+
+  // Ограничиваем количество результатов для ускорения
+  return Product.find(query).limit(30).lean();
 }
 
 function buildClarificationQuestions(products, currentIntent) {
@@ -82,7 +197,7 @@ function buildClarificationQuestions(products, currentIntent) {
     questions.push('Какой объем/тип упаковки вам нужен?');
     quickReplies.push(...packages.slice(0, 5));
   }
-  
+
   // Приоритет 2: Бренд
   if (!currentIntent.brand && brands.length > 1) {
     if (questions.length === 0) {
@@ -96,25 +211,81 @@ function buildClarificationQuestions(products, currentIntent) {
 
 function filterCandidatesByIntent(candidates, intent) {
   let filtered = [...candidates];
+
+  // Фильтрация по бренду (точное совпадение или включение)
   if (intent.brand) {
-    filtered = filtered.filter(item =>
-      item.brandName && normalizeText(item.brandName).includes(normalizeText(intent.brand))
-    );
+    const brandNormalized = normalizeText(intent.brand);
+    filtered = filtered.filter(item => {
+      if (!item.brandName) return false;
+      const itemBrand = normalizeText(item.brandName);
+      // Точное совпадение или включение
+      return itemBrand === brandNormalized || itemBrand.includes(brandNormalized) || brandNormalized.includes(itemBrand);
+    });
   }
+
+  // Фильтрация по упаковке (более гибкая)
   if (intent.packageInfo !== null && intent.packageInfo !== undefined) {
-    filtered = filtered.filter(item =>
-      item.packageInfo && normalizeText(item.packageInfo).includes(normalizeText(intent.packageInfo))
-    );
+    const packageNormalized = normalizeText(intent.packageInfo);
+    filtered = filtered.filter(item => {
+      if (!item.packageInfo) return false;
+      const itemPackage = normalizeText(item.packageInfo);
+      // Ищем совпадения по числам (0.5, 0,5, поллитра и т.д.)
+      const extractNumbers = (str) => str.replace(/[^\d.,]/g, '').replace(',', '.');
+      const itemNums = extractNumbers(itemPackage);
+      const intentNums = extractNumbers(packageNormalized);
+
+      // Если есть числа, сравниваем их
+      if (itemNums && intentNums && itemNums === intentNums) {
+        return true;
+      }
+      // Иначе обычное сравнение
+      return itemPackage === packageNormalized ||
+        itemPackage.includes(packageNormalized) ||
+        packageNormalized.includes(itemPackage);
+    });
   }
+
+  // Фильтрация по типу товара
   if (intent.type) {
-    // Фильтруем по типу товара (zero, light, обычная и т.д.)
     const typeLower = normalizeText(intent.type);
+    const typeKeywords = {
+      'zero': ['zero', 'ноль', '0', 'без сахара'],
+      'light': ['light', 'лайт', 'легкий'],
+      'diet': ['diet', 'диет', 'диетический'],
+      'обычная': ['обычная', 'классическая', 'classic', 'original']
+    };
+
+    const keywords = typeKeywords[typeLower] || [typeLower];
+
     filtered = filtered.filter(item => {
       const nameLower = normalizeText(item.name);
       const descLower = normalizeText(item.description || '');
-      return nameLower.includes(typeLower) || descLower.includes(typeLower);
+      return keywords.some(keyword => nameLower.includes(keyword) || descLower.includes(keyword));
     });
   }
+
+  // Фильтрация по типу упаковки (стекло/металл/пластик)
+  if (intent.packageType) {
+    const packageTypeLower = normalizeText(intent.packageType);
+    filtered = filtered.filter(item => {
+      const nameLower = normalizeText(item.name || '');
+      const descLower = normalizeText(item.description || '');
+      const packageInfoLower = normalizeText(item.packageInfo || '');
+      const fullText = `${nameLower} ${descLower} ${packageInfoLower}`;
+
+      if (packageTypeLower === 'glass' || packageTypeLower === 'стекло') {
+        return fullText.includes('стекл') || fullText.includes('glass');
+      }
+      if (packageTypeLower === 'can' || packageTypeLower === 'металл' || packageTypeLower === 'банка') {
+        return fullText.includes('банка') || fullText.includes('can') || fullText.includes('жест') || fullText.includes('металл');
+      }
+      if (packageTypeLower === 'plastic' || packageTypeLower === 'пластик') {
+        return fullText.includes('пласти') || fullText.includes('pet');
+      }
+      return false;
+    });
+  }
+
   return filtered;
 }
 
@@ -392,7 +563,7 @@ async function postMessage(req, res) {
     let candidates = [];
     if (intent.filters && Array.isArray(intent.filters.candidateProductIds) && intent.filters.candidateProductIds.length > 0) {
       // Используем сохраненных кандидатов из предыдущих шагов
-      candidates = await Product.find({ 
+      candidates = await Product.find({
         id: { $in: intent.filters.candidateProductIds },
         isPayed: true,
         paymentExpiresAt: { $gt: new Date() }
@@ -408,36 +579,52 @@ async function postMessage(req, res) {
       conversation.state = 'NEEDS_CLARIFICATION';
       await conversation.save();
       await intent.save();
+
+      // Сбрасываем фильтры, чтобы начать поиск заново
+      intent.filters = {};
+      intent.brand = null;
+      intent.packageInfo = null;
+      intent.type = null;
+      intent.packageType = null;
+      await intent.save();
+
       return res.json({
         state: conversation.state,
         messageId: message.id,
-        questions: ['Не нашел товар. Уточните название или бренд.'],
+        questions: ['Не нашел такой товар. Попробуйте написать название по-другому или укажите бренд.'],
         quickReplies: []
       });
     }
 
     // Пытаемся извлечь информацию из сообщения через Gemini
+    // Используем только если есть кандидаты и текст не пустой
     let geminiResult = null;
-    try {
-      geminiResult = await getIntentFromGemini({
-        message: text || '',
-        candidates: candidates.map(item => ({
+    if (text && text.trim() && candidates.length > 0) {
+      try {
+        // Ограничиваем количество кандидатов для ускорения
+        const candidatesForGemini = candidates.slice(0, 15).map(item => ({
           id: item.id,
           name: item.name,
           brandName: item.brandName,
           packageInfo: item.packageInfo,
           description: item.description,
           sku: item.sku
-        })),
-        known: {
-          brand: intent.brand || null,
-          packageInfo: intent.packageInfo !== undefined ? intent.packageInfo : null,
-          type: intent.type || null
-        }
-      });
-    } catch (error) {
-      console.error('Ошибка при получении intent от Gemini:', error);
-      geminiResult = null;
+        }));
+
+        geminiResult = await getIntentFromGemini({
+          message: text.trim(),
+          candidates: candidatesForGemini,
+          known: {
+            brand: intent.brand || null,
+            packageInfo: intent.packageInfo !== undefined ? intent.packageInfo : null,
+            type: intent.type || null,
+            packageType: intent.packageType || null
+          }
+        });
+      } catch (error) {
+        console.error('Ошибка при получении intent от Gemini:', error);
+        geminiResult = null;
+      }
     }
 
     // Обновляем intent на основе ответа Gemini
@@ -452,13 +639,17 @@ async function postMessage(req, res) {
       if (aiIntent.packageInfo !== undefined && aiIntent.packageInfo !== null) {
         intent.packageInfo = aiIntent.packageInfo;
       }
+      if (aiIntent.packageType !== undefined && aiIntent.packageType !== null) {
+        intent.packageType = aiIntent.packageType;
+      }
     }
 
     // Фильтруем кандидатов на основе текущего intent
     candidates = filterCandidatesByIntent(candidates, {
       brand: intent.brand || null,
       packageInfo: intent.packageInfo !== undefined ? intent.packageInfo : null,
-      type: intent.type || null
+      type: intent.type || null,
+      packageType: intent.packageType || null
     });
 
     // Сохраняем отфильтрованных кандидатов
@@ -472,14 +663,15 @@ async function postMessage(req, res) {
       conversation.state = 'NEEDS_CLARIFICATION';
       await intent.save();
       await conversation.save();
-      
+
       // Сбрасываем фильтры и начинаем заново
       intent.filters = {};
       intent.brand = null;
       intent.packageInfo = null;
       intent.type = null;
+      intent.packageType = null;
       await intent.save();
-      
+
       return res.json({
         state: conversation.state,
         messageId: message.id,
@@ -509,7 +701,7 @@ async function postMessage(req, res) {
 
       // Сохраняем intent и продолжаем к поиску
       await intent.save();
-      
+
       const request = await SearchRequest.create({
         id: generateId(),
         conversationId,
@@ -535,12 +727,23 @@ async function postMessage(req, res) {
       conversation.state = 'DONE';
       await conversation.save();
 
+      // Формируем сообщение о найденном товаре
+      const productName = `${candidates[0].name}${candidates[0].brandName ? ' (' + candidates[0].brandName + ')' : ''}${candidates[0].packageInfo ? ' - ' + candidates[0].packageInfo : ''}`;
+      let systemMessage = `Найден товар: ${productName}`;
+
+      if (items.length === 0) {
+        systemMessage += '\nК сожалению, в ближайших магазинах нет предложений по этому товару. Попробуйте увеличить радиус поиска или уточнить запрос.';
+      } else {
+        const totalOffers = items.reduce((sum, item) => sum + (item.offers?.length || 0), 0);
+        systemMessage += `\nНайдено предложений: ${totalOffers} в ${items.length} магазинах.`;
+      }
+
       // Добавляем ответное сообщение от системы
       await SearchMessage.create({
         id: generateId(),
         conversationId,
         sender: 'SYSTEM',
-        text: `Найден товар: ${candidates[0].name}${candidates[0].brandName ? ' (' + candidates[0].brandName + ')' : ''}${candidates[0].packageInfo ? ' - ' + candidates[0].packageInfo : ''}`
+        text: systemMessage
       });
 
       return res.json({
@@ -548,7 +751,7 @@ async function postMessage(req, res) {
         messageId: message.id,
         requestId: request.id,
         resultId: result.id,
-        items,
+        items: items.length > 0 ? items : [], // Всегда возвращаем массив, даже если пустой
         selectedProduct: {
           id: candidates[0].id,
           name: candidates[0].name,
@@ -559,7 +762,21 @@ async function postMessage(req, res) {
     }
 
     // Если товаров больше одного - генерируем умные вопросы через Gemini
-    // Цель: сузить выбор до одного товара
+    // Цель: сузить выбор до одного товара (работает как Акинатор)
+
+    // Получаем предыдущие вопросы из истории сообщений системы
+    const previousSystemMessages = await SearchMessage.find({
+      conversationId,
+      sender: 'SYSTEM'
+    })
+      .sort({ createdAt: -1 })
+      .limit(10)
+      .lean();
+
+    const previousQuestions = previousSystemMessages
+      .map(msg => msg.text)
+      .filter(text => text && text.trim().length > 0);
+
     let clarification = null;
     try {
       clarification = await generateClarificationQuestions({
@@ -574,8 +791,10 @@ async function postMessage(req, res) {
         known: {
           brand: intent.brand || null,
           packageInfo: intent.packageInfo !== undefined ? intent.packageInfo : null,
-          type: intent.type || null
-        }
+          type: intent.type || null,
+          packageType: intent.packageType || null
+        },
+        previousQuestions: previousQuestions
       });
     } catch (error) {
       console.error('Ошибка при генерации вопросов:', error);
@@ -589,25 +808,25 @@ async function postMessage(req, res) {
     conversation.state = 'NEEDS_CLARIFICATION';
     await intent.save();
     await conversation.save();
-    
-    // Добавляем ответное сообщение от системы с вопросами
+
+    // Формируем вопрос (только один, как Акинатор)
+    const question = clarification.questions.length > 0
+      ? clarification.questions[0]
+      : 'Уточните, какой именно товар вас интересует?';
+
+    // Добавляем ответное сообщение от системы с вопросом
     await SearchMessage.create({
       id: generateId(),
       conversationId,
       sender: 'SYSTEM',
-      text: clarification.questions.length > 0 
-        ? clarification.questions.join(' ')
-        : 'Уточните, какой именно товар вас интересует?'
+      text: question
     });
-    
+
     return res.json({
       state: conversation.state,
       messageId: message.id,
-      questions: clarification.questions.length > 0
-        ? clarification.questions
-        : ['Уточните, какой именно товар вас интересует?'],
-      quickReplies: clarification.quickReplies || [],
-      remainingProducts: candidates.length
+      questions: [question],
+      quickReplies: clarification.quickReplies || []
     });
   } catch (error) {
     console.error('Ошибка при обработке сообщения:', error);

@@ -120,6 +120,21 @@ salesRepresentativeStoreSchema.index(
   { unique: true }
 );
 
+const salesRepresentativeProductSchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true, unique: true },
+    salesRepresentativeId: { type: String, required: true, index: true },
+    productId: { type: String, required: true, index: true },
+    distributorId: { type: String, required: true, index: true }
+  },
+  baseSchemaOptions
+);
+
+salesRepresentativeProductSchema.index(
+  { salesRepresentativeId: 1, productId: 1 },
+  { unique: true }
+);
+
 const brandSchema = new mongoose.Schema(
   {
     id: { type: String, required: true, unique: true },
@@ -185,6 +200,43 @@ const offerSchema = new mongoose.Schema(
   },
   baseSchemaOptions
 );
+
+// Схема позиции в продаже (вложенный документ)
+const saleItemSchema = new mongoose.Schema({
+  productId: { type: String, required: true },
+  sku: { type: String, required: true },
+  productName: { type: String, required: true },
+  quantity: { type: Number, required: true, min: 1 },
+  price: { type: Number, required: true, min: 0 },
+  totalPrice: { type: Number, required: true, min: 0 },
+  currency: { type: String, required: true }
+}, { _id: false });
+
+// Схема продажи (чека)
+const saleSchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true, unique: true },
+    storeId: { type: String, required: true, index: true },
+    sellerId: { type: String, required: true, index: true }, // userId продавца
+    status: {
+      type: String,
+      required: true,
+      enum: ['DRAFT', 'COMPLETED', 'CANCELLED'],
+      default: 'DRAFT',
+      index: true
+    },
+    items: [saleItemSchema], // Массив позиций в чеке
+    totalAmount: { type: Number, required: true, default: 0, min: 0 },
+    currency: { type: String, required: true, default: 'RUB' },
+    completedAt: { type: Date, default: null }
+  },
+  baseSchemaOptions
+);
+
+// Индексы для оптимизации запросов
+saleSchema.index({ storeId: 1, createdAt: -1 });
+saleSchema.index({ storeId: 1, status: 1, createdAt: -1 });
+saleSchema.index({ sellerId: 1, createdAt: -1 });
 
 const customerSessionSchema = new mongoose.Schema(
   {
@@ -318,9 +370,9 @@ const brandDistributorRequestSchema = new mongoose.Schema(
     id: { type: String, required: true, unique: true },
     brandId: { type: String, required: true, index: true },
     distributorId: { type: String, required: true, index: true },
-    status: { 
-      type: String, 
-      required: true, 
+    status: {
+      type: String,
+      required: true,
       enum: ['PENDING', 'ACCEPTED', 'REJECTED'],
       default: 'PENDING'
     },
@@ -330,7 +382,7 @@ const brandDistributorRequestSchema = new mongoose.Schema(
 );
 
 // Уникальный индекс для предотвращения дубликатов активных запросов
-brandDistributorRequestSchema.index({ brandId: 1, distributorId: 1 }, { 
+brandDistributorRequestSchema.index({ brandId: 1, distributorId: 1 }, {
   unique: true,
   partialFilterExpression: { status: { $in: ['PENDING', 'ACCEPTED'] } }
 });
@@ -343,9 +395,9 @@ const categoryRequestSchema = new mongoose.Schema(
     description: { type: String, default: null },
     parentCategoryId: { type: String, default: null, index: true },
     parentCategoryName: { type: String, default: null }, // Для случая, когда создается новая категория
-    status: { 
-      type: String, 
-      required: true, 
+    status: {
+      type: String,
+      required: true,
       enum: ['PENDING', 'ACCEPTED', 'REJECTED'],
       default: 'PENDING',
       index: true
@@ -355,6 +407,23 @@ const categoryRequestSchema = new mongoose.Schema(
   baseSchemaOptions
 );
 
+const planSchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true, unique: true },
+    salesRepresentativeId: { type: String, required: true, index: true },
+    distributorId: { type: String, required: true, index: true },
+    targetAmount: { type: Number, required: true, min: 0 }, // План по сумме
+    targetQuantity: { type: Number, required: true, min: 0 }, // План по количеству штук
+    period: { type: String, required: true }, // Период плана (например, "2024-01", "2024-Q1", "2024")
+    description: { type: String, default: null },
+    startDate: { type: Date, default: null },
+    endDate: { type: Date, default: null }
+  },
+  baseSchemaOptions
+);
+
+planSchema.index({ salesRepresentativeId: 1, distributorId: 1, period: 1 });
+
 const User = mongoose.models.User || mongoose.model('User', userSchema);
 const Store = mongoose.models.Store || mongoose.model('Store', storeSchema);
 const Distributor =
@@ -363,10 +432,13 @@ const SalesRepresentative =
   mongoose.models.SalesRepresentative || mongoose.model('SalesRepresentative', salesRepresentativeSchema);
 const SalesRepresentativeStore =
   mongoose.models.SalesRepresentativeStore || mongoose.model('SalesRepresentativeStore', salesRepresentativeStoreSchema);
+const SalesRepresentativeProduct =
+  mongoose.models.SalesRepresentativeProduct || mongoose.model('SalesRepresentativeProduct', salesRepresentativeProductSchema);
 const Brand = mongoose.models.Brand || mongoose.model('Brand', brandSchema);
 const Category = mongoose.models.Category || mongoose.model('Category', categorySchema);
 const Product = mongoose.models.Product || mongoose.model('Product', productSchema);
 const Offer = mongoose.models.Offer || mongoose.model('Offer', offerSchema);
+const Sale = mongoose.models.Sale || mongoose.model('Sale', saleSchema);
 const CustomerSession =
   mongoose.models.CustomerSession || mongoose.model('CustomerSession', customerSessionSchema);
 const SearchConversation =
@@ -393,6 +465,8 @@ const BrandDistributorRequest =
   mongoose.models.BrandDistributorRequest || mongoose.model('BrandDistributorRequest', brandDistributorRequestSchema);
 const CategoryRequest =
   mongoose.models.CategoryRequest || mongoose.model('CategoryRequest', categoryRequestSchema);
+const Plan =
+  mongoose.models.Plan || mongoose.model('Plan', planSchema);
 
 async function seedDefaults() {
   const categoryCount = await Category.countDocuments();
@@ -438,8 +512,56 @@ async function connectToDatabase() {
     throw new Error('Переменная окружения MONGO_URL не задана');
   }
 
-  await mongoose.connect(mongoUrl);
-  await seedDefaults();
+  // Настройки подключения с увеличенными таймаутами
+  // family: 4 принудительно использует IPv4, что решает проблемы с таймаутами
+  const mongooseOptions = {
+    serverSelectionTimeoutMS: 10000, // 10 секунд на выбор сервера
+    family: 4, // Принудительно используем IPv4 (отключает IPv6)
+    socketTimeoutMS: 45000, // 45 секунд таймаут сокета
+    connectTimeoutMS: 10000, // 10 секунд на подключение
+    retryWrites: true, // Повторять записи при ошибках
+    retryReads: true, // Повторять чтения при ошибках
+  };
+
+  // Обработка событий подключения
+  mongoose.connection.on('error', (err) => {
+    console.error('Ошибка MongoDB:', err.message);
+  });
+
+  mongoose.connection.on('disconnected', () => {
+    console.warn('MongoDB отключен. Попытка переподключения...');
+  });
+
+  mongoose.connection.on('reconnected', () => {
+    console.log('MongoDB переподключен');
+  });
+
+  mongoose.connection.on('connected', () => {
+    console.log('MongoDB подключен успешно');
+  });
+
+  // Функция переподключения с retry логикой
+  let retryCount = 0;
+  const maxRetries = 5;
+  const retryDelay = 5000; // 5 секунд
+
+  while (retryCount < maxRetries) {
+    try {
+      await mongoose.connect(mongoUrl, mongooseOptions);
+      await seedDefaults();
+      return; // Успешное подключение
+    } catch (error) {
+      retryCount++;
+      console.error(`Попытка подключения ${retryCount}/${maxRetries} не удалась:`, error.message);
+
+      if (retryCount >= maxRetries) {
+        throw new Error(`Не удалось подключиться к MongoDB после ${maxRetries} попыток: ${error.message}`);
+      }
+
+      // Ждем перед следующей попыткой
+      await new Promise(resolve => setTimeout(resolve, retryDelay));
+    }
+  }
 }
 
 module.exports = {
@@ -450,10 +572,12 @@ module.exports = {
     Distributor,
     SalesRepresentative,
     SalesRepresentativeStore,
+    SalesRepresentativeProduct,
     Brand,
     Category,
     Product,
     Offer,
+    Sale,
     CustomerSession,
     SearchConversation,
     SearchMessage,
@@ -466,6 +590,7 @@ module.exports = {
     AuthCredential,
     VerificationCode,
     BrandDistributorRequest,
-    CategoryRequest
+    CategoryRequest,
+    Plan
   }
 };

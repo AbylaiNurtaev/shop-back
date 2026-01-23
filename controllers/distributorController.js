@@ -1,7 +1,7 @@
 const { generateId } = require('../utils/uuid');
 const { models } = require('../models/database');
 
-const { Distributor, User, Store, Brand, BrandDistributorRequest, SalesRepresentative, SalesRepresentativeStore } = models;
+const { Distributor, User, Store, Brand, BrandDistributorRequest, SalesRepresentative, SalesRepresentativeStore, SalesRepresentativeProduct, Product, Offer, Sale, Plan } = models;
 
 const STORE_ROLES = ['STORE', 'STORE_USER'];
 
@@ -103,7 +103,7 @@ async function getDistributorById(req, res) {
 
 async function getDistributors(req, res) {
   try {
-    const { country, city, categoryId, hasActiveStores } = req.query;
+    const { country, city, categoryId, hasActiveStores, brandId } = req.query;
     
     // Базовый запрос
     const query = {};
@@ -174,6 +174,39 @@ async function getDistributors(req, res) {
       activeStoresCount: storeCountMap[distributor.id] || 0
     }));
     
+    // Если передан brandId, группируем дистрибьюторов на прикрепленные и неприкрепленные
+    if (brandId) {
+      // Получаем все принятые запросы для данного бренда
+      const acceptedRequests = await BrandDistributorRequest.find({
+        brandId,
+        status: 'ACCEPTED'
+      }).lean();
+      
+      const attachedDistributorIds = new Set(
+        acceptedRequests.map(req => req.distributorId)
+      );
+      
+      // Разделяем дистрибьюторов на две группы
+      const attached = distributorsWithStores.filter(d => 
+        attachedDistributorIds.has(d.id)
+      );
+      const notAttached = distributorsWithStores.filter(d => 
+        !attachedDistributorIds.has(d.id)
+      );
+      
+      return res.json({
+        attached: {
+          items: attached,
+          total: attached.length
+        },
+        notAttached: {
+          items: notAttached,
+          total: notAttached.length
+        }
+      });
+    }
+    
+    // Если brandId не передан, возвращаем результат в старом формате
     res.json({
       items: distributorsWithStores,
       total: distributorsWithStores.length
@@ -241,6 +274,40 @@ async function getMyDistributor(req, res) {
     res.json(distributor);
   } catch (error) {
     res.status(500).json({ error: 'Ошибка при получении дистрибьютора' });
+  }
+}
+
+async function updateMyDistributorName(req, res) {
+  try {
+    const userId = req.user && req.user.userId;
+    if (!userId) {
+      return res.status(401).json({ error: 'Токен доступа отсутствует' });
+    }
+
+    const { name } = req.body;
+    if (!name || typeof name !== 'string' || name.trim().length === 0) {
+      return res.status(400).json({ error: 'Имя обязательно и не должно быть пустым' });
+    }
+
+    const user = await models.User.findOne({ id: userId }).lean();
+    if (!user || !user.distributorId) {
+      return res.status(404).json({ error: 'Дистрибьютор не найден' });
+    }
+
+    const distributor = await Distributor.findOneAndUpdate(
+      { id: user.distributorId },
+      { name: name.trim(), updatedAt: new Date() },
+      { new: true }
+    ).lean();
+
+    if (!distributor) {
+      return res.status(404).json({ error: 'Дистрибьютор не найден' });
+    }
+
+    res.json(distributor);
+  } catch (error) {
+    console.error('Ошибка при обновлении имени дистрибьютора:', error);
+    res.status(500).json({ error: 'Ошибка при обновлении имени дистрибьютора' });
   }
 }
 
@@ -1155,6 +1222,858 @@ async function removeDistributorStore(req, res) {
   }
 }
 
+// Получение списка товаров торгового представителя (для дистрибьютора)
+async function getSalesRepresentativeProducts(req, res) {
+  try {
+    const distributorId = req.user && req.user.distributorId;
+    const { salesRepresentativeId } = req.params;
+
+    if (!distributorId) {
+      return res.status(403).json({ error: 'Только дистрибьюторы могут просматривать товары ТП' });
+    }
+
+    if (!salesRepresentativeId) {
+      return res.status(400).json({ error: 'ID торгового представителя обязателен' });
+    }
+
+    const resolved = await resolveSalesRepresentative(distributorId, salesRepresentativeId);
+    if (!resolved.linkId) {
+      return res.status(404).json({ error: 'Торговый представитель не найден' });
+    }
+    if (!resolved.isAllowed) {
+      return res.status(404).json({ error: 'Торговый представитель не найден' });
+    }
+
+    const links = await SalesRepresentativeProduct.find({
+      salesRepresentativeId: { $in: resolved.linkIds },
+      distributorId
+    }).lean();
+
+    const productIds = links.map(link => link.productId);
+    const products = productIds.length
+      ? await Product.find({ id: { $in: productIds } }).lean()
+      : [];
+
+    res.json({
+      items: products,
+      total: products.length
+    });
+  } catch (error) {
+    console.error('Ошибка при получении товаров ТП:', error);
+    res.status(500).json({ error: 'Ошибка при получении товаров торгового представителя' });
+  }
+}
+
+// Добавление товара торговому представителю
+async function addProductToSalesRepresentative(req, res) {
+  try {
+    const distributorId = req.user && req.user.distributorId;
+    const { salesRepresentativeId } = req.params;
+    const { productId } = req.body;
+
+    if (!distributorId) {
+      return res.status(403).json({ error: 'Только дистрибьюторы могут добавлять товары ТП' });
+    }
+
+    if (!salesRepresentativeId || !productId) {
+      return res.status(400).json({ error: 'ID торгового представителя и ID товара обязательны' });
+    }
+
+    const resolved = await resolveSalesRepresentative(distributorId, salesRepresentativeId);
+    if (!resolved.linkId) {
+      return res.status(404).json({ error: 'Торговый представитель не найден' });
+    }
+    if (!resolved.isAllowed) {
+      return res.status(404).json({ error: 'Торговый представитель не найден' });
+    }
+
+    const product = await Product.findOne({ id: productId }).lean();
+    if (!product) {
+      return res.status(404).json({ error: 'Товар не найден' });
+    }
+
+    // Проверяем, что товар принадлежит бренду, подключенному к дистрибьютору
+    const brandDistributorConnection = await BrandDistributorRequest.findOne({
+      brandId: product.brandId,
+      distributorId,
+      status: 'ACCEPTED'
+    }).lean();
+
+    if (!brandDistributorConnection) {
+      return res.status(403).json({ error: 'Товар принадлежит бренду, не подключенному к этому дистрибьютору' });
+    }
+
+    const existingLink = await SalesRepresentativeProduct.findOne({
+      salesRepresentativeId: { $in: resolved.linkIds },
+      productId
+    }).lean();
+
+    if (existingLink) {
+      return res.status(409).json({ error: 'Товар уже закреплен за этим ТП' });
+    }
+
+    const link = await SalesRepresentativeProduct.create({
+      id: generateId(),
+      salesRepresentativeId: resolved.linkId,
+      productId,
+      distributorId
+    });
+
+    res.status(201).json({
+      message: 'Товар успешно добавлен торговому представителю',
+      link: link.toObject()
+    });
+  } catch (error) {
+    console.error('Ошибка при добавлении товара ТП:', error);
+    res.status(500).json({ error: 'Ошибка при добавлении товара торговому представителю' });
+  }
+}
+
+// Массовое добавление товаров торговому представителю
+async function addProductsToSalesRepresentative(req, res) {
+  try {
+    const distributorId = req.user && req.user.distributorId;
+    const { salesRepresentativeId } = req.params;
+    const { productIds } = req.body;
+
+    if (!distributorId) {
+      return res.status(403).json({ error: 'Только дистрибьюторы могут добавлять товары ТП' });
+    }
+
+    if (!salesRepresentativeId) {
+      return res.status(400).json({ error: 'ID торгового представителя обязателен' });
+    }
+
+    if (!productIds || !Array.isArray(productIds) || productIds.length === 0) {
+      return res.status(400).json({ error: 'Массив productIds обязателен и не должен быть пустым' });
+    }
+
+    const resolved = await resolveSalesRepresentative(distributorId, salesRepresentativeId);
+    if (!resolved.linkId) {
+      return res.status(404).json({ error: 'Торговый представитель не найден' });
+    }
+    if (!resolved.isAllowed) {
+      return res.status(404).json({ error: 'Торговый представитель не найден' });
+    }
+
+    // Проверяем существование всех товаров
+    const products = await Product.find({ id: { $in: productIds } }).lean();
+    const foundProductIds = new Set(products.map(p => p.id));
+    const notFoundProductIds = productIds.filter(id => !foundProductIds.has(id));
+
+    if (notFoundProductIds.length > 0) {
+      return res.status(404).json({ 
+        error: 'Некоторые товары не найдены',
+        notFoundProductIds 
+      });
+    }
+
+    // Проверяем, что все товары принадлежат брендам, подключенным к дистрибьютору
+    const brandIds = Array.from(new Set(products.map(p => p.brandId)));
+    const brandDistributorConnections = await BrandDistributorRequest.find({
+      brandId: { $in: brandIds },
+      distributorId,
+      status: 'ACCEPTED'
+    }).lean();
+
+    const allowedBrandIds = new Set(brandDistributorConnections.map(conn => conn.brandId));
+    const notAllowedProducts = products.filter(p => !allowedBrandIds.has(p.brandId));
+
+    if (notAllowedProducts.length > 0) {
+      return res.status(403).json({ 
+        error: 'Некоторые товары принадлежат брендам, не подключенным к этому дистрибьютору',
+        notAllowedProductIds: notAllowedProducts.map(p => p.id)
+      });
+    }
+
+    // Проверяем существующие связи
+    const existingLinks = await SalesRepresentativeProduct.find({
+      salesRepresentativeId: { $in: resolved.linkIds },
+      productId: { $in: productIds },
+      distributorId
+    }).lean();
+
+    const existingProductIds = new Set(existingLinks.map(link => link.productId));
+    const newProductIds = productIds.filter(id => !existingProductIds.has(id));
+
+    if (newProductIds.length === 0) {
+      return res.status(409).json({ 
+        error: 'Все указанные товары уже закреплены за этим ТП',
+        alreadyAssigned: Array.from(existingProductIds)
+      });
+    }
+
+    // Создаем новые связи
+    const links = await Promise.all(
+      newProductIds.map(productId =>
+        SalesRepresentativeProduct.create({
+          id: generateId(),
+          salesRepresentativeId: resolved.linkId,
+          productId,
+          distributorId
+        })
+      )
+    );
+
+    res.status(201).json({
+      message: 'Товары успешно добавлены торговому представителю',
+      added: links.map(link => link.toObject()),
+      alreadyAssigned: Array.from(existingProductIds),
+      totalAdded: links.length,
+      totalSkipped: existingProductIds.size
+    });
+  } catch (error) {
+    console.error('Ошибка при массовом добавлении товаров ТП:', error);
+    res.status(500).json({ error: 'Ошибка при массовом добавлении товаров торговому представителю' });
+  }
+}
+
+// Удаление товара у торгового представителя
+async function removeProductFromSalesRepresentative(req, res) {
+  try {
+    const distributorId = req.user && req.user.distributorId;
+    const { salesRepresentativeId, productId } = req.params;
+
+    if (!distributorId) {
+      return res.status(403).json({ error: 'Только дистрибьюторы могут удалять товары ТП' });
+    }
+
+    if (!salesRepresentativeId || !productId) {
+      return res.status(400).json({ error: 'ID торгового представителя и ID товара обязательны' });
+    }
+
+    const resolved = await resolveSalesRepresentative(distributorId, salesRepresentativeId);
+    if (!resolved.linkId) {
+      return res.status(404).json({ error: 'Торговый представитель не найден' });
+    }
+    if (!resolved.isAllowed) {
+      return res.status(404).json({ error: 'Торговый представитель не найден' });
+    }
+
+    const link = await SalesRepresentativeProduct.findOne({
+      salesRepresentativeId: { $in: resolved.linkIds },
+      productId,
+      distributorId
+    }).lean();
+
+    if (!link) {
+      return res.status(404).json({ error: 'Связь товара и ТП не найдена' });
+    }
+
+    await SalesRepresentativeProduct.deleteOne({ id: link.id });
+
+    res.json({
+      message: 'Товар успешно откреплен от торгового представителя'
+    });
+  } catch (error) {
+    console.error('Ошибка при удалении товара ТП:', error);
+    res.status(500).json({ error: 'Ошибка при удалении товара торгового представителя' });
+  }
+}
+
+// Получение товаров от подключенных брендов (для дистрибьютора)
+async function getDistributorProducts(req, res) {
+  try {
+    // Проверяем и отключаем товары с истекшей оплатой перед получением списка
+    const { checkAndDisableExpiredPayments } = require('../utils/paymentExpiration');
+    await checkAndDisableExpiredPayments();
+
+    const distributorId = req.user && req.user.distributorId;
+    const { brandId } = req.query;
+
+    if (!distributorId) {
+      return res.status(403).json({ error: 'Только дистрибьюторы могут просматривать товары подключенных брендов' });
+    }
+
+    // Получаем все бренды, подключенные к дистрибьютору
+    const brandDistributorConnections = await BrandDistributorRequest.find({
+      distributorId,
+      status: 'ACCEPTED'
+    }).lean();
+
+    const allowedBrandIds = brandDistributorConnections.map(conn => conn.brandId);
+
+    if (allowedBrandIds.length === 0) {
+      return res.json({
+        items: [],
+        total: 0,
+        message: 'Нет подключенных брендов'
+      });
+    }
+
+    // Фильтруем товары по разрешенным брендам
+    let query = {
+      brandId: { $in: allowedBrandIds },
+      isPayed: true,
+      paymentExpiresAt: { $gt: new Date() }
+    };
+
+    // Если указан конкретный brandId, проверяем, что он в списке разрешенных
+    if (brandId) {
+      if (!allowedBrandIds.includes(brandId)) {
+        return res.status(403).json({
+          error: 'Указанный бренд не подключен к вашему дистрибьютору'
+        });
+      }
+      query.brandId = brandId;
+    }
+
+    const products = await Product.find(query).lean();
+
+    res.json({
+      items: products,
+      total: products.length
+    });
+  } catch (error) {
+    console.error('Ошибка при получении товаров дистрибьютора:', error);
+    res.status(500).json({ error: 'Ошибка при получении товаров дистрибьютора' });
+  }
+}
+
+// ========== АНАЛИТИКА ДИСТРИБЬЮТОРА ==========
+
+// Общая статистика (количество магазинов, торговых представителей, товаров)
+async function getDistributorAnalyticsSummary(req, res) {
+  try {
+    const distributorId = req.user && req.user.distributorId;
+    
+    if (!distributorId) {
+      return res.status(403).json({ error: 'Только дистрибьюторы могут просматривать аналитику' });
+    }
+
+    // Количество магазинов
+    const storesCount = await User.countDocuments({
+      distributorId,
+      role: { $in: STORE_ROLES },
+      isActive: true
+    });
+
+    // Количество торговых представителей
+    const salesRepsCount = await User.countDocuments({
+      distributorId,
+      role: 'SALES_REPRESENTATIVE',
+      isActive: true
+    });
+
+    // Всего товаров (из подключенных брендов)
+    const brandDistributorConnections = await BrandDistributorRequest.find({
+      distributorId,
+      status: 'ACCEPTED'
+    }).lean();
+
+    const allowedBrandIds = brandDistributorConnections.map(conn => conn.brandId);
+    const productsCount = allowedBrandIds.length > 0
+      ? await Product.countDocuments({
+          brandId: { $in: allowedBrandIds },
+          isPayed: true,
+          paymentExpiresAt: { $gt: new Date() }
+        })
+      : 0;
+
+    res.json({
+      storesCount,
+      salesRepresentativesCount: salesRepsCount,
+      totalProducts: productsCount
+    });
+  } catch (error) {
+    console.error('Ошибка при получении общей статистики:', error);
+    res.status(500).json({ error: 'Ошибка при получении общей статистики' });
+  }
+}
+
+// Остатки по магазинам (детальная информация об остатках товаров в каждом магазине)
+async function getDistributorStockByStores(req, res) {
+  try {
+    const distributorId = req.user && req.user.distributorId;
+    
+    if (!distributorId) {
+      return res.status(403).json({ error: 'Только дистрибьюторы могут просматривать остатки' });
+    }
+
+    // Получаем все магазины дистрибьютора
+    const storeUsers = await User.find({
+      distributorId,
+      role: { $in: STORE_ROLES },
+      isActive: true
+    }).lean();
+
+    const storeIds = Array.from(new Set(storeUsers.map(user => user.storeId).filter(Boolean)));
+    
+    if (storeIds.length === 0) {
+      return res.json({
+        items: [],
+        total: 0
+      });
+    }
+
+    // Получаем информацию о магазинах
+    const stores = await Store.find({ id: { $in: storeIds } }).lean();
+    const storeById = new Map(stores.map(s => [s.id, s]));
+
+    // Получаем все офферы для этих магазинов
+    const offers = await Offer.find({ storeId: { $in: storeIds } }).lean();
+    
+    // Получаем информацию о товарах
+    const productIds = [...new Set(offers.map(offer => offer.productId))];
+    const products = productIds.length > 0
+      ? await Product.find({ id: { $in: productIds } }).lean()
+      : [];
+    const productById = new Map(products.map(p => [p.id, p]));
+
+    // Группируем по магазинам
+    const stockByStore = new Map();
+    
+    storeIds.forEach(storeId => {
+      const store = storeById.get(storeId);
+      if (store) {
+        stockByStore.set(storeId, {
+          storeId: store.id,
+          storeName: store.name,
+          storeAddress: store.address,
+          items: [],
+          totalItems: 0,
+          totalQuantity: 0,
+          totalValue: 0
+        });
+      }
+    });
+
+    // Обрабатываем офферы
+    offers.forEach(offer => {
+      const storeStock = stockByStore.get(offer.storeId);
+      if (!storeStock) return;
+
+      const product = productById.get(offer.productId);
+      if (!product) return;
+
+      const item = {
+        offerId: offer.id,
+        productId: product.id,
+        productName: product.name,
+        sku: product.sku,
+        brandName: product.brandName || null,
+        quantity: offer.quantity || 0,
+        price: offer.price || 0,
+        currency: offer.currency || 'RUB',
+        value: (offer.quantity || 0) * (offer.price || 0),
+        isAvailable: offer.isAvailable
+      };
+
+      storeStock.items.push(item);
+      storeStock.totalItems += 1;
+      storeStock.totalQuantity += item.quantity;
+      storeStock.totalValue += item.value;
+    });
+
+    // Сортируем по общему количеству товаров (убывание)
+    const result = Array.from(stockByStore.values())
+      .sort((a, b) => b.totalQuantity - a.totalQuantity)
+      .map(store => ({
+        ...store,
+        items: store.items.sort((a, b) => b.quantity - a.quantity)
+      }));
+
+    res.json({
+      items: result,
+      total: result.length
+    });
+  } catch (error) {
+    console.error('Ошибка при получении остатков по магазинам:', error);
+    res.status(500).json({ error: 'Ошибка при получении остатков по магазинам' });
+  }
+}
+
+// Оборот (по магазину, по бренду, по товару)
+async function getDistributorTurnover(req, res) {
+  try {
+    const distributorId = req.user && req.user.distributorId;
+    const { type, startDate, endDate } = req.query; // type: 'store', 'brand', 'product'
+    
+    if (!distributorId) {
+      return res.status(403).json({ error: 'Только дистрибьюторы могут просматривать оборот' });
+    }
+
+    // Получаем все магазины дистрибьютора
+    const storeUsers = await User.find({
+      distributorId,
+      role: { $in: STORE_ROLES },
+      isActive: true
+    }).lean();
+
+    const storeIds = Array.from(new Set(storeUsers.map(user => user.storeId).filter(Boolean)));
+    
+    if (storeIds.length === 0) {
+      return res.json({
+        type: type || 'store',
+        period: {
+          startDate: startDate || null,
+          endDate: endDate || null
+        },
+        items: [],
+        total: 0,
+        summary: {
+          totalRevenue: 0,
+          totalSales: 0,
+          totalQuantity: 0
+        }
+      });
+    }
+
+    // Парсим даты
+    let start = startDate ? new Date(startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    let end = endDate ? new Date(endDate) : new Date();
+    start.setHours(0, 0, 0, 0);
+    end.setHours(23, 59, 59, 999);
+
+    // Получаем завершенные продажи
+    const allSales = await Sale.find({
+      storeId: { $in: storeIds },
+      status: 'COMPLETED'
+    }).lean();
+
+    // Фильтруем по дате: используем completedAt, если он есть, иначе createdAt
+    const sales = allSales.filter(sale => {
+      const saleDate = sale.completedAt ? new Date(sale.completedAt) : new Date(sale.createdAt);
+      return saleDate >= start && saleDate <= end;
+    });
+
+    // Получаем информацию о товарах и брендах
+    const productIds = new Set();
+    sales.forEach(sale => {
+      if (sale.items) {
+        sale.items.forEach(item => {
+          productIds.add(item.productId);
+        });
+      }
+    });
+
+    const products = productIds.size
+      ? await Product.find({ id: { $in: Array.from(productIds) } }).lean()
+      : [];
+    const productById = new Map(products.map(p => [p.id, p]));
+
+    // Получаем информацию о магазинах
+    const stores = await Store.find({ id: { $in: storeIds } }).lean();
+    const storeById = new Map(stores.map(s => [s.id, s]));
+
+    // Общая статистика
+    let totalRevenue = 0;
+    let totalSales = sales.length;
+    let totalQuantity = 0;
+
+    sales.forEach(sale => {
+      totalRevenue += sale.totalAmount || 0;
+      if (sale.items) {
+        sale.items.forEach(item => {
+          totalQuantity += item.quantity || 0;
+        });
+      }
+    });
+
+    // Агрегация по типу
+    let items = [];
+
+    if (type === 'brand') {
+      // Оборот по брендам
+      const brandStats = new Map();
+
+      sales.forEach(sale => {
+        if (sale.items) {
+          sale.items.forEach(item => {
+            const product = productById.get(item.productId);
+            if (!product) return;
+
+            const brandId = product.brandId;
+            if (!brandStats.has(brandId)) {
+              brandStats.set(brandId, {
+                brandId,
+                brandName: product.brandName || 'Неизвестный бренд',
+                totalRevenue: 0,
+                totalSales: 0,
+                totalQuantity: 0
+              });
+            }
+
+            const stat = brandStats.get(brandId);
+            stat.totalRevenue += item.totalPrice || 0;
+            stat.totalSales += 1;
+            stat.totalQuantity += item.quantity || 0;
+          });
+        }
+      });
+
+      items = Array.from(brandStats.values())
+        .sort((a, b) => b.totalRevenue - a.totalRevenue);
+
+    } else if (type === 'product') {
+      // Оборот по товарам
+      const productStats = new Map();
+
+      sales.forEach(sale => {
+        if (sale.items) {
+          sale.items.forEach(item => {
+            const product = productById.get(item.productId);
+            if (!product) return;
+
+            if (!productStats.has(item.productId)) {
+              productStats.set(item.productId, {
+                productId: product.id,
+                productName: product.name,
+                sku: product.sku,
+                brandName: product.brandName || null,
+                totalRevenue: 0,
+                totalSales: 0,
+                totalQuantity: 0
+              });
+            }
+
+            const stat = productStats.get(item.productId);
+            stat.totalRevenue += item.totalPrice || 0;
+            stat.totalSales += 1;
+            stat.totalQuantity += item.quantity || 0;
+          });
+        }
+      });
+
+      items = Array.from(productStats.values())
+        .sort((a, b) => b.totalRevenue - a.totalRevenue);
+
+    } else {
+      // Оборот по магазинам (по умолчанию)
+      const storeStats = new Map();
+
+      storeIds.forEach(storeId => {
+        const store = storeById.get(storeId);
+        if (store) {
+          storeStats.set(storeId, {
+            storeId: store.id,
+            storeName: store.name,
+            storeAddress: store.address,
+            totalRevenue: 0,
+            totalSales: 0,
+            totalQuantity: 0
+          });
+        }
+      });
+
+      sales.forEach(sale => {
+        const stat = storeStats.get(sale.storeId);
+        if (stat) {
+          stat.totalRevenue += sale.totalAmount || 0;
+          stat.totalSales += 1;
+          if (sale.items) {
+            sale.items.forEach(item => {
+              stat.totalQuantity += item.quantity || 0;
+            });
+          }
+        }
+      });
+
+      items = Array.from(storeStats.values())
+        .sort((a, b) => b.totalRevenue - a.totalRevenue);
+    }
+
+    res.json({
+      type: type || 'store',
+      period: {
+        startDate: start.toISOString(),
+        endDate: end.toISOString()
+      },
+      items,
+      total: items.length,
+      summary: {
+        totalRevenue,
+        totalSales,
+        totalQuantity
+      }
+    });
+  } catch (error) {
+    console.error('Ошибка при получении оборота:', error);
+    res.status(500).json({ error: 'Ошибка при получении оборота' });
+  }
+}
+
+// KPI торговых представителей
+async function getDistributorSalesRepKPI(req, res) {
+  try {
+    const distributorId = req.user && req.user.distributorId;
+    const { period, startDate, endDate } = req.query; // period: 'month', 'quarter', 'year' или custom dates
+    
+    if (!distributorId) {
+      return res.status(403).json({ error: 'Только дистрибьюторы могут просматривать KPI торговых представителей' });
+    }
+
+    // Получаем всех торговых представителей дистрибьютора
+    const salesReps = await User.find({
+      distributorId,
+      role: 'SALES_REPRESENTATIVE',
+      isActive: true
+    }).lean();
+
+    if (salesReps.length === 0) {
+      return res.json({
+        items: [],
+        total: 0
+      });
+    }
+
+    // Получаем магазины, закрепленные за торговыми представителями
+    const salesRepIds = salesReps.map(rep => rep.id);
+    const links = await SalesRepresentativeStore.find({
+      distributorId,
+      salesRepresentativeId: { $in: salesRepIds }
+    }).lean();
+
+    // Группируем магазины по торговым представителям
+    const storesBySalesRep = new Map();
+    links.forEach(link => {
+      if (!storesBySalesRep.has(link.salesRepresentativeId)) {
+        storesBySalesRep.set(link.salesRepresentativeId, []);
+      }
+      storesBySalesRep.get(link.salesRepresentativeId).push(link.storeId);
+    });
+
+    // Определяем период для анализа
+    let start, end;
+    if (startDate && endDate) {
+      start = new Date(startDate);
+      end = new Date(endDate);
+    } else if (period === 'month') {
+      start = new Date();
+      start.setDate(1);
+      start.setHours(0, 0, 0, 0);
+      end = new Date();
+    } else if (period === 'quarter') {
+      const quarter = Math.floor(new Date().getMonth() / 3);
+      start = new Date(new Date().getFullYear(), quarter * 3, 1);
+      start.setHours(0, 0, 0, 0);
+      end = new Date();
+    } else if (period === 'year') {
+      start = new Date(new Date().getFullYear(), 0, 1);
+      start.setHours(0, 0, 0, 0);
+      end = new Date();
+    } else {
+      // По умолчанию - текущий месяц
+      start = new Date();
+      start.setDate(1);
+      start.setHours(0, 0, 0, 0);
+      end = new Date();
+    }
+    end.setHours(23, 59, 59, 999);
+
+    // Получаем планы для торговых представителей
+    const plans = await Plan.find({
+      distributorId,
+      salesRepresentativeId: { $in: salesRepIds }
+    }).lean();
+
+    // Группируем планы по торговым представителям
+    const plansBySalesRep = new Map();
+    plans.forEach(plan => {
+      if (!plansBySalesRep.has(plan.salesRepresentativeId)) {
+        plansBySalesRep.set(plan.salesRepresentativeId, []);
+      }
+      plansBySalesRep.get(plan.salesRepresentativeId).push(plan);
+    });
+
+    // Получаем продажи для магазинов торговых представителей
+    const allStoreIds = Array.from(new Set(links.map(link => link.storeId)));
+    const allSales = allStoreIds.length > 0
+      ? await Sale.find({
+          storeId: { $in: allStoreIds },
+          status: 'COMPLETED'
+        }).lean()
+      : [];
+
+    // Фильтруем по дате: используем completedAt, если он есть, иначе createdAt
+    const sales = allSales.filter(sale => {
+      const saleDate = sale.completedAt ? new Date(sale.completedAt) : new Date(sale.createdAt);
+      return saleDate >= start && saleDate <= end;
+    });
+
+    // Группируем продажи по магазинам
+    const salesByStore = new Map();
+    sales.forEach(sale => {
+      if (!salesByStore.has(sale.storeId)) {
+        salesByStore.set(sale.storeId, []);
+      }
+      salesByStore.get(sale.storeId).push(sale);
+    });
+
+    // Вычисляем KPI для каждого торгового представителя
+    const kpiItems = salesReps.map(salesRep => {
+      const storeIds = storesBySalesRep.get(salesRep.id) || [];
+      const repPlans = plansBySalesRep.get(salesRep.id) || [];
+
+      // Собираем все продажи из магазинов торгового представителя
+      let totalRevenue = 0;
+      let totalSales = 0;
+      let totalQuantity = 0;
+
+      storeIds.forEach(storeId => {
+        const storeSales = salesByStore.get(storeId) || [];
+        storeSales.forEach(sale => {
+          totalRevenue += sale.totalAmount || 0;
+          totalSales += 1;
+          if (sale.items) {
+            sale.items.forEach(item => {
+              totalQuantity += item.quantity || 0;
+            });
+          }
+        });
+      });
+
+      // Находим актуальный план (если есть)
+      const currentPlan = repPlans.find(plan => {
+        const planStart = plan.startDate ? new Date(plan.startDate) : null;
+        const planEnd = plan.endDate ? new Date(plan.endDate) : null;
+        if (planStart && planEnd) {
+          return start >= planStart && end <= planEnd;
+        }
+        return false;
+      }) || repPlans[0] || null;
+
+      // Вычисляем процент выполнения плана
+      let planCompletionPercent = null;
+      if (currentPlan && currentPlan.targetAmount > 0) {
+        planCompletionPercent = Math.round((totalRevenue / currentPlan.targetAmount) * 100 * 100) / 100;
+      }
+
+      return {
+        salesRepresentativeId: salesRep.id,
+        salesRepresentativeName: salesRep.firstName || salesRep.email,
+        email: salesRep.email,
+        storesCount: storeIds.length,
+        totalRevenue,
+        totalSales,
+        totalQuantity,
+        plan: currentPlan ? {
+          id: currentPlan.id,
+          targetAmount: currentPlan.targetAmount,
+          targetQuantity: currentPlan.targetQuantity,
+          period: currentPlan.period
+        } : null,
+        planCompletionPercent: planCompletionPercent !== null ? Math.round(planCompletionPercent * 100) / 100 : null
+      };
+    });
+
+    // Сортируем по выручке (убывание)
+    kpiItems.sort((a, b) => b.totalRevenue - a.totalRevenue);
+
+    res.json({
+      period: {
+        startDate: start.toISOString(),
+        endDate: end.toISOString()
+      },
+      items: kpiItems,
+      total: kpiItems.length
+    });
+  } catch (error) {
+    console.error('Ошибка при получении KPI торговых представителей:', error);
+    res.status(500).json({ error: 'Ошибка при получении KPI торговых представителей' });
+  }
+}
+
 module.exports = {
   createDistributor,
   getDistributorById,
@@ -1162,6 +2081,7 @@ module.exports = {
   updateDistributor,
   deleteDistributor,
   getMyDistributor,
+  updateMyDistributorName,
   sendConnectionRequest,
   getConnectionRequests,
   acceptConnectionRequest,
@@ -1176,6 +2096,15 @@ module.exports = {
   getMySalesRepresentativeStores,
   getDistributorStores,
   addDistributorStore,
-  removeDistributorStore
+  removeDistributorStore,
+  getSalesRepresentativeProducts,
+  addProductToSalesRepresentative,
+  addProductsToSalesRepresentative,
+  removeProductFromSalesRepresentative,
+  getDistributorProducts,
+  getDistributorAnalyticsSummary,
+  getDistributorStockByStores,
+  getDistributorTurnover,
+  getDistributorSalesRepKPI
 };
 

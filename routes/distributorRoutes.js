@@ -8,6 +8,7 @@ const {
   updateDistributor,
   deleteDistributor,
   getMyDistributor,
+  updateMyDistributorName,
   sendConnectionRequest,
   getConnectionRequests,
   acceptConnectionRequest,
@@ -22,7 +23,16 @@ const {
   getMySalesRepresentativeStores,
   getDistributorStores,
   addDistributorStore,
-  removeDistributorStore
+  removeDistributorStore,
+  getSalesRepresentativeProducts,
+  addProductToSalesRepresentative,
+  addProductsToSalesRepresentative,
+  removeProductFromSalesRepresentative,
+  getDistributorProducts,
+  getDistributorAnalyticsSummary,
+  getDistributorStockByStores,
+  getDistributorTurnover,
+  getDistributorSalesRepKPI
 } = require('../controllers/distributorController');
 
 router.post('/', createDistributor);
@@ -34,8 +44,16 @@ router.use(authenticateToken);
 
 // Эндпоинты для дистрибьюторов
 router.get('/me', getMyDistributor);
+router.put('/me/name', updateMyDistributorName);
 router.get('/me/sales-representatives', getSalesRepresentatives);
 router.get('/me/stores', getDistributorStores);
+router.get('/me/products', getDistributorProducts);
+
+// Эндпоинты аналитики
+router.get('/me/analytics/summary', getDistributorAnalyticsSummary);
+router.get('/me/analytics/stock-by-stores', getDistributorStockByStores);
+router.get('/me/analytics/turnover', getDistributorTurnover);
+router.get('/me/analytics/sales-rep-kpi', getDistributorSalesRepKPI);
 router.get('/sales-representatives/me/stores', getMySalesRepresentativeStores);
 router.get('/requests', getConnectionRequests);
 router.post('/requests/:requestId/accept', acceptConnectionRequest);
@@ -46,6 +64,10 @@ router.get('/sales-representatives/:salesRepresentativeId/stores', getSalesRepre
 router.post('/sales-representatives/:salesRepresentativeId/stores', addStoreToSalesRepresentative);
 router.post('/sales-representatives/:salesRepresentativeId/stores/batch', addStoresToSalesRepresentative);
 router.delete('/sales-representatives/:salesRepresentativeId/stores/:storeId', removeStoreFromSalesRepresentative);
+router.get('/sales-representatives/:salesRepresentativeId/products', getSalesRepresentativeProducts);
+router.post('/sales-representatives/:salesRepresentativeId/products', addProductToSalesRepresentative);
+router.post('/sales-representatives/:salesRepresentativeId/products/batch', addProductsToSalesRepresentative);
+router.delete('/sales-representatives/:salesRepresentativeId/products/:productId', removeProductFromSalesRepresentative);
 router.post('/stores', addDistributorStore);
 router.delete('/stores/:storeId', removeDistributorStore);
 

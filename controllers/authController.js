@@ -4,7 +4,7 @@ const { models } = require('../models/database');
 const { generateId } = require('../utils/uuid');
 const { sendEmail } = require('../utils/email');
 
-const { AuthCredential, User, VerificationCode, Brand, Distributor, SalesRepresentative } = models;
+const { AuthCredential, User, VerificationCode, Brand, Distributor, SalesRepresentative, Store } = models;
 
 async function login(req, res) {
   try {
@@ -87,6 +87,19 @@ async function login(req, res) {
       }
     }
 
+    // Если это продавец магазина, пытаемся найти связанный магазин по storeId,
+    // чтобы вернуть storeId и storeName на фронт
+    let storeInfo = null;
+    if ((user.role === 'STORE' || user.role === 'STORE_USER') && user.storeId) {
+      const store = await Store.findOne({ id: user.storeId }).lean();
+      if (store) {
+        storeInfo = {
+          storeId: store.id,
+          storeName: store.name
+        };
+      }
+    }
+
     // Генерируем токены
     const payload = {
       login,
@@ -94,7 +107,8 @@ async function login(req, res) {
       role: user.role,
       ...(brandInfo ? { brandId: brandInfo.brandId } : {}),
       ...(distributorInfo ? { distributorId: distributorInfo.distributorId } : {}),
-      ...(salesRepresentativeInfo ? { salesRepresentativeId: salesRepresentativeInfo.salesRepresentativeId } : {})
+      ...(salesRepresentativeInfo ? { salesRepresentativeId: salesRepresentativeInfo.salesRepresentativeId } : {}),
+      ...(storeInfo ? { storeId: storeInfo.storeId } : {})
     };
     const accessToken = generateAccessToken(payload);
     const refreshToken = generateRefreshToken(payload);
@@ -109,7 +123,8 @@ async function login(req, res) {
         email: user.email,
         ...(brandInfo ? { brandId: brandInfo.brandId, brandName: brandInfo.brandName } : {}),
         ...(distributorInfo ? { distributorId: distributorInfo.distributorId, distributorName: distributorInfo.distributorName } : {}),
-        ...(salesRepresentativeInfo ? { salesRepresentativeId: salesRepresentativeInfo.salesRepresentativeId, salesRepresentativeName: salesRepresentativeInfo.salesRepresentativeName } : {})
+        ...(salesRepresentativeInfo ? { salesRepresentativeId: salesRepresentativeInfo.salesRepresentativeId, salesRepresentativeName: salesRepresentativeInfo.salesRepresentativeName } : {}),
+        ...(storeInfo ? { storeId: storeInfo.storeId, storeName: storeInfo.storeName } : {})
       }
     });
   } catch (error) {
@@ -602,4 +617,127 @@ async function registerSalesRepresentative(req, res) {
   }
 }
 
-module.exports = { login, registerAdmin, sendVerificationCode, verifyCode, registerDistributor, registerSalesRepresentative };
+// Регистрация продавца магазина
+async function registerStoreSeller(req, res) {
+  let createdUserId = null;
+  let email = null;
+
+  try {
+    const { email: emailParam, password, name, storeId } = req.body;
+    email = emailParam;
+
+    // Валидация обязательных полей
+    if (!name || !email || !password || !storeId) {
+      return res.status(400).json({
+        error: 'Отсутствуют обязательные поля: name, email, password, storeId'
+      });
+    }
+
+    // Проверяем формат email
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ error: 'Некорректный формат email' });
+    }
+
+    // Проверяем существование магазина
+    const store = await Store.findOne({ id: storeId }).lean();
+    if (!store) {
+      return res.status(404).json({ error: 'Магазин не найден' });
+    }
+
+    // Проверяем, что email ещё не занят
+    const existingUser = await User.findOne({ email }).lean();
+    if (existingUser) {
+      return res.status(409).json({
+        error: 'Пользователь с таким email уже существует',
+        code: 'EMAIL_ALREADY_EXISTS'
+      });
+    }
+
+    // Проверяем наличие "висячих" учетных данных
+    const existingCredential = await AuthCredential.findOne({ login: email }).lean();
+    if (existingCredential) {
+      await AuthCredential.deleteOne({ login: email });
+    }
+
+    const userId = generateId();
+    createdUserId = userId;
+
+    // Создаем пользователя продавца магазина (кассира)
+    try {
+      await User.create({
+        id: userId,
+        role: 'STORE_SELLER',
+        email,
+        firstName: name,
+        storeId: storeId,
+        distributorId: null,
+        isActive: true
+      });
+    } catch (userError) {
+      if (userError.code === 11000 || userError.message.includes('duplicate')) {
+        return res.status(409).json({
+          error: 'Пользователь с таким email уже существует',
+          code: 'EMAIL_ALREADY_EXISTS'
+        });
+      }
+      throw userError;
+    }
+
+    // Создаем учетные данные
+    try {
+      await AuthCredential.create({
+        login: email,
+        password: hashPassword(password)
+      });
+    } catch (credError) {
+      if (credError.code === 11000 || credError.message.includes('duplicate')) {
+        await User.deleteOne({ id: userId });
+        return res.status(409).json({
+          error: 'Учетные данные уже существуют',
+          code: 'EMAIL_ALREADY_EXISTS'
+        });
+      }
+      await User.deleteOne({ id: userId });
+      throw credError;
+    }
+
+    // Генерируем токены
+    const payload = {
+      login: email,
+      userId: userId,
+      role: 'STORE_SELLER',
+      storeId: storeId
+    };
+    const accessToken = generateAccessToken(payload);
+    const refreshToken = generateRefreshToken(payload);
+
+    res.status(201).json({
+      user: {
+        id: userId,
+        role: 'STORE_SELLER',
+        email,
+        firstName: name,
+        storeId: storeId,
+        storeName: store.name
+      },
+      accessToken,
+      refreshToken,
+      expiresIn: JWT_EXPIRES_IN
+    });
+  } catch (error) {
+    console.error('Ошибка при регистрации продавца магазина:', error);
+
+    // Откатываем изменения, если что-то пошло не так
+    if (createdUserId) {
+      await User.deleteOne({ id: createdUserId }).catch(() => { });
+    }
+    if (email) {
+      await AuthCredential.deleteOne({ login: email }).catch(() => { });
+    }
+
+    res.status(500).json({ error: 'Ошибка при регистрации продавца магазина' });
+  }
+}
+
+module.exports = { login, registerAdmin, sendVerificationCode, verifyCode, registerDistributor, registerSalesRepresentative, registerStoreSeller };
