@@ -29,10 +29,14 @@ const {
   addProductsToSalesRepresentative,
   removeProductFromSalesRepresentative,
   getDistributorProducts,
+  setProductCostPrice,
+  getProductCostPrice,
+  deleteProductCostPrice,
   getDistributorAnalyticsSummary,
   getDistributorStockByStores,
   getDistributorTurnover,
-  getDistributorSalesRepKPI
+  getDistributorSalesRepKPI,
+  getSalesRepresentativeProductSales
 } = require('../controllers/distributorController');
 
 router.post('/', createDistributor);
@@ -48,12 +52,17 @@ router.put('/me/name', updateMyDistributorName);
 router.get('/me/sales-representatives', getSalesRepresentatives);
 router.get('/me/stores', getDistributorStores);
 router.get('/me/products', getDistributorProducts);
+// Эндпоинты управления себестоимостью товаров
+router.put('/me/products/:productId/cost-price', setProductCostPrice);
+router.get('/me/products/:productId/cost-price', getProductCostPrice);
+router.delete('/me/products/:productId/cost-price', deleteProductCostPrice);
 
 // Эндпоинты аналитики
 router.get('/me/analytics/summary', getDistributorAnalyticsSummary);
 router.get('/me/analytics/stock-by-stores', getDistributorStockByStores);
 router.get('/me/analytics/turnover', getDistributorTurnover);
 router.get('/me/analytics/sales-rep-kpi', getDistributorSalesRepKPI);
+router.get('/sales-representatives/:salesRepresentativeId/products/:productId/sales-by-stores', getSalesRepresentativeProductSales);
 router.get('/sales-representatives/me/stores', getMySalesRepresentativeStores);
 router.get('/requests', getConnectionRequests);
 router.post('/requests/:requestId/accept', acceptConnectionRequest);

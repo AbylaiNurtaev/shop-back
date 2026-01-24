@@ -174,6 +174,9 @@ const productSchema = new mongoose.Schema(
     images: { type: [String], default: [] },
     sku: { type: String, required: true },
     packageInfo: { type: String, default: null },
+    // Себестоимость товара от бренда (цена закупки)
+    costPrice: { type: Number, default: null },
+    costCurrency: { type: String, default: 'RUB' },
     // Поля для карточек товаров бренда
     storageLife: { type: String, required: true },
     productionDate: { type: Date, required: true },
@@ -424,6 +427,40 @@ const planSchema = new mongoose.Schema(
 
 planSchema.index({ salesRepresentativeId: 1, distributorId: 1, period: 1 });
 
+// Схема плана по категории
+const categoryPlanSchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true, unique: true },
+    salesRepresentativeId: { type: String, required: true, index: true },
+    distributorId: { type: String, required: true, index: true },
+    categoryId: { type: String, required: true, index: true },
+    targetAmount: { type: Number, required: true, min: 0 }, // План по сумме
+    targetQuantity: { type: Number, required: true, min: 0 }, // План по количеству штук
+    period: { type: String, required: true }, // Период плана (например, "2024-01", "2024-Q1", "2024")
+    description: { type: String, default: null },
+    startDate: { type: Date, default: null },
+    endDate: { type: Date, default: null }
+  },
+  baseSchemaOptions
+);
+
+categoryPlanSchema.index({ salesRepresentativeId: 1, distributorId: 1, categoryId: 1, period: 1 }, { unique: true });
+
+// Схема себестоимости товара от дистрибьютора
+const distributorProductPriceSchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true, unique: true },
+    distributorId: { type: String, required: true, index: true },
+    productId: { type: String, required: true, index: true },
+    costPrice: { type: Number, required: true, min: 0 },
+    costCurrency: { type: String, required: true, default: 'RUB' }
+  },
+  baseSchemaOptions
+);
+
+// Уникальный индекс для предотвращения дубликатов
+distributorProductPriceSchema.index({ distributorId: 1, productId: 1 }, { unique: true });
+
 const User = mongoose.models.User || mongoose.model('User', userSchema);
 const Store = mongoose.models.Store || mongoose.model('Store', storeSchema);
 const Distributor =
@@ -467,6 +504,10 @@ const CategoryRequest =
   mongoose.models.CategoryRequest || mongoose.model('CategoryRequest', categoryRequestSchema);
 const Plan =
   mongoose.models.Plan || mongoose.model('Plan', planSchema);
+const CategoryPlan =
+  mongoose.models.CategoryPlan || mongoose.model('CategoryPlan', categoryPlanSchema);
+const DistributorProductPrice =
+  mongoose.models.DistributorProductPrice || mongoose.model('DistributorProductPrice', distributorProductPriceSchema);
 
 async function seedDefaults() {
   const categoryCount = await Category.countDocuments();
@@ -591,6 +632,8 @@ module.exports = {
     VerificationCode,
     BrandDistributorRequest,
     CategoryRequest,
-    Plan
+    Plan,
+    CategoryPlan,
+    DistributorProductPrice
   }
 };

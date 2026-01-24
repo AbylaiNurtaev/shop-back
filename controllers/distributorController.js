@@ -1,7 +1,7 @@
 const { generateId } = require('../utils/uuid');
 const { models } = require('../models/database');
 
-const { Distributor, User, Store, Brand, BrandDistributorRequest, SalesRepresentative, SalesRepresentativeStore, SalesRepresentativeProduct, Product, Offer, Sale, Plan } = models;
+const { Distributor, User, Store, Brand, BrandDistributorRequest, SalesRepresentative, SalesRepresentativeStore, SalesRepresentativeProduct, Product, Offer, Sale, Plan, DistributorProductPrice } = models;
 
 const STORE_ROLES = ['STORE', 'STORE_USER'];
 
@@ -1520,13 +1520,202 @@ async function getDistributorProducts(req, res) {
 
     const products = await Product.find(query).lean();
 
+    // Получаем установленные себестоимости для этих товаров
+    const productIds = products.map(p => p.id);
+    const costPrices = productIds.length > 0
+      ? await DistributorProductPrice.find({
+          distributorId,
+          productId: { $in: productIds }
+        }).lean()
+      : [];
+    const costPriceByProductId = new Map(costPrices.map(cp => [cp.productId, cp]));
+
+    // Обогащаем товары информацией о себестоимости
+    const enrichedProducts = products.map(product => {
+      const costPrice = costPriceByProductId.get(product.id);
+      return {
+        ...product,
+        // Себестоимость, установленная дистрибьютором
+        costPrice: costPrice ? costPrice.costPrice : null,
+        costCurrency: costPrice ? costPrice.costCurrency : null,
+        hasCostPrice: !!costPrice
+      };
+    });
+
     res.json({
-      items: products,
-      total: products.length
+      items: enrichedProducts,
+      total: enrichedProducts.length
     });
   } catch (error) {
     console.error('Ошибка при получении товаров дистрибьютора:', error);
     res.status(500).json({ error: 'Ошибка при получении товаров дистрибьютора' });
+  }
+}
+
+// Установка себестоимости товара для дистрибьютора
+async function setProductCostPrice(req, res) {
+  try {
+    const distributorId = req.user && req.user.distributorId;
+    const { productId } = req.params;
+    const { costPrice, costCurrency } = req.body;
+
+    if (!distributorId) {
+      return res.status(403).json({ error: 'Только дистрибьюторы могут устанавливать себестоимость товаров' });
+    }
+
+    if (!productId) {
+      return res.status(400).json({ error: 'ID товара обязателен' });
+    }
+
+    if (costPrice === undefined || costPrice === null || costPrice < 0) {
+      return res.status(400).json({ error: 'Себестоимость должна быть указана и быть неотрицательной' });
+    }
+
+    // Проверяем, что товар принадлежит бренду, подключенному к дистрибьютору
+    const product = await Product.findOne({ id: productId }).lean();
+    if (!product) {
+      return res.status(404).json({ error: 'Товар не найден' });
+    }
+
+    const brandDistributorConnection = await BrandDistributorRequest.findOne({
+      brandId: product.brandId,
+      distributorId,
+      status: 'ACCEPTED'
+    }).lean();
+
+    if (!brandDistributorConnection) {
+      return res.status(403).json({
+        error: 'Товар не может быть добавлен: бренд не подключен к вашему дистрибьютору'
+      });
+    }
+
+    // Ищем или создаем запись о себестоимости
+    let costPriceRecord = await DistributorProductPrice.findOne({
+      distributorId,
+      productId
+    }).lean();
+
+    const currency = costCurrency || 'RUB';
+
+    if (costPriceRecord) {
+      // Обновляем существующую запись
+      costPriceRecord = await DistributorProductPrice.findOneAndUpdate(
+        { id: costPriceRecord.id },
+        {
+          costPrice,
+          costCurrency: currency,
+          updatedAt: new Date()
+        },
+        { new: true }
+      ).lean();
+    } else {
+      // Создаем новую запись
+      costPriceRecord = await DistributorProductPrice.create({
+        id: generateId(),
+        distributorId,
+        productId,
+        costPrice,
+        costCurrency: currency
+      });
+      costPriceRecord = costPriceRecord.toObject();
+    }
+
+    res.json({
+      message: 'Себестоимость товара успешно установлена',
+      product: {
+        id: product.id,
+        name: product.name,
+        sku: product.sku,
+        brandName: product.brandName
+      },
+      costPrice: {
+        id: costPriceRecord.id,
+        costPrice: costPriceRecord.costPrice,
+        costCurrency: costPriceRecord.costCurrency
+      }
+    });
+  } catch (error) {
+    console.error('Ошибка при установке себестоимости товара:', error);
+    res.status(500).json({ error: 'Ошибка при установке себестоимости товара' });
+  }
+}
+
+// Получение себестоимости товара для дистрибьютора
+async function getProductCostPrice(req, res) {
+  try {
+    const distributorId = req.user && req.user.distributorId;
+    const { productId } = req.params;
+
+    if (!distributorId) {
+      return res.status(403).json({ error: 'Только дистрибьюторы могут просматривать себестоимость товаров' });
+    }
+
+    if (!productId) {
+      return res.status(400).json({ error: 'ID товара обязателен' });
+    }
+
+    // Получаем товар
+    const product = await Product.findOne({ id: productId }).lean();
+    if (!product) {
+      return res.status(404).json({ error: 'Товар не найден' });
+    }
+
+    // Получаем себестоимость
+    const costPriceRecord = await DistributorProductPrice.findOne({
+      distributorId,
+      productId
+    }).lean();
+
+    res.json({
+      product: {
+        id: product.id,
+        name: product.name,
+        sku: product.sku,
+        brandName: product.brandName
+      },
+      costPrice: costPriceRecord
+        ? {
+            id: costPriceRecord.id,
+            costPrice: costPriceRecord.costPrice,
+            costCurrency: costPriceRecord.costCurrency
+          }
+        : null
+    });
+  } catch (error) {
+    console.error('Ошибка при получении себестоимости товара:', error);
+    res.status(500).json({ error: 'Ошибка при получении себестоимости товара' });
+  }
+}
+
+// Удаление себестоимости товара для дистрибьютора
+async function deleteProductCostPrice(req, res) {
+  try {
+    const distributorId = req.user && req.user.distributorId;
+    const { productId } = req.params;
+
+    if (!distributorId) {
+      return res.status(403).json({ error: 'Только дистрибьюторы могут удалять себестоимость товаров' });
+    }
+
+    if (!productId) {
+      return res.status(400).json({ error: 'ID товара обязателен' });
+    }
+
+    const result = await DistributorProductPrice.deleteOne({
+      distributorId,
+      productId
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ error: 'Себестоимость товара не найдена' });
+    }
+
+    res.json({
+      message: 'Себестоимость товара успешно удалена'
+    });
+  } catch (error) {
+    console.error('Ошибка при удалении себестоимости товара:', error);
+    res.status(500).json({ error: 'Ошибка при удалении себестоимости товара' });
   }
 }
 
@@ -1610,6 +1799,95 @@ async function getDistributorStockByStores(req, res) {
     const stores = await Store.find({ id: { $in: storeIds } }).lean();
     const storeById = new Map(stores.map(s => [s.id, s]));
 
+    // Получаем связи торговых представителей с магазинами
+    const salesRepStoreLinks = await SalesRepresentativeStore.find({
+      storeId: { $in: storeIds },
+      distributorId
+    }).lean();
+
+    // Группируем ТП по магазинам
+    const salesRepsByStore = new Map();
+    salesRepStoreLinks.forEach(link => {
+      if (!salesRepsByStore.has(link.storeId)) {
+        salesRepsByStore.set(link.storeId, []);
+      }
+      salesRepsByStore.get(link.storeId).push(link.salesRepresentativeId);
+    });
+
+    // Получаем информацию о торговых представителях
+    const salesRepIds = Array.from(
+      new Set(salesRepStoreLinks.map(link => link.salesRepresentativeId))
+    );
+    
+    // Получаем из модели SalesRepresentative
+    const salesRepsFromModel = salesRepIds.length
+      ? await SalesRepresentative.find({ id: { $in: salesRepIds } }).lean()
+      : [];
+    
+    // Получаем email'ы для поиска в User
+    const salesRepEmails = salesRepsFromModel.map(rep => rep.email);
+    
+    // Получаем пользователей по email и по id
+    const salesRepUsers = salesRepIds.length || salesRepEmails.length
+      ? await User.find({
+          $or: [
+            { id: { $in: salesRepIds }, role: 'SALES_REPRESENTATIVE' },
+            { email: { $in: salesRepEmails }, role: 'SALES_REPRESENTATIVE' }
+          ]
+        }).lean()
+      : [];
+
+    // Создаем мапу: salesRepresentativeId -> данные пользователя
+    const salesRepMap = new Map();
+    
+    // Сначала добавляем по id из SalesRepresentative
+    salesRepsFromModel.forEach(rep => {
+      const user = salesRepUsers.find(u => u.id === rep.id || u.email === rep.email);
+      if (user) {
+        // Добавляем по ID из SalesRepresentative (это ключ в связях)
+        salesRepMap.set(rep.id, {
+          id: user.id,
+          email: user.email,
+          firstName: user.firstName
+        });
+        // Также добавляем по ID пользователя на случай если в связях используется user.id
+        if (user.id !== rep.id) {
+          salesRepMap.set(user.id, {
+            id: user.id,
+            email: user.email,
+            firstName: user.firstName
+          });
+        }
+      } else {
+        // Если пользователь не найден, используем данные из SalesRepresentative
+        salesRepMap.set(rep.id, {
+          id: rep.id,
+          email: rep.email,
+          firstName: rep.name
+        });
+      }
+    });
+    
+    // Добавляем пользователей, которые могут быть найдены только по id (если salesRepresentativeId = user.id)
+    salesRepUsers.forEach(user => {
+      // Добавляем по user.id (на случай если в связях используется user.id напрямую)
+      if (!salesRepMap.has(user.id)) {
+        salesRepMap.set(user.id, {
+          id: user.id,
+          email: user.email,
+          firstName: user.firstName
+        });
+      }
+      // Также проверяем, может ли этот user.id быть salesRepresentativeId в связях
+      if (salesRepIds.includes(user.id) && !salesRepMap.has(user.id)) {
+        salesRepMap.set(user.id, {
+          id: user.id,
+          email: user.email,
+          firstName: user.firstName
+        });
+      }
+    });
+
     // Получаем все офферы для этих магазинов
     const offers = await Offer.find({ storeId: { $in: storeIds } }).lean();
     
@@ -1626,10 +1904,18 @@ async function getDistributorStockByStores(req, res) {
     storeIds.forEach(storeId => {
       const store = storeById.get(storeId);
       if (store) {
+        // Получаем торговых представителей для этого магазина
+        const salesRepIdsForStore = salesRepsByStore.get(storeId) || [];
+        const salesRepsForStore = salesRepIdsForStore
+          .map(id => salesRepMap.get(id))
+          .filter(Boolean);
+
         stockByStore.set(storeId, {
           storeId: store.id,
           storeName: store.name,
           storeAddress: store.address,
+          salesRepresentatives: salesRepsForStore,
+          salesRepresentativesCount: salesRepsForStore.length,
           items: [],
           totalItems: 0,
           totalQuantity: 0,
@@ -2074,6 +2360,191 @@ async function getDistributorSalesRepKPI(req, res) {
   }
 }
 
+// Получение продаж конкретного товара по магазинам выбранного торгового представителя (для дистрибьютора)
+async function getSalesRepresentativeProductSales(req, res) {
+  try {
+    const distributorId = req.user && req.user.distributorId;
+    const { salesRepresentativeId, productId } = req.params;
+    
+    if (!distributorId) {
+      return res.status(403).json({ error: 'Только дистрибьюторы могут просматривать продажи торговых представителей' });
+    }
+
+    if (!salesRepresentativeId) {
+      return res.status(400).json({ error: 'ID торгового представителя обязателен' });
+    }
+
+    if (!productId) {
+      return res.status(400).json({ error: 'ID товара обязателен' });
+    }
+
+    // Проверяем, что торговый представитель принадлежит дистрибьютору
+    const resolved = await resolveSalesRepresentative(distributorId, salesRepresentativeId);
+    if (!resolved.linkId) {
+      return res.status(404).json({ error: 'Торговый представитель не найден' });
+    }
+    if (!resolved.isAllowed) {
+      return res.status(403).json({ error: 'Торговый представитель не принадлежит дистрибьютору' });
+    }
+
+    // Получаем магазины торгового представителя
+    const linkQueryIds = resolved.linkIds.length ? resolved.linkIds : [resolved.linkId];
+    const links = await SalesRepresentativeStore.find({
+      salesRepresentativeId: { $in: linkQueryIds },
+      distributorId
+    }).lean();
+
+    const storeIds = Array.from(new Set(links.map(link => link.storeId)));
+    
+    if (storeIds.length === 0) {
+      return res.json({
+        salesRepresentativeId,
+        salesRepresentative: {
+          id: resolved.user ? resolved.user.id : resolved.salesRepresentative.id,
+          email: resolved.user ? resolved.user.email : resolved.salesRepresentative.email,
+          firstName: resolved.user ? resolved.user.firstName : resolved.salesRepresentative.name
+        },
+        productId,
+        product: null,
+        period: {
+          startDate: null,
+          endDate: null
+        },
+        stores: [],
+        total: 0,
+        summary: {
+          totalSales: 0,
+          totalRevenue: 0,
+          totalQuantity: 0
+        }
+      });
+    }
+
+    // Получаем информацию о магазинах
+    const stores = await Store.find({ id: { $in: storeIds } }).lean();
+    const storesById = new Map(stores.map(store => [store.id, store]));
+
+    // Парсим даты из query параметров
+    let startDate = req.query.startDate ? new Date(req.query.startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000); // По умолчанию 30 дней
+    let endDate = req.query.endDate ? new Date(req.query.endDate) : new Date();
+    
+    // Устанавливаем startDate на начало дня (00:00:00)
+    startDate.setHours(0, 0, 0, 0);
+    // Устанавливаем endDate на конец дня (23:59:59.999)
+    endDate.setHours(23, 59, 59, 999);
+
+    // Получаем информацию о товаре
+    const product = await Product.findOne({ id: productId }).lean();
+    if (!product) {
+      return res.status(404).json({ error: 'Товар не найден' });
+    }
+
+    // Получаем все завершенные продажи из магазинов ТП
+    const allCompletedSales = await Sale.find({
+      storeId: { $in: storeIds },
+      status: 'COMPLETED'
+    })
+      .sort({ completedAt: -1, createdAt: -1 })
+      .lean();
+
+    // Фильтруем по дате и товару
+    const sales = allCompletedSales.filter(sale => {
+      const saleDate = sale.completedAt ? new Date(sale.completedAt) : new Date(sale.createdAt);
+      if (saleDate < startDate || saleDate > endDate) return false;
+      
+      // Проверяем, есть ли в продаже нужный товар
+      if (!sale.items || !Array.isArray(sale.items)) return false;
+      return sale.items.some(item => item.productId === productId);
+    });
+
+    // Группируем продажи по магазинам
+    const storeSalesMap = new Map();
+    
+    // Инициализируем статистику для каждого магазина
+    stores.forEach(store => {
+      storeSalesMap.set(store.id, {
+        storeId: store.id,
+        storeName: store.name,
+        storeAddress: store.address,
+        sales: [],
+        totalSales: 0,
+        totalRevenue: 0,
+        totalQuantity: 0
+      });
+    });
+
+    // Обрабатываем каждую продажу
+    sales.forEach(sale => {
+      const storeStat = storeSalesMap.get(sale.storeId);
+      if (!storeStat) return;
+
+      // Находим товар в продаже
+      const productItem = sale.items.find(item => item.productId === productId);
+      if (!productItem) return;
+
+      const quantity = productItem.quantity || 0;
+      const price = productItem.price || 0;
+      const revenue = quantity * price;
+      const saleDate = sale.completedAt ? new Date(sale.completedAt) : new Date(sale.createdAt);
+
+      storeStat.sales.push({
+        saleId: sale.id,
+        saleDate: saleDate.toISOString(),
+        quantity,
+        price,
+        revenue: Math.round(revenue * 100) / 100,
+        totalAmount: sale.totalAmount || 0,
+        currency: sale.currency || 'RUB'
+      });
+
+      storeStat.totalSales += 1;
+      storeStat.totalQuantity += quantity;
+      storeStat.totalRevenue += revenue;
+    });
+
+    // Преобразуем в массив и сортируем
+    const storesWithSales = Array.from(storeSalesMap.values())
+      .filter(store => store.totalSales > 0) // Только магазины с продажами
+      .sort((a, b) => b.totalRevenue - a.totalRevenue); // Сортируем по выручке
+
+    // Общая статистика
+    const summary = {
+      totalSales: sales.length,
+      totalRevenue: Math.round(
+        storesWithSales.reduce((sum, store) => sum + store.totalRevenue, 0) * 100
+      ) / 100,
+      totalQuantity: storesWithSales.reduce((sum, store) => sum + store.totalQuantity, 0)
+    };
+
+    res.json({
+      salesRepresentativeId,
+      salesRepresentative: {
+        id: resolved.user ? resolved.user.id : resolved.salesRepresentative.id,
+        email: resolved.user ? resolved.user.email : resolved.salesRepresentative.email,
+        firstName: resolved.user ? resolved.user.firstName : resolved.salesRepresentative.name
+      },
+      productId,
+      product: {
+        id: product.id,
+        name: product.name,
+        sku: product.sku,
+        brandId: product.brandId,
+        brandName: product.brandName
+      },
+      period: {
+        startDate: startDate.toISOString(),
+        endDate: endDate.toISOString()
+      },
+      stores: storesWithSales,
+      total: storesWithSales.length,
+      summary
+    });
+  } catch (error) {
+    console.error('Ошибка при получении продаж товара торгового представителя:', error);
+    res.status(500).json({ error: 'Ошибка при получении продаж товара торгового представителя' });
+  }
+}
+
 module.exports = {
   createDistributor,
   getDistributorById,
@@ -2102,9 +2573,13 @@ module.exports = {
   addProductsToSalesRepresentative,
   removeProductFromSalesRepresentative,
   getDistributorProducts,
+  setProductCostPrice,
+  getProductCostPrice,
+  deleteProductCostPrice,
   getDistributorAnalyticsSummary,
   getDistributorStockByStores,
   getDistributorTurnover,
-  getDistributorSalesRepKPI
+  getDistributorSalesRepKPI,
+  getSalesRepresentativeProductSales
 };
 

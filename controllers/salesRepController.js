@@ -812,13 +812,26 @@ async function getMySalesAnalytics(req, res) {
               brandName: product ? product.brandName : null,
               totalQuantity: 0,
               totalRevenue: 0,
-              salesCount: 0
+              salesCount: 0,
+              storeStats: new Map() // Статистика по магазинам для этого товара
             });
           }
           const productStat = productStats.get(item.productId);
           productStat.totalQuantity += quantity;
           productStat.totalRevenue += revenue;
           productStat.salesCount += 1;
+          
+          // Обновляем статистику по магазинам для этого товара
+          if (!productStat.storeStats.has(sale.storeId)) {
+            productStat.storeStats.set(sale.storeId, {
+              storeId: sale.storeId,
+              quantity: 0,
+              revenue: 0
+            });
+          }
+          const storeStatForProduct = productStat.storeStats.get(sale.storeId);
+          storeStatForProduct.quantity += quantity;
+          storeStatForProduct.revenue += revenue;
 
           // Статистика по брендам
           const product = productById.get(item.productId);
@@ -875,10 +888,33 @@ async function getMySalesAnalytics(req, res) {
     });
 
     const byProduct = Array.from(productStats.values())
-      .map(stat => ({
-        ...stat,
-        productsCount: undefined
-      }))
+      .map(stat => {
+        // Находим магазин с максимальными продажами для этого товара
+        let topStore = null;
+        if (stat.storeStats && stat.storeStats.size > 0) {
+          const storeStatsArray = Array.from(stat.storeStats.values());
+          const topStoreStat = storeStatsArray.reduce((max, current) => 
+            current.quantity > max.quantity ? current : max
+          );
+          const store = context.storesById.get(topStoreStat.storeId);
+          if (store) {
+            topStore = {
+              storeId: store.id,
+              storeName: store.name,
+              storeAddress: store.address,
+              quantity: topStoreStat.quantity,
+              revenue: Math.round(topStoreStat.revenue * 100) / 100
+            };
+          }
+        }
+        
+        return {
+          ...stat,
+          productsCount: undefined,
+          storeStats: undefined, // Удаляем внутреннюю структуру
+          topStore: topStore // Добавляем информацию о топ магазине
+        };
+      })
       .sort((a, b) => b.totalRevenue - a.totalRevenue)
       .slice(0, 20); // Топ 20 товаров
 
@@ -1183,6 +1219,153 @@ async function getPoorlySellingProducts(req, res) {
   }
 }
 
+// Получение продаж конкретного товара по магазинам (для торгового представителя)
+async function getProductSalesByStores(req, res) {
+  try {
+    const { productId } = req.params;
+    
+    if (!productId) {
+      return res.status(400).json({ error: 'ID товара обязателен' });
+    }
+
+    const context = await getSalesRepStoresContext(req);
+    if (!context.isFound) {
+      return res.status(404).json({ error: 'Торговый представитель не найден' });
+    }
+
+    if (!context.storeIds.length) {
+      return res.json({
+        productId,
+        product: null,
+        period: {
+          startDate: null,
+          endDate: null
+        },
+        stores: [],
+        total: 0,
+        summary: {
+          totalSales: 0,
+          totalRevenue: 0,
+          totalQuantity: 0
+        }
+      });
+    }
+
+    // Парсим даты из query параметров
+    let startDate = req.query.startDate ? new Date(req.query.startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000); // По умолчанию 30 дней
+    let endDate = req.query.endDate ? new Date(req.query.endDate) : new Date();
+    
+    // Устанавливаем startDate на начало дня (00:00:00)
+    startDate.setHours(0, 0, 0, 0);
+    // Устанавливаем endDate на конец дня (23:59:59.999)
+    endDate.setHours(23, 59, 59, 999);
+
+    // Получаем информацию о товаре
+    const product = await Product.findOne({ id: productId }).lean();
+    if (!product) {
+      return res.status(404).json({ error: 'Товар не найден' });
+    }
+
+    // Получаем все завершенные продажи из магазинов ТП
+    const allCompletedSales = await Sale.find({
+      storeId: { $in: context.storeIds },
+      status: 'COMPLETED'
+    })
+      .sort({ completedAt: -1, createdAt: -1 })
+      .lean();
+
+    // Фильтруем по дате и товару
+    const sales = allCompletedSales.filter(sale => {
+      const saleDate = sale.completedAt ? new Date(sale.completedAt) : new Date(sale.createdAt);
+      if (saleDate < startDate || saleDate > endDate) return false;
+      
+      // Проверяем, есть ли в продаже нужный товар
+      if (!sale.items || !Array.isArray(sale.items)) return false;
+      return sale.items.some(item => item.productId === productId);
+    });
+
+    // Группируем продажи по магазинам
+    const storeSalesMap = new Map();
+    
+    // Инициализируем статистику для каждого магазина
+    context.stores.forEach(store => {
+      storeSalesMap.set(store.id, {
+        storeId: store.id,
+        storeName: store.name,
+        storeAddress: store.address,
+        sales: [],
+        totalSales: 0,
+        totalRevenue: 0,
+        totalQuantity: 0
+      });
+    });
+
+    // Обрабатываем каждую продажу
+    sales.forEach(sale => {
+      const storeStat = storeSalesMap.get(sale.storeId);
+      if (!storeStat) return;
+
+      // Находим товар в продаже
+      const productItem = sale.items.find(item => item.productId === productId);
+      if (!productItem) return;
+
+      const quantity = productItem.quantity || 0;
+      const price = productItem.price || 0;
+      const revenue = quantity * price;
+      const saleDate = sale.completedAt ? new Date(sale.completedAt) : new Date(sale.createdAt);
+
+      storeStat.sales.push({
+        saleId: sale.id,
+        saleDate: saleDate.toISOString(),
+        quantity,
+        price,
+        revenue: Math.round(revenue * 100) / 100,
+        totalAmount: sale.totalAmount || 0,
+        currency: sale.currency || 'RUB'
+      });
+
+      storeStat.totalSales += 1;
+      storeStat.totalQuantity += quantity;
+      storeStat.totalRevenue += revenue;
+    });
+
+    // Преобразуем в массив и сортируем
+    const stores = Array.from(storeSalesMap.values())
+      .filter(store => store.totalSales > 0) // Только магазины с продажами
+      .sort((a, b) => b.totalRevenue - a.totalRevenue); // Сортируем по выручке
+
+    // Общая статистика
+    const summary = {
+      totalSales: sales.length,
+      totalRevenue: Math.round(
+        stores.reduce((sum, store) => sum + store.totalRevenue, 0) * 100
+      ) / 100,
+      totalQuantity: stores.reduce((sum, store) => sum + store.totalQuantity, 0)
+    };
+
+    res.json({
+      productId,
+      product: {
+        id: product.id,
+        name: product.name,
+        sku: product.sku,
+        brandId: product.brandId,
+        brandName: product.brandName
+      },
+      period: {
+        startDate: startDate.toISOString(),
+        endDate: endDate.toISOString()
+      },
+      stores,
+      total: stores.length,
+      summary
+    });
+  } catch (error) {
+    console.error('Ошибка при получении продаж товара по магазинам:', error);
+    res.status(500).json({ error: 'Ошибка при получении продаж товара по магазинам' });
+  }
+}
+
 module.exports = {
   getMyProductGroups,
   getMyStockControl,
@@ -1192,6 +1375,7 @@ module.exports = {
   getMyProducts,
   getMySalesAnalytics,
   getExpiringProducts,
-  getPoorlySellingProducts
+  getPoorlySellingProducts,
+  getProductSalesByStores
 };
 

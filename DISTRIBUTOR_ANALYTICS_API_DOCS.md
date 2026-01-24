@@ -104,6 +104,19 @@ console.log(`Товаров: ${data.totalProducts}`);
       "storeId": "store_123",
       "storeName": "Магазин на Ленина",
       "storeAddress": "ул. Ленина, д. 10",
+      "salesRepresentatives": [
+        {
+          "id": "sales_rep_1",
+          "email": "rep1@example.com",
+          "firstName": "Иван"
+        },
+        {
+          "id": "sales_rep_2",
+          "email": "rep2@example.com",
+          "firstName": "Петр"
+        }
+      ],
+      "salesRepresentativesCount": 2,
       "items": [
         {
           "offerId": "offer_456",
@@ -138,6 +151,14 @@ console.log(`Товаров: ${data.totalProducts}`);
       "storeId": "store_124",
       "storeName": "Магазин на Пушкина",
       "storeAddress": "ул. Пушкина, д. 5",
+      "salesRepresentatives": [
+        {
+          "id": "sales_rep_3",
+          "email": "rep3@example.com",
+          "firstName": "Мария"
+        }
+      ],
+      "salesRepresentativesCount": 1,
       "items": [
         {
           "offerId": "offer_458",

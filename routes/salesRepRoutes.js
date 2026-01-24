@@ -11,7 +11,8 @@ const {
   getMyProducts,
   getMySalesAnalytics,
   getExpiringProducts,
-  getPoorlySellingProducts
+  getPoorlySellingProducts,
+  getProductSalesByStores
 } = require('../controllers/salesRepController');
 
 router.use(authenticateToken);
@@ -25,6 +26,7 @@ router.get('/ai-analytics', getMyAiAnalytics);
 router.get('/sales-analytics', getMySalesAnalytics);
 router.get('/expiring-products', getExpiringProducts);
 router.get('/poorly-selling-products', getPoorlySellingProducts);
+router.get('/products/:productId/sales-by-stores', getProductSalesByStores);
 
 module.exports = router;
 

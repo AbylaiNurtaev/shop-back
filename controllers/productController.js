@@ -3,7 +3,7 @@ const { generateId } = require('../utils/uuid');
 const { models } = require('../models/database');
 const { calculateDistance, getCoordinatesFromLink } = require('../utils/distance');
 
-const { Product, Offer, Store, Brand, User, BrandDistributorRequest } = models;
+const { Product, Offer, Store, Brand, User, BrandDistributorRequest, DistributorProductPrice } = models;
 const { checkAndDisableExpiredPayments } = require('../utils/paymentExpiration');
 
 const STORE_ROLES = ['STORE', 'STORE_USER'];
@@ -43,6 +43,9 @@ async function createProduct(req, res) {
       sku,
       brandId,
       packageInfo,
+      // Себестоимость от бренда
+      costPrice,
+      costCurrency,
       // Поля для карточек товаров бренда
       storageLife,
       productionDate,
@@ -85,6 +88,9 @@ async function createProduct(req, res) {
       images: images || [],
       sku,
       packageInfo: packageInfo !== undefined ? String(packageInfo) : null,
+      // Себестоимость от бренда
+      costPrice: costPrice !== undefined ? costPrice : null,
+      costCurrency: costCurrency || 'RUB',
       // Поля для карточек товаров бренда
       storageLife: storageLife || null,
       productionDate: parsedProductionDate,
@@ -197,9 +203,50 @@ async function getProducts(req, res) {
 
     const products = await Product.find(query).lean();
 
+    // Если пользователь - магазин, добавляем информацию об Offer (цена магазина) и себестоимость от дистрибьютора
+    let enrichedProducts = products;
+    if (req.user && req.user.userId) {
+      const user = await User.findOne({ id: req.user.userId }).lean();
+      if (user && user.storeId && (user.role === 'STORE' || user.role === 'STORE_USER')) {
+        const productIds = products.map(p => p.id);
+        
+        // Получаем Offers (цены магазина)
+        const offers = productIds.length > 0
+          ? await Offer.find({ productId: { $in: productIds }, storeId: user.storeId }).lean()
+          : [];
+        const offerByProductId = new Map(offers.map(offer => [offer.productId, offer]));
+
+        // Получаем себестоимости от дистрибьютора
+        const costPrices = user.distributorId && productIds.length > 0
+          ? await DistributorProductPrice.find({
+              distributorId: user.distributorId,
+              productId: { $in: productIds }
+            }).lean()
+          : [];
+        const costPriceByProductId = new Map(costPrices.map(cp => [cp.productId, cp]));
+
+        enrichedProducts = products.map(product => {
+          const offer = offerByProductId.get(product.id);
+          const costPrice = costPriceByProductId.get(product.id);
+          return {
+            ...product,
+            // Себестоимость от дистрибьютора (из DistributorProductPrice)
+            costPrice: costPrice ? costPrice.costPrice : null,
+            costCurrency: costPrice ? costPrice.costCurrency : null,
+            // Цена магазина (из Offer, если существует)
+            storePrice: offer ? offer.price : null,
+            storeCurrency: offer ? offer.currency : null,
+            // Информация о наличии товара в магазине
+            hasOffer: !!offer,
+            offerQuantity: offer ? offer.quantity : null
+          };
+        });
+      }
+    }
+
     res.json({
-      items: products,
-      total: products.length
+      items: enrichedProducts,
+      total: enrichedProducts.length
     });
   } catch (error) {
     console.error('Ошибка при получении списка товаров:', error);
@@ -277,6 +324,9 @@ async function updateProduct(req, res) {
       sku,
       brandId,
       packageInfo,
+      // Себестоимость от бренда
+      costPrice,
+      costCurrency,
       // Поля для карточек товаров бренда
       storageLife,
       productionDate,
@@ -296,6 +346,10 @@ async function updateProduct(req, res) {
     if (images !== undefined) update.images = images;
     if (sku !== undefined) update.sku = sku;
     if (packageInfo !== undefined) update.packageInfo = packageInfo !== null ? String(packageInfo) : null;
+
+    // Себестоимость от бренда
+    if (costPrice !== undefined) update.costPrice = costPrice;
+    if (costCurrency !== undefined) update.costCurrency = costCurrency;
 
     // Поля для карточек товаров бренда
     if (storageLife !== undefined) update.storageLife = storageLife;

@@ -31,7 +31,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/stores', storeRoutes);
 app.use('/api/distributors', distributorRoutes);
-app.use('/api/sales-reps', salesRepRoutes);
+app.use('/api/sales-representatives', salesRepRoutes);
 app.use('/api/brands', brandRoutes);
 app.use('/api/categories', categoryRoutes);
 app.use('/api/products', productRoutes);

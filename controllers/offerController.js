@@ -5,6 +5,19 @@ const { Offer, Product, Category, User, BrandDistributorRequest } = models;
 
 const STORE_ROLES = ['STORE', 'STORE_USER'];
 
+// Получение storeId для владельца магазина
+async function getStoreIdForStoreOwner(user) {
+  if (!user || !user.userId) {
+    return null;
+  }
+
+  const userDoc = await User.findOne({ 
+    id: user.userId, 
+    role: { $in: STORE_ROLES } 
+  }).lean();
+  return userDoc ? userDoc.storeId : null;
+}
+
 async function createOffer(req, res) {
   try {
     const { productId, storeId, price, currency, isAvailable, quantity } = req.body;
@@ -161,21 +174,50 @@ async function updateOffer(req, res) {
     const { offerId } = req.params;
     const { price, currency, isAvailable, quantity } = req.body;
 
+    // Проверяем существование оффера
+    const offer = await Offer.findOne({ id: offerId }).lean();
+    if (!offer) {
+      return res.status(404).json({ error: 'Оффер не найден' });
+    }
+
+    // Проверяем права доступа: владелец магазина может обновлять только свои офферы
+    const userStoreId = await getStoreIdForStoreOwner(req.user);
+    if (userStoreId && offer.storeId !== userStoreId) {
+      return res.status(403).json({ 
+        error: 'Нет доступа к этому офферу. Вы можете изменять только цены товаров своего магазина' 
+      });
+    }
+
+    // Если пользователь не является владельцем магазина, проверяем другие роли (например, ADMIN)
+    if (!userStoreId) {
+      // Проверяем, является ли пользователь администратором
+      if (req.user.role !== 'ADMIN') {
+        return res.status(403).json({ 
+          error: 'Только владелец магазина может изменять цены товаров' 
+        });
+      }
+    }
+
+    // Валидация цены
+    if (price !== undefined) {
+      if (typeof price !== 'number' || price < 0) {
+        return res.status(400).json({ error: 'Цена должна быть неотрицательным числом' });
+      }
+    }
+
     const update = { updatedAt: new Date() };
     if (price !== undefined) update.price = price;
     if (currency !== undefined) update.currency = currency;
     if (isAvailable !== undefined) update.isAvailable = isAvailable;
     if (quantity !== undefined) update.quantity = quantity;
 
-    const offer = await Offer.findOneAndUpdate({ id: offerId }, update, {
+    const updatedOffer = await Offer.findOneAndUpdate({ id: offerId }, update, {
       new: true
     }).lean();
-    if (!offer) {
-      return res.status(404).json({ error: 'Оффер не найден' });
-    }
 
-    res.json(offer);
+    res.json(updatedOffer);
   } catch (error) {
+    console.error('Ошибка при обновлении оффера:', error);
     res.status(500).json({ error: 'Ошибка при обновлении оффера' });
   }
 }
