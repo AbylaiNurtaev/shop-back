@@ -36,7 +36,10 @@ const {
   getDistributorStockByStores,
   getDistributorTurnover,
   getDistributorSalesRepKPI,
-  getSalesRepresentativeProductSales
+  getSalesRepresentativeProductSales,
+  getDistributorActivityHistory,
+  getDistributorPoorlySellingProducts,
+  getDistributorProductSalesByStores
 } = require('../controllers/distributorController');
 
 router.post('/', createDistributor);
@@ -63,6 +66,13 @@ router.get('/me/analytics/stock-by-stores', getDistributorStockByStores);
 router.get('/me/analytics/turnover', getDistributorTurnover);
 router.get('/me/analytics/sales-rep-kpi', getDistributorSalesRepKPI);
 router.get('/sales-representatives/:salesRepresentativeId/products/:productId/sales-by-stores', getSalesRepresentativeProductSales);
+
+// Эндпоинты для плохих продаж и продаж по магазинам
+router.get('/me/poorly-selling-products', getDistributorPoorlySellingProducts);
+router.get('/me/products/:productId/sales-by-stores', getDistributorProductSalesByStores);
+
+// Эндпоинт истории действий
+router.get('/me/activity-history', getDistributorActivityHistory);
 router.get('/sales-representatives/me/stores', getMySalesRepresentativeStores);
 router.get('/requests', getConnectionRequests);
 router.post('/requests/:requestId/accept', acceptConnectionRequest);

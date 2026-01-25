@@ -1,5 +1,6 @@
 const { generateId } = require('../utils/uuid');
 const { models } = require('../models/database');
+const { analyzeInvoice } = require('../utils/gemini');
 
 const { Offer, Product, Store, User, SalesRepresentativeStore, SalesRepresentative, BrandDistributorRequest } = models;
 
@@ -550,6 +551,211 @@ async function quickAddStockByBarcode(req, res) {
   }
 }
 
+// Обработка накладной с помощью ИИ (владелец магазина)
+async function processInvoice(req, res) {
+  try {
+    const storeId = await getStoreIdForStoreOwner(req.user);
+    if (!storeId) {
+      return res.status(404).json({ error: 'Магазин не найден для текущего пользователя' });
+    }
+
+    // Получаем файл из req.files (upload.any()) или req.file (upload.single())
+    let file;
+    if (req.files && req.files.length > 0) {
+      if (req.files.length > 1) {
+        return res.status(400).json({ error: 'Пожалуйста, загрузите только один файл накладной' });
+      }
+      file = req.files[0];
+    } else {
+      file = req.file;
+    }
+
+    if (!file) {
+      return res.status(400).json({ error: 'Файл накладной не передан' });
+    }
+
+    // Проверяем тип файла
+    const allowedMimeTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+    if (!allowedMimeTypes.includes(file.mimetype)) {
+      return res.status(400).json({ error: 'Недопустимый тип файла. Разрешены только изображения' });
+    }
+
+    // Получаем пользователя магазина для проверки дистрибьютора
+    const storeUser = await User.findOne({
+      storeId,
+      role: { $in: STORE_ROLES },
+      isActive: true
+    }).lean();
+
+    if (!storeUser) {
+      return res.status(404).json({ error: 'Магазин не найден или не активен' });
+    }
+
+    // Анализируем накладную с помощью ИИ
+    let invoiceData;
+    try {
+      invoiceData = await analyzeInvoice({
+        buffer: file.buffer,
+        mimeType: file.mimetype
+      });
+    } catch (error) {
+      console.error('Ошибка при анализе накладной:', error);
+      return res.status(500).json({
+        error: 'Ошибка при анализе накладной',
+        details: error.message
+      });
+    }
+
+    if (!invoiceData.items || invoiceData.items.length === 0) {
+      return res.status(400).json({
+        error: 'Не удалось извлечь товары из накладной. Проверьте качество изображения.'
+      });
+    }
+
+    // Обрабатываем каждый товар из накладной
+    const results = {
+      processed: [],
+      notFound: [],
+      errors: []
+    };
+
+    for (const item of invoiceData.items) {
+      try {
+        if (!item.productName || !item.quantity || item.quantity <= 0) {
+          results.errors.push({
+            item,
+            error: 'Отсутствует название товара или неверное количество'
+          });
+          continue;
+        }
+
+        // Ищем товар в базе данных
+        // Сначала по SKU, если он указан
+        let product = null;
+        if (item.sku) {
+          product = await Product.findOne({ sku: item.sku }).lean();
+        }
+
+        // Если не нашли по SKU, ищем по названию и бренду
+        if (!product) {
+          const searchQuery = {
+            name: { $regex: item.productName, $options: 'i' }
+          };
+
+          // Если указан бренд, добавляем его в поиск
+          if (item.brand) {
+            searchQuery.brandName = { $regex: item.brand, $options: 'i' };
+          }
+
+          // Ищем товары, которые оплачены и не истекли
+          searchQuery.isPayed = true;
+          searchQuery.paymentExpiresAt = { $gt: new Date() };
+
+          const products = await Product.find(searchQuery).lean();
+
+          // Если найдено несколько товаров, выбираем наиболее подходящий
+          if (products.length > 0) {
+            // Если есть точное совпадение по названию - берем его
+            const exactMatch = products.find(p =>
+              p.name.toLowerCase() === item.productName.toLowerCase()
+            );
+            product = exactMatch || products[0];
+          }
+        }
+
+        if (!product) {
+          results.notFound.push({
+            productName: item.productName,
+            sku: item.sku,
+            brand: item.brand,
+            quantity: item.quantity
+          });
+          continue;
+        }
+
+        // Проверяем связь бренда с дистрибьютором (если магазин привязан к дистрибьютору)
+        if (storeUser.distributorId) {
+          const brandDistributorConnection = await BrandDistributorRequest.findOne({
+            brandId: product.brandId,
+            distributorId: storeUser.distributorId,
+            status: 'ACCEPTED'
+          }).lean();
+
+          if (!brandDistributorConnection) {
+            results.errors.push({
+              item,
+              error: 'Бренд товара не подключен к дистрибьютору этого магазина'
+            });
+            continue;
+          }
+        }
+
+        // Ищем или создаем оффер
+        let offer = await Offer.findOne({ productId: product.id, storeId }).lean();
+
+        if (!offer) {
+          // Создаем новый оффер
+          offer = await Offer.create({
+            id: generateId(),
+            productId: product.id,
+            storeId,
+            price: 0, // Цену нужно будет установить позже
+            currency: 'RUB',
+            isAvailable: true,
+            quantity: item.quantity
+          });
+          offer = offer.toObject();
+        } else {
+          // Увеличиваем количество
+          const newQuantity = (offer.quantity || 0) + item.quantity;
+          offer = await Offer.findOneAndUpdate(
+            { id: offer.id },
+            { quantity: newQuantity, updatedAt: new Date() },
+            { new: true }
+          ).lean();
+        }
+
+        results.processed.push({
+          productName: product.name,
+          productId: product.id,
+          sku: product.sku,
+          brandName: product.brandName,
+          quantity: item.quantity,
+          totalQuantity: offer.quantity,
+          offerId: offer.id
+        });
+      } catch (error) {
+        console.error('Ошибка при обработке товара из накладной:', error);
+        results.errors.push({
+          item,
+          error: error.message
+        });
+      }
+    }
+
+    res.json({
+      message: 'Накладная обработана',
+      invoiceInfo: {
+        invoiceNumber: invoiceData.invoiceNumber,
+        date: invoiceData.date,
+        supplier: invoiceData.supplier
+      },
+      summary: {
+        total: invoiceData.items.length,
+        processed: results.processed.length,
+        notFound: results.notFound.length,
+        errors: results.errors.length
+      },
+      processed: results.processed,
+      notFound: results.notFound,
+      errors: results.errors
+    });
+  } catch (error) {
+    console.error('Ошибка при обработке накладной:', error);
+    res.status(500).json({ error: 'Ошибка при обработке накладной' });
+  }
+}
+
 module.exports = {
   // Функции для владельца магазина
   getWarehouseInventory,
@@ -557,6 +763,7 @@ module.exports = {
   removeStock,
   updateStock,
   getWarehouseAnalytics,
+  processInvoice,
   // Функции для продавца (QR-сканер)
   findProductByBarcode,
   quickAddStockByBarcode

@@ -1,4 +1,5 @@
 const express = require('express');
+const multer = require('multer');
 const router = express.Router();
 const { authenticateToken, requireStoreOwner, requireStoreSeller } = require('../middleware/auth');
 const {
@@ -8,10 +9,17 @@ const {
   removeStock,
   updateStock,
   getWarehouseAnalytics,
+  processInvoice,
   // Функции для продавца магазина (QR-сканер)
   findProductByBarcode,
   quickAddStockByBarcode
 } = require('../controllers/warehouseController');
+
+// Настройка multer для загрузки файлов
+const upload = multer({ 
+  storage: multer.memoryStorage(), 
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB
+});
 
 // Все маршруты требуют авторизации
 router.use(authenticateToken);
@@ -33,6 +41,10 @@ router.put('/stock/update', requireStoreOwner, updateStock);
 
 // Аналитика склада
 router.get('/analytics', requireStoreOwner, getWarehouseAnalytics);
+
+// Обработка накладной с помощью ИИ
+// Принимаем файл с любым именем поля (file, invoice, image и т.д.)
+router.post('/invoice/process', requireStoreOwner, upload.any(), processInvoice);
 
 // ========== МАРШРУТЫ ДЛЯ ПРОДАВЦА МАГАЗИНА (QR-СКАНЕР) ==========
 // Только быстрый приход товара по штрих-коду

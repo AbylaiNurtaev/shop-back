@@ -11,6 +11,7 @@ const {
   getSearch,
   uploadAttachment,
   uploadVoice,
+  searchByImage,
   getHistory,
   exportHistory,
   deleteHistory
@@ -28,6 +29,7 @@ router.get('/search/:requestId', getSearch);
 
 router.post('/attachments', upload.single('file'), uploadAttachment);
 router.post('/voice', upload.single('file'), uploadVoice);
+router.post('/search-by-image', upload.single('image'), searchByImage);
 
 router.get('/history', getHistory);
 router.get('/history/export', exportHistory);

@@ -32,12 +32,13 @@ app.use('/api/users', userRoutes);
 app.use('/api/stores', storeRoutes);
 app.use('/api/distributors', distributorRoutes);
 app.use('/api/sales-reps', salesRepRoutes);
+app.use('/api/sales-representatives', salesRepRoutes); // Алиас для совместимости
 app.use('/api/brands', brandRoutes);
 app.use('/api/categories', categoryRoutes);
 app.use('/api/products', productRoutes);
 app.use('/api/offers', offerRoutes);
 app.use('/api/uploads', uploadRoutes);
-app.use('/api/customer', customerRoutes);
+app.use('/api/customers', customerRoutes);
 app.use('/api/warehouse', warehouseRoutes);
 app.use('/api/pos', posRoutes);
 app.use('/api/plans', planRoutes);

@@ -461,6 +461,24 @@ const distributorProductPriceSchema = new mongoose.Schema(
 // Уникальный индекс для предотвращения дубликатов
 distributorProductPriceSchema.index({ distributorId: 1, productId: 1 }, { unique: true });
 
+// Схема истории действий дистрибьютора
+// Одна запись = один дистрибьютор, внутри массив действий
+const distributorActivityActionSchema = new mongoose.Schema({
+  actionType: { type: String, required: true }, // Тип действия (например, 'UPDATE_NAME', 'ADD_STORE', 'ADD_SALES_REP')
+  description: { type: String, required: true }, // Описание действия
+  metadata: { type: Object, default: {} }, // Дополнительные данные (id объектов, значения и т.д.)
+  timestamp: { type: Date, default: Date.now } // Время действия
+}, { _id: false });
+
+const distributorActivityHistorySchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true, unique: true },
+    distributorId: { type: String, required: true, unique: true, index: true },
+    actions: [distributorActivityActionSchema] // Массив действий
+  },
+  baseSchemaOptions
+);
+
 const User = mongoose.models.User || mongoose.model('User', userSchema);
 const Store = mongoose.models.Store || mongoose.model('Store', storeSchema);
 const Distributor =
@@ -508,6 +526,8 @@ const CategoryPlan =
   mongoose.models.CategoryPlan || mongoose.model('CategoryPlan', categoryPlanSchema);
 const DistributorProductPrice =
   mongoose.models.DistributorProductPrice || mongoose.model('DistributorProductPrice', distributorProductPriceSchema);
+const DistributorActivityHistory =
+  mongoose.models.DistributorActivityHistory || mongoose.model('DistributorActivityHistory', distributorActivityHistorySchema);
 
 async function seedDefaults() {
   const categoryCount = await Category.countDocuments();
@@ -634,6 +654,7 @@ module.exports = {
     CategoryRequest,
     Plan,
     CategoryPlan,
-    DistributorProductPrice
+    DistributorProductPrice,
+    DistributorActivityHistory
   }
 };

@@ -2,7 +2,7 @@ const multer = require('multer');
 const { generateId } = require('../utils/uuid');
 const { uploadImage } = require('../utils/s3');
 const { calculateDistance, getCoordinatesFromLink } = require('../utils/distance');
-const { getIntentFromGemini, transcribeAudio, generateClarificationQuestions } = require('../utils/gemini');
+const { getIntentFromGemini, transcribeAudio, generateClarificationQuestions, analyzeProductImage } = require('../utils/gemini');
 const { models } = require('../models/database');
 
 const {
@@ -249,10 +249,11 @@ function filterCandidatesByIntent(candidates, intent) {
   if (intent.type) {
     const typeLower = normalizeText(intent.type);
     const typeKeywords = {
-      'zero': ['zero', 'ноль', '0', 'без сахара'],
+      'zero': ['zero', 'ноль', '0', 'без сахара', 'безсахар'],
       'light': ['light', 'лайт', 'легкий'],
       'diet': ['diet', 'диет', 'диетический'],
-      'обычная': ['обычная', 'классическая', 'classic', 'original']
+      'classic': ['classic', 'классическая', 'классик', 'обычная', 'original', 'оригинал'],
+      'обычная': ['обычная', 'классическая', 'classic', 'original', 'оригинал']
     };
 
     const keywords = typeKeywords[typeLower] || [typeLower];
@@ -260,7 +261,23 @@ function filterCandidatesByIntent(candidates, intent) {
     filtered = filtered.filter(item => {
       const nameLower = normalizeText(item.name);
       const descLower = normalizeText(item.description || '');
-      return keywords.some(keyword => nameLower.includes(keyword) || descLower.includes(keyword));
+      const brandLower = normalizeText(item.brandName || '');
+      const fullText = `${nameLower} ${descLower} ${brandLower}`;
+
+      // Для "classic" - если в товаре нет явных указаний на zero/light/diet, считаем его classic
+      if (typeLower === 'classic' || typeLower === 'обычная') {
+        const hasZero = ['zero', 'ноль', '0', 'без сахара', 'безсахар'].some(k => fullText.includes(k));
+        const hasLight = ['light', 'лайт', 'легкий'].some(k => fullText.includes(k));
+        const hasDiet = ['diet', 'диет', 'диетический'].some(k => fullText.includes(k));
+
+        // Если нет указаний на zero/light/diet - это classic
+        if (!hasZero && !hasLight && !hasDiet) {
+          return true;
+        }
+      }
+
+      // Обычная проверка по ключевым словам
+      return keywords.some(keyword => fullText.includes(keyword));
     });
   }
 
@@ -439,6 +456,15 @@ async function performSearch({ text, geo, radiusMeters, intent }) {
   const radius = radiusMeters || 1000;
   const offersByProduct = new Map();
 
+  // Функция для форматирования расстояния
+  const formatDistance = (meters) => {
+    if (meters < 1000) {
+      return `${Math.round(meters)} м`;
+    }
+    const km = (meters / 1000).toFixed(1);
+    return `${km} км`;
+  };
+
   for (const offer of offers) {
     const store = storeById.get(offer.storeId);
     if (!store || !store.location) continue;
@@ -458,7 +484,7 @@ async function performSearch({ text, geo, radiusMeters, intent }) {
     if (!coords) continue;
 
     const distance = calculateDistance(geo.lat, geo.lng, coords.lat, coords.lon);
-    if (distance > radius) continue;
+    const isWithinRadius = distance <= radius;
 
     const mappedOffer = {
       offerId: offer.id,
@@ -471,7 +497,10 @@ async function performSearch({ text, geo, radiusMeters, intent }) {
         name: store.name,
         address: store.address,
         location: store.location,
-        distanceMeters: Math.round(distance)
+        locationCoords: store.locationCoords || null,
+        distanceMeters: Math.round(distance),
+        distanceFormatted: formatDistance(Math.round(distance)),
+        isWithinRadius: isWithinRadius
       }
     };
 
@@ -484,9 +513,17 @@ async function performSearch({ text, geo, radiusMeters, intent }) {
   return products
     .map(product => {
       const offersWithStores = (offersByProduct.get(product.id) || [])
-        .sort((a, b) => a.store.distanceMeters - b.store.distanceMeters);
-      if (offersWithStores.length === 0) return null;
+        .sort((a, b) => {
+          // Сначала показываем предложения в радиусе, потом вне радиуса
+          if (a.store.isWithinRadius !== b.store.isWithinRadius) {
+            return a.store.isWithinRadius ? -1 : 1;
+          }
+          // Внутри каждой группы сортируем по расстоянию
+          return a.store.distanceMeters - b.store.distanceMeters;
+        });
+
       const category = categoryById.get(product.categoryId) || null;
+      const offersInRadius = offersWithStores.filter(o => o.store.isWithinRadius);
 
       return {
         product: {
@@ -504,10 +541,20 @@ async function performSearch({ text, geo, radiusMeters, intent }) {
           allergens: product.allergens,
           ageRestrictions: product.ageRestrictions
         },
-        offers: offersWithStores
+        offers: offersWithStores,
+        // Статистика для удобства
+        totalOffers: offersWithStores.length,
+        offersInRadius: offersInRadius.length,
+        nearestStore: offersWithStores.length > 0 ? {
+          name: offersWithStores[0].store.name,
+          distance: offersWithStores[0].store.distanceFormatted,
+          distanceMeters: offersWithStores[0].store.distanceMeters,
+          address: offersWithStores[0].store.address,
+          location: offersWithStores[0].store.location,
+          isWithinRadius: offersWithStores[0].store.isWithinRadius
+        } : null
       };
-    })
-    .filter(item => item !== null);
+    });
 }
 
 async function postMessage(req, res) {
@@ -543,6 +590,88 @@ async function postMessage(req, res) {
     }
 
     conversation.updatedAt = new Date();
+
+    // Проверяем, есть ли уже выбранный товар и пришла ли геолокация
+    if (intent && intent.filters && Array.isArray(intent.filters.candidateProductIds) && intent.filters.candidateProductIds.length === 1) {
+      // Есть выбранный товар - проверяем геолокацию
+      if (geo && geo.lat !== undefined && geo.lng !== undefined) {
+        // Выполняем поиск для уже выбранного товара
+        const selectedProduct = await Product.findOne({ id: intent.filters.candidateProductIds[0] }).lean();
+        if (selectedProduct) {
+          const request = await SearchRequest.create({
+            id: generateId(),
+            conversationId,
+            intentId: intent.id,
+            geo: { lat: geo.lat, lng: geo.lng },
+            radiusMeters: radiusMeters || 1000,
+            expiresAt: nowPlus(RESULT_TTL_MS)
+          });
+
+          conversation.requestId = request.id;
+          conversation.state = 'SEARCHING';
+          await conversation.save();
+
+          const items = await performSearch({ text: intent.rawText || text, geo, radiusMeters, intent });
+          const result = await SearchResult.create({
+            id: generateId(),
+            requestId: request.id,
+            items,
+            expiresAt: nowPlus(RESULT_TTL_MS)
+          });
+
+          conversation.resultId = result.id;
+          conversation.state = 'DONE';
+          await conversation.save();
+
+          // Формируем сообщение о найденном товаре
+          const productName = `${selectedProduct.name}${selectedProduct.brandName ? ' (' + selectedProduct.brandName + ')' : ''}${selectedProduct.packageInfo ? ' - ' + selectedProduct.packageInfo : ''}`;
+          let systemMessage = `Найден товар: ${productName}`;
+
+          if (items.length === 0) {
+            systemMessage += '\nК сожалению, в ближайших магазинах нет предложений по этому товару. Попробуйте увеличить радиус поиска или уточнить запрос.';
+          } else {
+            const item = items[0]; // Берем первый товар (должен быть один)
+            const totalOffers = item.offers?.length || 0;
+            const offersInRadius = item.offersInRadius || 0;
+
+            if (totalOffers === 0) {
+              systemMessage += '\nК сожалению, в базе нет предложений по этому товару.';
+            } else if (offersInRadius === 0) {
+              const nearest = item.nearestStore;
+              if (nearest) {
+                systemMessage += `\nНайдено предложений: ${totalOffers}, но все они находятся вне радиуса поиска. Ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
+              } else {
+                systemMessage += `\nНайдено предложений: ${totalOffers}, но все они находятся вне радиуса поиска.`;
+              }
+            } else {
+              systemMessage += `\nНайдено предложений: ${totalOffers} (${offersInRadius} в радиусе ${radiusMeters || 1000}м).`;
+            }
+          }
+
+          // Добавляем ответное сообщение от системы
+          await SearchMessage.create({
+            id: generateId(),
+            conversationId,
+            sender: 'SYSTEM',
+            text: systemMessage
+          });
+
+          return res.json({
+            state: conversation.state,
+            messageId: message.id,
+            requestId: request.id,
+            resultId: result.id,
+            items: items.length > 0 ? items : [],
+            selectedProduct: {
+              id: selectedProduct.id,
+              name: selectedProduct.name,
+              brandName: selectedProduct.brandName,
+              packageInfo: selectedProduct.packageInfo
+            }
+          });
+        }
+      }
+    }
 
     // Если это первое сообщение и нет геолокации, просим её
     if (!geo || geo.lat === undefined || geo.lng === undefined) {
@@ -642,7 +771,14 @@ async function postMessage(req, res) {
       if (aiIntent.packageType !== undefined && aiIntent.packageType !== null) {
         intent.packageType = aiIntent.packageType;
       }
+      // Сохраняем intent сразу после обновления
+      await intent.save();
     }
+
+    // Сохраняем предыдущих кандидатов перед фильтрацией (для fallback)
+    const previousCandidateIds = intent.filters && Array.isArray(intent.filters.candidateProductIds)
+      ? intent.filters.candidateProductIds
+      : candidates.map(c => c.id);
 
     // Фильтруем кандидатов на основе текущего intent
     candidates = filterCandidatesByIntent(candidates, {
@@ -658,33 +794,89 @@ async function postMessage(req, res) {
       candidateProductIds: candidates.map(item => item.id)
     };
 
-    // Если кандидатов нет, просим уточнить
+    // Если кандидатов нет после фильтрации, пробуем более мягкую фильтрацию
     if (candidates.length === 0) {
-      conversation.state = 'NEEDS_CLARIFICATION';
-      await intent.save();
-      await conversation.save();
+      // Пробуем фильтровать без последнего добавленного параметра
+      let fallbackCandidates = [];
 
-      // Сбрасываем фильтры и начинаем заново
-      intent.filters = {};
-      intent.brand = null;
-      intent.packageInfo = null;
-      intent.type = null;
-      intent.packageType = null;
-      await intent.save();
+      if (previousCandidateIds && previousCandidateIds.length > 0) {
+        // Берем предыдущих кандидатов
+        fallbackCandidates = await Product.find({
+          id: { $in: previousCandidateIds },
+          isPayed: true,
+          paymentExpiresAt: { $gt: new Date() }
+        }).lean();
+      } else {
+        // Берем исходных кандидатов из текста
+        fallbackCandidates = await buildCandidatesByText(text);
+        fallbackCandidates = fallbackCandidates.filter(p => p.isPayed && p.paymentExpiresAt && new Date(p.paymentExpiresAt) > new Date());
+      }
 
-      return res.json({
-        state: conversation.state,
-        messageId: message.id,
-        questions: ['Не нашел подходящих товаров. Уточните запрос, пожалуйста.'],
-        quickReplies: []
-      });
+      // Фильтруем без последнего параметра (type или packageType)
+      const fallbackIntent = { ...intent };
+      if (intent.type) {
+        // Убираем type и пробуем снова
+        fallbackIntent.type = null;
+        candidates = filterCandidatesByIntent(fallbackCandidates, {
+          brand: fallbackIntent.brand || null,
+          packageInfo: fallbackIntent.packageInfo !== undefined ? fallbackIntent.packageInfo : null,
+          type: null,
+          packageType: fallbackIntent.packageType || null
+        });
+
+        // Если все еще нет кандидатов, сбрасываем все фильтры
+        if (candidates.length === 0) {
+          conversation.state = 'NEEDS_CLARIFICATION';
+          intent.filters = {};
+          intent.brand = null;
+          intent.packageInfo = null;
+          intent.type = null;
+          intent.packageType = null;
+          await intent.save();
+          await conversation.save();
+
+          return res.json({
+            state: conversation.state,
+            messageId: message.id,
+            questions: ['Не нашел подходящих товаров. Попробуйте уточнить запрос по-другому.'],
+            quickReplies: []
+          });
+        } else {
+          // Откатываем type, так как фильтр слишком строгий
+          intent.type = null;
+          await intent.save();
+        }
+      } else {
+        // Если нет кандидатов и не было type, просто сбрасываем
+        conversation.state = 'NEEDS_CLARIFICATION';
+        intent.filters = {};
+        intent.brand = null;
+        intent.packageInfo = null;
+        intent.type = null;
+        intent.packageType = null;
+        await intent.save();
+        await conversation.save();
+
+        return res.json({
+          state: conversation.state,
+          messageId: message.id,
+          questions: ['Не нашел подходящих товаров. Уточните запрос, пожалуйста.'],
+          quickReplies: []
+        });
+      }
     }
 
     // Если остался один товар - можно переходить к поиску (если есть геолокация)
     if (candidates.length === 1) {
+      // Сохраняем intent с выбранным товаром
+      intent.filters = {
+        ...(intent.filters || {}),
+        candidateProductIds: [candidates[0].id]
+      };
+      await intent.save();
+
       if (!geo || geo.lat === undefined || geo.lng === undefined) {
         conversation.state = 'NEEDS_CLARIFICATION';
-        await intent.save();
         await conversation.save();
         return res.json({
           state: conversation.state,
@@ -734,8 +926,22 @@ async function postMessage(req, res) {
       if (items.length === 0) {
         systemMessage += '\nК сожалению, в ближайших магазинах нет предложений по этому товару. Попробуйте увеличить радиус поиска или уточнить запрос.';
       } else {
-        const totalOffers = items.reduce((sum, item) => sum + (item.offers?.length || 0), 0);
-        systemMessage += `\nНайдено предложений: ${totalOffers} в ${items.length} магазинах.`;
+        const item = items[0]; // Берем первый товар (должен быть один)
+        const totalOffers = item.offers?.length || 0;
+        const offersInRadius = item.offersInRadius || 0;
+
+        if (totalOffers === 0) {
+          systemMessage += '\nК сожалению, в базе нет предложений по этому товару.';
+        } else if (offersInRadius === 0) {
+          const nearest = item.nearestStore;
+          if (nearest) {
+            systemMessage += `\nНайдено предложений: ${totalOffers}, но все они находятся вне радиуса поиска. Ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
+          } else {
+            systemMessage += `\nНайдено предложений: ${totalOffers}, но все они находятся вне радиуса поиска.`;
+          }
+        } else {
+          systemMessage += `\nНайдено предложений: ${totalOffers} (${offersInRadius} в радиусе ${radiusMeters || 1000}м).`;
+        }
       }
 
       // Добавляем ответное сообщение от системы
@@ -1034,6 +1240,498 @@ async function deleteHistory(req, res) {
   }
 }
 
+async function searchByImage(req, res) {
+  try {
+    let { conversationId, geo, radiusMeters } = req.body || {};
+    const file = req.file;
+
+    if (!file) {
+      return res.status(400).json({ error: 'Изображение не передано' });
+    }
+
+    if (!ALLOWED_IMAGE_TYPES.has(file.mimetype)) {
+      return res.status(400).json({ error: 'Недопустимый тип файла. Поддерживаются только изображения.' });
+    }
+
+    // Парсим geo, если это строка JSON
+    if (typeof geo === 'string') {
+      try {
+        geo = JSON.parse(geo);
+      } catch (e) {
+        geo = null;
+      }
+    }
+
+    // Парсим radiusMeters, если это строка
+    if (radiusMeters && typeof radiusMeters === 'string') {
+      radiusMeters = parseInt(radiusMeters, 10) || 1000;
+    }
+
+    // Анализируем изображение с помощью Gemini
+    let imageAnalysis = null;
+    try {
+      imageAnalysis = await analyzeProductImage({
+        buffer: file.buffer,
+        mimeType: file.mimetype
+      });
+    } catch (error) {
+      console.error('Ошибка при анализе изображения:', error);
+      return res.status(500).json({
+        error: 'Не удалось проанализировать изображение',
+        details: error.message
+      });
+    }
+
+    if (!imageAnalysis) {
+      return res.status(500).json({ error: 'Не удалось извлечь информацию из изображения' });
+    }
+
+    console.log('Анализ изображения:', imageAnalysis);
+
+    // Функция для нормализации объема (330 ml -> 0.33, 330мл -> 0.33, 0.5л -> 0.5)
+    // Определяем функцию перед использованием
+    const normalizeVolume = (volumeStr) => {
+      if (!volumeStr) return null;
+      const normalized = normalizeText(volumeStr);
+
+      // Извлекаем числа
+      const extractNumbers = (str) => {
+        const match = str.match(/(\d+[.,]?\d*)/);
+        if (!match) return null;
+        return parseFloat(match[1].replace(',', '.'));
+      };
+
+      const num = extractNumbers(normalized);
+      if (!num) return null;
+
+      // Если указано в мл и больше 100, конвертируем в литры
+      if (normalized.includes('ml') || normalized.includes('мл')) {
+        if (num >= 100) {
+          return (num / 1000).toFixed(2);
+        }
+        return (num / 1000).toFixed(3);
+      }
+
+      // Если указано в литрах, возвращаем как есть
+      if (normalized.includes('l') || normalized.includes('л') || normalized.includes('литр')) {
+        return num.toFixed(2);
+      }
+
+      // Если число меньше 10, считаем литрами
+      if (num < 10) {
+        return num.toFixed(2);
+      }
+
+      // Если число больше 10, считаем миллилитрами и конвертируем
+      return (num / 1000).toFixed(2);
+    };
+
+    // Нормализуем объем из анализа
+    const normalizedVolume = normalizeVolume(imageAnalysis.packageInfo);
+    console.log('Нормализованный объем:', normalizedVolume, 'из', imageAnalysis.packageInfo);
+
+    // Создаем поисковый запрос на основе анализа изображения
+    const searchTerms = [];
+    if (imageAnalysis.productName) searchTerms.push(imageAnalysis.productName);
+    if (imageAnalysis.brand) searchTerms.push(imageAnalysis.brand);
+    // Не добавляем description, так как он может содержать лишнюю информацию
+
+    const searchText = searchTerms.join(' ');
+    console.log('Поисковый запрос:', searchText);
+
+    // Ищем товары в базе данных
+    let candidates = [];
+    if (searchText.trim()) {
+      candidates = await buildCandidatesByText(searchText);
+      candidates = candidates.filter(p => p.isPayed && p.paymentExpiresAt && new Date(p.paymentExpiresAt) > new Date());
+      console.log('Найдено кандидатов после текстового поиска:', candidates.length);
+    }
+
+    // Если кандидатов нет, пробуем поиск только по бренду и ключевым словам
+    if (candidates.length === 0 && imageAnalysis.brand) {
+      console.log('Пробуем поиск только по бренду:', imageAnalysis.brand);
+
+      // Нормализуем бренд для поиска
+      const brandNormalized = normalizeBrand(imageAnalysis.brand);
+
+      // Создаем варианты поиска
+      const searchVariants = [imageAnalysis.brand, brandNormalized];
+
+      // Добавляем ключевые слова
+      if (brandNormalized.includes('кола') || brandNormalized.includes('coca')) {
+        searchVariants.push('кола', 'coca cola', 'coca-cola', 'кока кола');
+      }
+      if (brandNormalized.includes('пепси') || brandNormalized.includes('pepsi')) {
+        searchVariants.push('пепси', 'pepsi');
+      }
+      if (brandNormalized.includes('фанта') || brandNormalized.includes('fanta')) {
+        searchVariants.push('фанта', 'fanta');
+      }
+      if (brandNormalized.includes('спрайт') || brandNormalized.includes('sprite')) {
+        searchVariants.push('спрайт', 'sprite');
+      }
+
+      // Ищем по всем вариантам
+      for (const variant of searchVariants) {
+        const found = await buildCandidatesByText(variant);
+        candidates.push(...found);
+      }
+
+      // Убираем дубликаты
+      const uniqueIds = new Set();
+      candidates = candidates.filter(p => {
+        if (uniqueIds.has(p.id)) return false;
+        if (!p.isPayed || !p.paymentExpiresAt || new Date(p.paymentExpiresAt) <= new Date()) return false;
+        uniqueIds.add(p.id);
+        return true;
+      });
+
+      console.log('Найдено кандидатов по бренду:', candidates.length);
+    }
+
+    // Функция для нормализации бренда (убирает дефисы, пробелы, приводит к общему виду)
+    const normalizeBrand = (brand) => {
+      if (!brand) return '';
+      return normalizeText(brand)
+        .replace(/[-\s]/g, '') // Убираем дефисы и пробелы
+        .replace(/cola/g, 'кола')
+        .replace(/coca/g, 'кока')
+        .replace(/pepsi/g, 'пепси')
+        .replace(/fanta/g, 'фанта')
+        .replace(/sprite/g, 'спрайт');
+    };
+
+    // Если нашли бренд, фильтруем по нему (но не слишком строго)
+    if (candidates.length > 0 && imageAnalysis.brand) {
+      const brandNormalized = normalizeBrand(imageAnalysis.brand);
+      const beforeFilter = candidates.length;
+
+      // Если после фильтрации не осталось кандидатов, пробуем более мягкую фильтрацию
+      let filtered = candidates.filter(item => {
+        if (!item.brandName) return false;
+        const itemBrand = normalizeBrand(item.brandName);
+
+        // Точное совпадение после нормализации
+        if (itemBrand === brandNormalized) return true;
+
+        // Взаимное включение
+        if (itemBrand.includes(brandNormalized) || brandNormalized.includes(itemBrand)) return true;
+
+        // Проверяем ключевые слова (кола, пепси и т.д.)
+        const keyWords = ['кола', 'пепси', 'фанта', 'спрайт'];
+        const brandHasKeyword = keyWords.some(kw => brandNormalized.includes(kw));
+        const itemHasKeyword = keyWords.some(kw => itemBrand.includes(kw));
+
+        if (brandHasKeyword && itemHasKeyword) {
+          // Если оба содержат одно и то же ключевое слово
+          const brandKeyword = keyWords.find(kw => brandNormalized.includes(kw));
+          const itemKeyword = keyWords.find(kw => itemBrand.includes(kw));
+          if (brandKeyword === itemKeyword) return true;
+        }
+
+        return false;
+      });
+
+      // Если после строгой фильтрации не осталось, используем более мягкую
+      if (filtered.length === 0 && beforeFilter > 0) {
+        console.log('Применяем мягкую фильтрацию по бренду');
+        filtered = candidates.filter(item => {
+          if (!item.brandName) return true; // Оставляем товары без бренда
+          const itemBrand = normalizeBrand(item.brandName);
+          const brandNormalized = normalizeBrand(imageAnalysis.brand);
+
+          // Проверяем ключевые слова
+          const keyWords = ['кола', 'пепси', 'фанта', 'спрайт'];
+          const brandKeyword = keyWords.find(kw => brandNormalized.includes(kw));
+          const itemKeyword = keyWords.find(kw => itemBrand.includes(kw));
+
+          if (brandKeyword && itemKeyword && brandKeyword === itemKeyword) {
+            return true;
+          }
+
+          // Частичное совпадение
+          return itemBrand.includes(brandNormalized) || brandNormalized.includes(itemBrand);
+        });
+      }
+
+      candidates = filtered;
+      console.log(`Фильтрация по бренду: ${beforeFilter} -> ${candidates.length}`);
+    }
+
+    // Сохраняем кандидатов до фильтрации по упаковке
+    const candidatesBeforePackageFilter = [...candidates];
+
+    // Фильтруем по типу упаковки, если указан (но не слишком строго)
+    if (candidates.length > 0 && imageAnalysis.packageType) {
+      const packageTypeLower = normalizeText(imageAnalysis.packageType);
+      const beforeFilter = candidates.length;
+      candidates = candidates.filter(item => {
+        const nameLower = normalizeText(item.name || '');
+        const descLower = normalizeText(item.description || '');
+        const packageInfoLower = normalizeText(item.packageInfo || '');
+        const fullText = `${nameLower} ${descLower} ${packageInfoLower}`;
+
+        if (packageTypeLower === 'glass' || packageTypeLower === 'стекло') {
+          return fullText.includes('стекл') || fullText.includes('glass');
+        }
+        if (packageTypeLower === 'can' || packageTypeLower === 'банка') {
+          return fullText.includes('банка') || fullText.includes('can') || fullText.includes('жест') || fullText.includes('металл') || fullText.includes('жестя');
+        }
+        if (packageTypeLower === 'plastic' || packageTypeLower === 'пластик') {
+          return fullText.includes('пласти') || fullText.includes('pet');
+        }
+        return true;
+      });
+      console.log(`Фильтрация по типу упаковки: ${beforeFilter} -> ${candidates.length}`);
+
+      // Если после фильтрации по типу упаковки не осталось кандидатов, откатываем фильтр
+      if (candidates.length === 0 && candidatesBeforePackageFilter.length > 0) {
+        console.log('Откатываем фильтр по типу упаковки, так как не осталось кандидатов');
+        candidates = candidatesBeforePackageFilter;
+      }
+    }
+
+    // Фильтруем по объему, если указан (с нормализацией)
+    if (candidates.length > 0 && normalizedVolume) {
+      const beforeFilter = candidates.length;
+      candidates = candidates.filter(item => {
+        if (!item.packageInfo) return false;
+        const itemPackage = normalizeText(item.packageInfo);
+        const itemVolume = normalizeVolume(item.packageInfo);
+
+        if (!itemVolume) {
+          // Если не удалось нормализовать объем товара, проверяем текстовое совпадение
+          return itemPackage.includes(normalizedVolume) || normalizedVolume.includes(itemPackage);
+        }
+
+        // Сравниваем нормализованные объемы с допуском
+        const diff = Math.abs(parseFloat(itemVolume) - parseFloat(normalizedVolume));
+        return diff < 0.1; // Допуск 0.1 литра
+      });
+      console.log(`Фильтрация по объему: ${beforeFilter} -> ${candidates.length}`);
+
+      // Если после фильтрации по объему не осталось кандидатов, откатываем фильтр
+      if (candidates.length === 0 && beforeFilter > 0) {
+        console.log('Откатываем фильтр по объему, так как не осталось кандидатов');
+        candidates = await buildCandidatesByText(searchText || imageAnalysis.brand || '');
+        candidates = candidates.filter(p => p.isPayed && p.paymentExpiresAt && new Date(p.paymentExpiresAt) > new Date());
+
+        // Применяем только фильтр по бренду (мягкий)
+        if (imageAnalysis.brand) {
+          const brandNormalized = normalizeBrand(imageAnalysis.brand);
+          candidates = candidates.filter(item => {
+            if (!item.brandName) return true; // Оставляем товары без бренда
+            const itemBrand = normalizeBrand(item.brandName);
+
+            // Проверяем ключевые слова
+            const keyWords = ['кола', 'пепси', 'фанта', 'спрайт'];
+            const brandKeyword = keyWords.find(kw => brandNormalized.includes(kw));
+            const itemKeyword = keyWords.find(kw => itemBrand.includes(kw));
+
+            if (brandKeyword && itemKeyword && brandKeyword === itemKeyword) {
+              return true;
+            }
+
+            // Частичное совпадение
+            return itemBrand.includes(brandNormalized) || brandNormalized.includes(itemBrand);
+          });
+        }
+      }
+    }
+
+    console.log('Итоговое количество кандидатов:', candidates.length);
+
+    if (candidates.length === 0) {
+      return res.json({
+        success: false,
+        message: 'Товар не найден в базе данных',
+        imageAnalysis: imageAnalysis,
+        candidates: [],
+        debug: {
+          searchText,
+          normalizedVolume,
+          totalSearched: await Product.countDocuments({ isPayed: true, paymentExpiresAt: { $gt: new Date() } })
+        }
+      });
+    }
+
+    // Функция для получения информации о магазинах для кандидатов
+    const getStoresForCandidates = async (productCandidates, userGeo, searchRadius) => {
+      const productIds = productCandidates.map(c => c.id);
+      const offers = await Offer.find({
+        productId: { $in: productIds },
+        isAvailable: true
+      }).lean();
+
+      if (offers.length === 0) {
+        return new Map(); // Возвращаем пустую карту
+      }
+
+      const storeIds = [...new Set(offers.map(offer => offer.storeId))];
+      const stores = storeIds.length > 0
+        ? await Store.find({ id: { $in: storeIds } }).lean()
+        : [];
+      const storeById = new Map(stores.map(store => [store.id, store]));
+
+      const formatDistance = (meters) => {
+        if (meters < 1000) {
+          return `${Math.round(meters)} м`;
+        }
+        const km = (meters / 1000).toFixed(1);
+        return `${km} км`;
+      };
+
+      const candidatesWithStores = new Map();
+
+      for (const candidate of productCandidates) {
+        const productOffers = offers.filter(o => o.productId === candidate.id);
+        const offersWithStores = [];
+
+        for (const offer of productOffers) {
+          const store = storeById.get(offer.storeId);
+          if (!store || !store.location) continue;
+
+          let coords = null;
+          if (store.locationCoords && store.locationCoords.lat !== null && store.locationCoords.lng !== null) {
+            coords = { lat: store.locationCoords.lat, lon: store.locationCoords.lng };
+          } else {
+            coords = await getCoordinatesFromLink(store.location);
+            if (coords) {
+              await Store.updateOne(
+                { id: store.id },
+                { locationCoords: { lat: coords.lat, lng: coords.lon } }
+              );
+            }
+          }
+
+          let distance = null;
+          let distanceFormatted = null;
+          let isWithinRadius = null;
+
+          if (userGeo && coords) {
+            distance = calculateDistance(userGeo.lat, userGeo.lng, coords.lat, coords.lon);
+            distanceFormatted = formatDistance(Math.round(distance));
+            isWithinRadius = searchRadius ? distance <= searchRadius : true;
+          }
+
+          offersWithStores.push({
+            offerId: offer.id,
+            price: offer.price,
+            currency: offer.currency,
+            isAvailable: offer.isAvailable,
+            quantity: offer.quantity,
+            store: {
+              id: store.id,
+              name: store.name,
+              address: store.address,
+              location: store.location,
+              locationCoords: store.locationCoords || null,
+              distanceMeters: distance ? Math.round(distance) : null,
+              distanceFormatted: distanceFormatted,
+              isWithinRadius: isWithinRadius
+            }
+          });
+        }
+
+        // Сортируем предложения
+        offersWithStores.sort((a, b) => {
+          if (userGeo) {
+            // Если есть геолокация, сортируем по расстоянию
+            if (a.store.isWithinRadius !== b.store.isWithinRadius) {
+              return a.store.isWithinRadius ? -1 : 1;
+            }
+            if (a.store.distanceMeters !== null && b.store.distanceMeters !== null) {
+              return a.store.distanceMeters - b.store.distanceMeters;
+            }
+          }
+          // Если нет геолокации, сортируем по цене
+          return (a.price || 0) - (b.price || 0);
+        });
+
+        const offersInRadius = offersWithStores.filter(o => o.store.isWithinRadius === true);
+
+        candidatesWithStores.set(candidate.id, {
+          offers: offersWithStores,
+          totalOffers: offersWithStores.length,
+          offersInRadius: offersInRadius.length,
+          nearestStore: offersWithStores.length > 0 ? {
+            name: offersWithStores[0].store.name,
+            distance: offersWithStores[0].store.distanceFormatted,
+            distanceMeters: offersWithStores[0].store.distanceMeters,
+            address: offersWithStores[0].store.address,
+            location: offersWithStores[0].store.location,
+            isWithinRadius: offersWithStores[0].store.isWithinRadius
+          } : null
+        });
+      }
+
+      return candidatesWithStores;
+    };
+
+    // Получаем информацию о магазинах для кандидатов
+    const candidatesStoresInfo = await getStoresForCandidates(candidates, geo, radiusMeters);
+
+    // Если есть геолокация, выполняем поиск магазинов (для обратной совместимости)
+    let items = [];
+    if (geo && geo.lat !== undefined && geo.lng !== undefined) {
+      // Создаем intent для поиска
+      const intent = {
+        filters: {
+          candidateProductIds: candidates.map(c => c.id)
+        },
+        brand: imageAnalysis.brand || null,
+        packageInfo: imageAnalysis.packageInfo || null,
+        type: imageAnalysis.type || null,
+        packageType: imageAnalysis.packageType || null
+      };
+
+      items = await performSearch({
+        text: searchText,
+        geo,
+        radiusMeters,
+        intent
+      });
+    }
+
+    // Формируем кандидатов с информацией о магазинах
+    const candidatesWithStores = candidates.map(c => {
+      const storeInfo = candidatesStoresInfo.get(c.id) || {
+        offers: [],
+        totalOffers: 0,
+        offersInRadius: 0,
+        nearestStore: null
+      };
+
+      return {
+        id: c.id,
+        name: c.name,
+        brandName: c.brandName,
+        packageInfo: c.packageInfo,
+        description: c.description,
+        images: c.images,
+        offers: storeInfo.offers,
+        totalOffers: storeInfo.totalOffers,
+        offersInRadius: storeInfo.offersInRadius,
+        nearestStore: storeInfo.nearestStore
+      };
+    });
+
+    // Возвращаем результаты
+    return res.json({
+      success: true,
+      imageAnalysis: imageAnalysis,
+      candidates: candidatesWithStores,
+      items: items,
+      totalCandidates: candidates.length,
+      totalOffers: candidatesWithStores.reduce((sum, c) => sum + (c.offers?.length || 0), 0)
+    });
+
+  } catch (error) {
+    console.error('Ошибка при поиске по изображению:', error);
+    res.status(500).json({ error: 'Ошибка при поиске по изображению' });
+  }
+}
+
 module.exports = {
   upload,
   createSession,
@@ -1045,6 +1743,7 @@ module.exports = {
   getSearch,
   uploadAttachment,
   uploadVoice,
+  searchByImage,
   getHistory,
   exportHistory,
   deleteHistory

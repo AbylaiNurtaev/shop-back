@@ -67,11 +67,11 @@ function requestGemini(prompt, config = {}) {
 
 function extractJson(text) {
   if (!text) return null;
-  
+
   let cleaned = text.replace(/```json\s*/g, '').replace(/```\s*/g, '');
   const match = cleaned.match(/\{[\s\S]*\}/);
   if (!match) return null;
-  
+
   try {
     return JSON.parse(match[0]);
   } catch {
@@ -86,7 +86,7 @@ function extractJson(text) {
 async function getIntentFromGemini({ message, candidates, known }) {
   const uniqueBrands = [...new Set(candidates.map(c => c.brandName).filter(Boolean))];
   const uniquePackages = [...new Set(candidates.map(c => c.packageInfo).filter(Boolean))];
-  
+
   const productsList = candidates.slice(0, 30).map(p => ({
     name: p.name,
     brand: p.brandName,
@@ -155,20 +155,20 @@ Known: {"brand":"Coca-Cola","packageInfo":"0.5л","type":null}
   try {
     const response = await requestGemini(prompt, { maxOutputTokens: 200 });
     const parsed = extractJson(response);
-    
+
     if (!parsed || !parsed.action) {
       console.error('Некорректный JSON от Gemini:', response);
       return {
         action: 'READY_TO_SEARCH',
-        intent: { 
-          brand: known.brand || null, 
-          packageInfo: known.packageInfo || null, 
+        intent: {
+          brand: known.brand || null,
+          packageInfo: known.packageInfo || null,
           type: known.type || null,
           packageType: known.packageType || null
         }
       };
     }
-    
+
     // Гарантируем, что не теряем уже известные данные
     const mergedIntent = {
       brand: parsed.intent.brand || known.brand || null,
@@ -176,9 +176,9 @@ Known: {"brand":"Coca-Cola","packageInfo":"0.5л","type":null}
       type: parsed.intent.type || known.type || null,
       packageType: parsed.intent.packageType || known.packageType || null
     };
-    
+
     console.log('Intent извлечен:', { message, known, extracted: parsed.intent, merged: mergedIntent });
-    
+
     return {
       action: 'READY_TO_SEARCH',
       intent: mergedIntent
@@ -187,9 +187,9 @@ Known: {"brand":"Coca-Cola","packageInfo":"0.5л","type":null}
     console.error('Ошибка Gemini getIntent:', error.message);
     return {
       action: 'READY_TO_SEARCH',
-      intent: { 
-        brand: known.brand || null, 
-        packageInfo: known.packageInfo || null, 
+      intent: {
+        brand: known.brand || null,
+        packageInfo: known.packageInfo || null,
         type: known.type || null,
         packageType: known.packageType || null
       }
@@ -216,19 +216,19 @@ async function generateClarificationQuestions({ candidates, known, previousQuest
   // Собираем статистику
   const brands = [...new Set(candidates.map(c => c.brandName).filter(Boolean))];
   const packages = [...new Set(candidates.map(c => c.packageInfo).filter(Boolean))];
-  
+
   const types = new Set();
   const packageTypes = new Set();
-  
+
   candidates.forEach(p => {
     const text = `${p.name || ''} ${p.description || ''}`.toLowerCase();
-    
+
     // Определяем тип напитка
     if (text.includes('zero') || text.includes('ноль')) types.add('Zero');
     if (text.includes('light') || text.includes('лайт')) types.add('Light');
-    if (text.includes('classic') || text.includes('классическая') || 
-        (!text.includes('zero') && !text.includes('light'))) types.add('Classic');
-    
+    if (text.includes('classic') || text.includes('классическая') ||
+      (!text.includes('zero') && !text.includes('light'))) types.add('Classic');
+
     // Определяем тип упаковки
     if (text.includes('стекл') || text.includes('glass')) packageTypes.add('Стекло');
     if (text.includes('банка') || text.includes('can') || text.includes('жест') || text.includes('металл')) packageTypes.add('Металл');
@@ -246,12 +246,12 @@ async function generateClarificationQuestions({ candidates, known, previousQuest
 
   // ПРИОРИТЕТ 1: Если не известна упаковка (объем) и есть варианты
   if (!known.packageInfo && packages.length > 1) {
-    const questionAsked = previousQuestions.some(q => 
-      q.toLowerCase().includes('объем') || 
+    const questionAsked = previousQuestions.some(q =>
+      q.toLowerCase().includes('объем') ||
       q.toLowerCase().includes('литр') ||
       q.toLowerCase().includes('размер')
     );
-    
+
     if (!questionAsked) {
       console.log('→ Задаем вопрос про ОБЪЕМ');
       return {
@@ -263,12 +263,12 @@ async function generateClarificationQuestions({ candidates, known, previousQuest
 
   // ПРИОРИТЕТ 2: Если не известен тип напитка и есть варианты
   if (!known.type && types.size > 1) {
-    const questionAsked = previousQuestions.some(q => 
+    const questionAsked = previousQuestions.some(q =>
       q.toLowerCase().includes('тип') ||
       q.toLowerCase().includes('zero') ||
       q.toLowerCase().includes('сахар')
     );
-    
+
     if (!questionAsked) {
       console.log('→ Задаем вопрос про ТИП');
       return {
@@ -280,13 +280,13 @@ async function generateClarificationQuestions({ candidates, known, previousQuest
 
   // ПРИОРИТЕТ 3: Если не известен тип упаковки (стекло/металл) и есть варианты
   if (!known.packageType && packageTypes.size > 1) {
-    const questionAsked = previousQuestions.some(q => 
+    const questionAsked = previousQuestions.some(q =>
       q.toLowerCase().includes('тара') ||
       q.toLowerCase().includes('стекло') ||
       q.toLowerCase().includes('банка') ||
       q.toLowerCase().includes('металл')
     );
-    
+
     if (!questionAsked) {
       console.log('→ Задаем вопрос про ТАРУ');
       return {
@@ -298,11 +298,11 @@ async function generateClarificationQuestions({ candidates, known, previousQuest
 
   // ПРИОРИТЕТ 4: Если не известен бренд и есть варианты
   if (!known.brand && brands.length > 1) {
-    const questionAsked = previousQuestions.some(q => 
+    const questionAsked = previousQuestions.some(q =>
       q.toLowerCase().includes('бренд') ||
       q.toLowerCase().includes('марк')
     );
-    
+
     if (!questionAsked) {
       console.log('→ Задаем вопрос про БРЕНД');
       return {
@@ -317,7 +317,7 @@ async function generateClarificationQuestions({ candidates, known, previousQuest
     console.log('→ Показываем список из', candidates.length, 'товаров');
     return {
       questions: ['Выберите товар:'],
-      quickReplies: candidates.slice(0, 5).map(c => 
+      quickReplies: candidates.slice(0, 5).map(c =>
         `${c.brandName || ''} ${c.packageInfo || ''} ${c.name || ''}`.trim().slice(0, 50)
       )
     };
@@ -326,11 +326,116 @@ async function generateClarificationQuestions({ candidates, known, previousQuest
   // Если товаров слишком много и вопросы закончились - просим уточнить
   console.log('⚠️ Не смогли сузить выбор, товаров:', candidates.length);
   console.log('⚠️ Все вопросы уже заданы, но товаров всё ещё много');
-  
+
   return {
     questions: ['Уточните название или характеристики товара'],
     quickReplies: []
   };
+}
+
+// ============================================================================
+// АНАЛИЗ ИЗОБРАЖЕНИЯ ТОВАРА
+// ============================================================================
+
+async function analyzeProductImage({ buffer, mimeType }) {
+  if (!GEMINI_API_KEY) {
+    throw new Error('GEMINI_API_KEY не задан');
+  }
+  if (!buffer || !mimeType) {
+    throw new Error('Нет данных для анализа изображения');
+  }
+
+  const prompt = `Ты эксперт по распознаванию товаров на изображениях. Проанализируй это изображение и извлеки информацию о товаре.
+
+ОПИШИ ТОВАР:
+- Название товара (если видно на упаковке/этикетке)
+- Бренд (Coca-Cola, Pepsi, Fanta, Sprite и т.д.)
+- Тип упаковки (стеклянная бутылка, пластиковая бутылка, банка)
+- Объем/размер упаковки (0.5л, 1л, 2л и т.д.)
+- Тип напитка (Classic, Zero, Light, если применимо)
+- Любые другие характеристики, которые видишь
+
+ВАЖНО:
+- Будь точным в распознавании брендов и названий
+- Если видишь текст на упаковке - используй его
+- Если не уверен в чем-то - укажи null
+
+ФОРМАТ ОТВЕТА (ТОЛЬКО JSON):
+{
+  "productName": "название товара или null",
+  "brand": "бренд или null",
+  "packageType": "glass/can/plastic или null",
+  "packageInfo": "объем/размер или null",
+  "type": "classic/zero/light или null",
+  "description": "краткое описание того, что видно на изображении"
+}
+
+ВЕРНИ ТОЛЬКО JSON!`;
+
+  const payload = JSON.stringify({
+    contents: [{
+      parts: [
+        { text: prompt },
+        {
+          inline_data: {
+            mime_type: mimeType,
+            data: buffer.toString('base64')
+          }
+        }
+      ]
+    }],
+    generationConfig: {
+      temperature: 0,
+      maxOutputTokens: 500
+    }
+  });
+
+  const options = {
+    hostname: 'generativelanguage.googleapis.com',
+    path: `/${GEMINI_API_VERSION}/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(payload)
+    },
+    timeout: 15000
+  };
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, res => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          return reject(new Error(`Gemini ${res.statusCode}: ${data}`));
+        }
+        try {
+          const parsed = JSON.parse(data);
+          const text = parsed?.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (!text) {
+            return reject(new Error('Пустой ответ от Gemini'));
+          }
+
+          const extracted = extractJson(text);
+          if (!extracted) {
+            return reject(new Error('Не удалось извлечь JSON из ответа Gemini'));
+          }
+
+          resolve(extracted);
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Timeout'));
+    });
+    req.write(payload);
+    req.end();
+  });
 }
 
 // ============================================================================
@@ -405,14 +510,134 @@ async function transcribeAudio({ buffer, mimeType }) {
   });
 }
 
+// ============================================================================
+// АНАЛИЗ НАКЛАДНОЙ (ИЗВЛЕЧЕНИЕ ТОВАРОВ)
+// ============================================================================
+
+async function analyzeInvoice({ buffer, mimeType }) {
+  if (!GEMINI_API_KEY) {
+    throw new Error('GEMINI_API_KEY не задан');
+  }
+  if (!buffer || !mimeType) {
+    throw new Error('Нет данных для анализа накладной');
+  }
+
+  const prompt = `Ты эксперт по анализу накладных и товарных документов. Проанализируй это изображение накладной и извлеки список всех товаров с их количеством.
+
+ВАЖНО:
+- Прочитай весь текст на изображении
+- Найди таблицу или список товаров
+- Для каждого товара извлеки: название, количество (штук), артикул/SKU (если есть), бренд (если видно)
+- Количество может быть указано в разных единицах (шт, уп, коробка и т.д.) - конвертируй в штуки если возможно
+- Если количество указано как "уп" (упаковка), "коробка" и т.д., попробуй определить количество штук в упаковке или оставь как есть
+
+ФОРМАТ ОТВЕТА (ТОЛЬКО JSON):
+{
+  "items": [
+    {
+      "productName": "полное название товара",
+      "quantity": число (количество штук),
+      "sku": "артикул или null",
+      "brand": "название бренда или null",
+      "unit": "шт/уп/коробка и т.д.",
+      "notes": "дополнительные заметки или null"
+    }
+  ],
+  "invoiceNumber": "номер накладной или null",
+  "date": "дата накладной или null",
+  "supplier": "поставщик или null"
+}
+
+ПРИМЕРЫ:
+- "Coca-Cola 0.5л x 24 шт" → {"productName": "Coca-Cola 0.5л", "quantity": 24, "unit": "шт"}
+- "Пепси 1л, 10 уп по 6 шт" → {"productName": "Пепси 1л", "quantity": 60, "unit": "шт", "notes": "10 уп по 6 шт"}
+- "Fanta 2л - 5 коробок" → {"productName": "Fanta 2л", "quantity": 5, "unit": "коробка"}
+
+ВЕРНИ ТОЛЬКО JSON!`;
+
+  const payload = JSON.stringify({
+    contents: [{
+      parts: [
+        { text: prompt },
+        {
+          inline_data: {
+            mime_type: mimeType,
+            data: buffer.toString('base64')
+          }
+        }
+      ]
+    }],
+    generationConfig: {
+      temperature: 0,
+      maxOutputTokens: 2000
+    }
+  });
+
+  const options = {
+    hostname: 'generativelanguage.googleapis.com',
+    path: `/${GEMINI_API_VERSION}/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(payload)
+    },
+    timeout: 30000
+  };
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, res => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          return reject(new Error(`Gemini ${res.statusCode}: ${data}`));
+        }
+        try {
+          const parsed = JSON.parse(data);
+          const text = parsed?.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (!text) {
+            return reject(new Error('Пустой ответ от Gemini'));
+          }
+
+          const extracted = extractJson(text);
+          if (!extracted) {
+            return reject(new Error('Не удалось извлечь JSON из ответа Gemini'));
+          }
+
+          // Валидация структуры ответа
+          if (!extracted.items || !Array.isArray(extracted.items)) {
+            return reject(new Error('Некорректная структура ответа: отсутствует массив items'));
+          }
+
+          resolve(extracted);
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Timeout'));
+    });
+    req.write(payload);
+    req.end();
+  });
+}
+
 // Экспорт всех функций
 module.exports = {
   getIntentFromGemini,
   transcribeAudio,
-  generateClarificationQuestions
+  generateClarificationQuestions,
+  analyzeProductImage,
+  analyzeInvoice
 };
 
 // Для совместимости с разными способами импорта
 module.exports.getIntentFromGemini = getIntentFromGemini;
 module.exports.transcribeAudio = transcribeAudio;
 module.exports.generateClarificationQuestions = generateClarificationQuestions;
+module.exports.analyzeProductImage = analyzeProductImage;
+module.exports.analyzeInvoice = analyzeInvoice;

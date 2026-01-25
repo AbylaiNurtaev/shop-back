@@ -1,7 +1,8 @@
 const { generateId } = require('../utils/uuid');
 const { models } = require('../models/database');
+const { logDistributorActivity } = require('../utils/distributorActivityLogger');
 
-const { Distributor, User, Store, Brand, BrandDistributorRequest, SalesRepresentative, SalesRepresentativeStore, SalesRepresentativeProduct, Product, Offer, Sale, Plan, DistributorProductPrice } = models;
+const { Distributor, User, Store, Brand, BrandDistributorRequest, SalesRepresentative, SalesRepresentativeStore, SalesRepresentativeProduct, Product, Offer, Sale, Plan, DistributorProductPrice, DistributorActivityHistory } = models;
 
 const STORE_ROLES = ['STORE', 'STORE_USER'];
 
@@ -104,27 +105,27 @@ async function getDistributorById(req, res) {
 async function getDistributors(req, res) {
   try {
     const { country, city, categoryId, hasActiveStores, brandId } = req.query;
-    
+
     // Базовый запрос
     const query = {};
-    
+
     // Фильтр по стране
     if (country) {
       query.country = country;
     }
-    
+
     // Фильтр по городу
     if (city) {
       query.city = city;
     }
-    
+
     let distributors = await Distributor.find(query).lean();
-    
+
     // Если нужна фильтрация по категориям или активным магазинам,
     // нужно дополнительно обработать результаты
     if (categoryId || hasActiveStores === 'true') {
       const distributorIds = distributors.map(d => d.id);
-      
+
       // Если нужны только дистрибьюторы с активными магазинами
       if (hasActiveStores === 'true') {
         const usersWithStores = await User.find({
@@ -132,19 +133,19 @@ async function getDistributors(req, res) {
           role: { $in: STORE_ROLES },
           isActive: true
         }).lean();
-        
+
         const distributorsWithStores = new Set(
           usersWithStores.map(u => u.distributorId).filter(Boolean)
         );
-        
+
         distributors = distributors.filter(d => distributorsWithStores.has(d.id));
       }
-      
+
       // Если нужна фильтрация по категориям брендов
       // (это требует дополнительной логики, так как категории связаны с брендами, а не дистрибьюторами)
       // Пока оставим это для будущей реализации
     }
-    
+
     // Добавляем информацию о количестве активных магазинов для каждого дистрибьютора
     const distributorIds = distributors.map(d => d.id);
     const storeCounts = await User.aggregate([
@@ -162,18 +163,18 @@ async function getDistributors(req, res) {
         }
       }
     ]);
-    
+
     const storeCountMap = {};
     storeCounts.forEach(item => {
       storeCountMap[item._id] = item.count;
     });
-    
+
     // Добавляем количество магазинов к каждому дистрибьютору
     const distributorsWithStores = distributors.map(distributor => ({
       ...distributor,
       activeStoresCount: storeCountMap[distributor.id] || 0
     }));
-    
+
     // Если передан brandId, группируем дистрибьюторов на прикрепленные и неприкрепленные
     if (brandId) {
       // Получаем все принятые запросы для данного бренда
@@ -181,19 +182,19 @@ async function getDistributors(req, res) {
         brandId,
         status: 'ACCEPTED'
       }).lean();
-      
+
       const attachedDistributorIds = new Set(
         acceptedRequests.map(req => req.distributorId)
       );
-      
+
       // Разделяем дистрибьюторов на две группы
-      const attached = distributorsWithStores.filter(d => 
+      const attached = distributorsWithStores.filter(d =>
         attachedDistributorIds.has(d.id)
       );
-      const notAttached = distributorsWithStores.filter(d => 
+      const notAttached = distributorsWithStores.filter(d =>
         !attachedDistributorIds.has(d.id)
       );
-      
+
       return res.json({
         attached: {
           items: attached,
@@ -205,7 +206,7 @@ async function getDistributors(req, res) {
         }
       });
     }
-    
+
     // Если brandId не передан, возвращаем результат в старом формате
     res.json({
       items: distributorsWithStores,
@@ -223,18 +224,59 @@ async function updateDistributor(req, res) {
     const { name, address, location, description, photos } = req.body;
     const normalizedLocation = normalizeLocation(location);
 
+    // Получаем старые данные для логирования
+    const oldDistributor = await Distributor.findOne({ id: distributorId }).lean();
+    if (!oldDistributor) {
+      return res.status(404).json({ error: 'Дистрибьютор не найден' });
+    }
+
     const update = { updatedAt: new Date() };
-    if (name !== undefined) update.name = name;
-    if (address !== undefined) update.address = address;
-    if (location !== undefined) update.location = normalizedLocation;
-    if (description !== undefined) update.description = description;
-    if (photos !== undefined) update.photos = photos;
+    const changes = [];
+    if (name !== undefined) {
+      update.name = name;
+      if (oldDistributor.name !== name) {
+        changes.push(`имя: "${oldDistributor.name}" → "${name}"`);
+      }
+    }
+    if (address !== undefined) {
+      update.address = address;
+      if (oldDistributor.address !== address) {
+        changes.push(`адрес: "${oldDistributor.address}" → "${address}"`);
+      }
+    }
+    if (location !== undefined) {
+      update.location = normalizedLocation;
+      if (oldDistributor.location !== normalizedLocation) {
+        changes.push('локация обновлена');
+      }
+    }
+    if (description !== undefined) {
+      update.description = description;
+      if (oldDistributor.description !== description) {
+        changes.push('описание обновлено');
+      }
+    }
+    if (photos !== undefined) {
+      update.photos = photos;
+      changes.push(`фотографии обновлены (${photos.length} шт.)`);
+    }
 
     const distributor = await Distributor.findOneAndUpdate({ id: distributorId }, update, {
       new: true
     }).lean();
     if (!distributor) {
       return res.status(404).json({ error: 'Дистрибьютор не найден' });
+    }
+
+    // Логируем действие, если это дистрибьютор обновляет себя
+    const userDistributorId = req.user && req.user.distributorId;
+    if (userDistributorId === distributorId && changes.length > 0) {
+      await logDistributorActivity(
+        distributorId,
+        'UPDATE_DISTRIBUTOR',
+        `Обновлены данные дистрибьютора: ${changes.join(', ')}`,
+        { changes, name: name !== undefined ? name : oldDistributor.name, address: address !== undefined ? address : oldDistributor.address }
+      );
     }
 
     res.json(distributor);
@@ -294,6 +336,7 @@ async function updateMyDistributorName(req, res) {
       return res.status(404).json({ error: 'Дистрибьютор не найден' });
     }
 
+    const oldDistributor = await Distributor.findOne({ id: user.distributorId }).lean();
     const distributor = await Distributor.findOneAndUpdate(
       { id: user.distributorId },
       { name: name.trim(), updatedAt: new Date() },
@@ -303,6 +346,14 @@ async function updateMyDistributorName(req, res) {
     if (!distributor) {
       return res.status(404).json({ error: 'Дистрибьютор не найден' });
     }
+
+    // Логируем действие
+    await logDistributorActivity(
+      user.distributorId,
+      'UPDATE_NAME',
+      `Обновлено имя дистрибьютора с "${oldDistributor?.name || 'неизвестно'}" на "${name.trim()}"`,
+      { oldName: oldDistributor?.name, newName: name.trim() }
+    );
 
     res.json(distributor);
   } catch (error) {
@@ -316,49 +367,49 @@ async function sendConnectionRequest(req, res) {
   try {
     const { distributorId } = req.params;
     const brandId = req.user && req.user.brandId;
-    
+
     if (!brandId) {
       return res.status(403).json({ error: 'Только бренды могут отправлять запросы на подключение' });
     }
-    
+
     if (!distributorId) {
       return res.status(400).json({ error: 'ID дистрибьютора обязателен' });
     }
-    
+
     // Проверяем существование дистрибьютора
     const distributor = await Distributor.findOne({ id: distributorId }).lean();
     if (!distributor) {
       return res.status(404).json({ error: 'Дистрибьютор не найден' });
     }
-    
+
     // Проверяем существование бренда
     const brand = await Brand.findOne({ id: brandId }).lean();
     if (!brand) {
       return res.status(404).json({ error: 'Бренд не найден' });
     }
-    
+
     // Проверяем, не отправлен ли уже запрос
     const existingRequest = await BrandDistributorRequest.findOne({
       brandId,
       distributorId,
       status: 'PENDING'
     }).lean();
-    
+
     if (existingRequest) {
       return res.status(409).json({ error: 'Запрос на подключение уже отправлен' });
     }
-    
+
     // Проверяем, не принят ли уже запрос
     const acceptedRequest = await BrandDistributorRequest.findOne({
       brandId,
       distributorId,
       status: 'ACCEPTED'
     }).lean();
-    
+
     if (acceptedRequest) {
       return res.status(409).json({ error: 'Бренд уже подключен к этому дистрибьютору' });
     }
-    
+
     // Создаем запрос
     const request = await BrandDistributorRequest.create({
       id: generateId(),
@@ -366,7 +417,7 @@ async function sendConnectionRequest(req, res) {
       distributorId,
       status: 'PENDING'
     });
-    
+
     // Отправляем email дистрибьютору
     const { sendEmail } = require('../utils/email');
     try {
@@ -379,7 +430,7 @@ async function sendConnectionRequest(req, res) {
       console.error('Ошибка при отправке email дистрибьютору:', emailError);
       // Не прерываем процесс, если email не отправился
     }
-    
+
     res.status(201).json({
       message: 'Запрос на подключение отправлен',
       request: request.toObject()
@@ -394,15 +445,15 @@ async function sendConnectionRequest(req, res) {
 async function getConnectionRequests(req, res) {
   try {
     const distributorId = req.user && req.user.distributorId;
-    
+
     if (!distributorId) {
       return res.status(403).json({ error: 'Только дистрибьюторы могут просматривать запросы' });
     }
-    
+
     const requests = await BrandDistributorRequest.find({ distributorId })
       .sort({ createdAt: -1 })
       .lean();
-    
+
     // Получаем информацию о брендах
     const brandIds = requests.map(r => r.brandId);
     const brands = await Brand.find({ id: { $in: brandIds } }).lean();
@@ -410,13 +461,13 @@ async function getConnectionRequests(req, res) {
     brands.forEach(brand => {
       brandMap[brand.id] = brand;
     });
-    
+
     // Объединяем запросы с информацией о брендах
     const requestsWithBrands = requests.map(request => ({
       ...request,
       brand: brandMap[request.brandId] || null
     }));
-    
+
     res.json({
       items: requestsWithBrands,
       total: requestsWithBrands.length
@@ -432,34 +483,42 @@ async function acceptConnectionRequest(req, res) {
   try {
     const { requestId } = req.params;
     const distributorId = req.user && req.user.distributorId;
-    
+
     if (!distributorId) {
       return res.status(403).json({ error: 'Только дистрибьюторы могут принимать запросы' });
     }
-    
+
     const request = await BrandDistributorRequest.findOne({ id: requestId }).lean();
     if (!request) {
       return res.status(404).json({ error: 'Запрос не найден' });
     }
-    
+
     if (request.distributorId !== distributorId) {
       return res.status(403).json({ error: 'Нет доступа к этому запросу' });
     }
-    
+
     if (request.status !== 'PENDING') {
       return res.status(400).json({ error: 'Запрос уже обработан' });
     }
-    
+
     // Обновляем статус запроса
     await BrandDistributorRequest.updateOne(
       { id: requestId },
       { status: 'ACCEPTED', updatedAt: new Date() }
     );
-    
+
+    // Логируем действие
+    await logDistributorActivity(
+      distributorId,
+      'ACCEPT_BRAND_REQUEST',
+      `Принят запрос на подключение от бренда "${brand?.name || request.brandId}"`,
+      { brandId: request.brandId, requestId }
+    );
+
     // Отправляем email бренду
     const brand = await Brand.findOne({ id: request.brandId }).lean();
     const distributor = await Distributor.findOne({ id: distributorId }).lean();
-    
+
     if (brand && distributor) {
       const { sendEmail } = require('../utils/email');
       try {
@@ -472,7 +531,7 @@ async function acceptConnectionRequest(req, res) {
         console.error('Ошибка при отправке email бренду:', emailError);
       }
     }
-    
+
     const updatedRequest = await BrandDistributorRequest.findOne({ id: requestId }).lean();
     res.json({
       message: 'Запрос принят',
@@ -490,38 +549,46 @@ async function rejectConnectionRequest(req, res) {
     const { requestId } = req.params;
     const { reason } = req.body;
     const distributorId = req.user && req.user.distributorId;
-    
+
     if (!distributorId) {
       return res.status(403).json({ error: 'Только дистрибьюторы могут отклонять запросы' });
     }
-    
+
     const request = await BrandDistributorRequest.findOne({ id: requestId }).lean();
     if (!request) {
       return res.status(404).json({ error: 'Запрос не найден' });
     }
-    
+
     if (request.distributorId !== distributorId) {
       return res.status(403).json({ error: 'Нет доступа к этому запросу' });
     }
-    
+
     if (request.status !== 'PENDING') {
       return res.status(400).json({ error: 'Запрос уже обработан' });
     }
-    
+
     // Обновляем статус запроса
     await BrandDistributorRequest.updateOne(
       { id: requestId },
-      { 
-        status: 'REJECTED', 
+      {
+        status: 'REJECTED',
         rejectedReason: reason || null,
-        updatedAt: new Date() 
+        updatedAt: new Date()
       }
     );
-    
+
+    // Логируем действие
+    await logDistributorActivity(
+      distributorId,
+      'REJECT_BRAND_REQUEST',
+      `Отклонен запрос на подключение от бренда "${brand?.name || request.brandId}"${reason ? `. Причина: ${reason}` : ''}`,
+      { brandId: request.brandId, requestId, reason: reason || null }
+    );
+
     // Отправляем email бренду
     const brand = await Brand.findOne({ id: request.brandId }).lean();
     const distributor = await Distributor.findOne({ id: distributorId }).lean();
-    
+
     if (brand && distributor) {
       const { sendEmail } = require('../utils/email');
       try {
@@ -534,7 +601,7 @@ async function rejectConnectionRequest(req, res) {
         console.error('Ошибка при отправке email бренду:', emailError);
       }
     }
-    
+
     const updatedRequest = await BrandDistributorRequest.findOne({ id: requestId }).lean();
     res.json({
       message: 'Запрос отклонен',
@@ -550,26 +617,26 @@ async function rejectConnectionRequest(req, res) {
 async function getSalesRepresentatives(req, res) {
   try {
     const distributorId = req.user && req.user.distributorId;
-    
+
     if (!distributorId) {
       return res.status(403).json({ error: 'Только дистрибьюторы могут просматривать своих торговых представителей' });
     }
-    
+
     // Проверяем существование дистрибьютора
     const distributor = await Distributor.findOne({ id: distributorId }).lean();
     if (!distributor) {
       return res.status(404).json({ error: 'Дистрибьютор не найден' });
     }
-    
+
     // Получаем торговых представителей из User (role: 'SALES_REPRESENTATIVE' с distributorId)
-    const salesRepresentatives = await User.find({ 
+    const salesRepresentatives = await User.find({
       role: 'SALES_REPRESENTATIVE',
       distributorId: distributorId,
       isActive: true
     })
       .sort({ createdAt: -1 })
       .lean();
-    
+
     res.json({
       items: salesRepresentatives,
       total: salesRepresentatives.length
@@ -585,48 +652,48 @@ async function addSalesRepresentative(req, res) {
   try {
     const distributorId = req.user && req.user.distributorId;
     const { salesRepresentativeId } = req.body;
-    
+
     if (!distributorId) {
       return res.status(403).json({ error: 'Только дистрибьюторы могут добавлять торговых представителей' });
     }
-    
+
     if (!salesRepresentativeId) {
       return res.status(400).json({ error: 'ID торгового представителя обязателен' });
     }
-    
+
     // Проверяем существование дистрибьютора
     const distributor = await Distributor.findOne({ id: distributorId }).lean();
     if (!distributor) {
       return res.status(404).json({ error: 'Дистрибьютор не найден' });
     }
-    
+
     // Проверяем существование торгового представителя в User
-    const salesRepresentativeUser = await User.findOne({ 
+    const salesRepresentativeUser = await User.findOne({
       id: salesRepresentativeId,
       role: 'SALES_REPRESENTATIVE'
     }).lean();
-    
+
     if (!salesRepresentativeUser) {
       return res.status(404).json({ error: 'Торговый представитель не найден' });
     }
-    
+
     // Проверяем, не закреплен ли уже торговый представитель за другим дистрибьютором
     if (salesRepresentativeUser.distributorId && salesRepresentativeUser.distributorId !== distributorId) {
       return res.status(409).json({ error: 'Торговый представитель уже закреплен за другим дистрибьютором' });
     }
-    
+
     // Если уже закреплен за этим дистрибьютором
     if (salesRepresentativeUser.distributorId === distributorId) {
       return res.status(409).json({ error: 'Торговый представитель уже закреплен за вами' });
     }
-    
+
     // Закрепляем торгового представителя за дистрибьютором (обновляем User)
     const updatedSalesRepresentative = await User.findOneAndUpdate(
       { id: salesRepresentativeId },
       { distributorId, updatedAt: new Date() },
       { new: true }
     ).lean();
-    
+
     // Также обновляем SalesRepresentative, если он существует
     await SalesRepresentative.findOneAndUpdate(
       { email: salesRepresentativeUser.email },
@@ -635,7 +702,15 @@ async function addSalesRepresentative(req, res) {
     ).catch(() => {
       // Игнорируем ошибку, если записи нет
     });
-    
+
+    // Логируем действие
+    await logDistributorActivity(
+      distributorId,
+      'ADD_SALES_REPRESENTATIVE',
+      `Добавлен торговый представитель "${salesRepresentativeUser.email || salesRepresentativeId}"`,
+      { salesRepresentativeId, email: salesRepresentativeUser.email }
+    );
+
     res.status(200).json({
       message: 'Торговый представитель успешно добавлен',
       salesRepresentative: updatedSalesRepresentative
@@ -651,43 +726,43 @@ async function removeSalesRepresentative(req, res) {
   try {
     const distributorId = req.user && req.user.distributorId;
     const { salesRepresentativeId } = req.params;
-    
+
     if (!distributorId) {
       return res.status(403).json({ error: 'Только дистрибьюторы могут удалять торговых представителей' });
     }
-    
+
     if (!salesRepresentativeId) {
       return res.status(400).json({ error: 'ID торгового представителя обязателен' });
     }
-    
+
     // Проверяем существование дистрибьютора
     const distributor = await Distributor.findOne({ id: distributorId }).lean();
     if (!distributor) {
       return res.status(404).json({ error: 'Дистрибьютор не найден' });
     }
-    
+
     // Проверяем существование торгового представителя в User
-    const salesRepresentativeUser = await User.findOne({ 
+    const salesRepresentativeUser = await User.findOne({
       id: salesRepresentativeId,
       role: 'SALES_REPRESENTATIVE'
     }).lean();
-    
+
     if (!salesRepresentativeUser) {
       return res.status(404).json({ error: 'Торговый представитель не найден' });
     }
-    
+
     // Проверяем, что торговый представитель закреплен за этим дистрибьютором
     if (salesRepresentativeUser.distributorId !== distributorId) {
       return res.status(403).json({ error: 'Торговый представитель не закреплен за вами' });
     }
-    
+
     // Открепляем торгового представителя от дистрибьютора (обновляем User)
     const updatedSalesRepresentative = await User.findOneAndUpdate(
       { id: salesRepresentativeId },
       { distributorId: null, updatedAt: new Date() },
       { new: true }
     ).lean();
-    
+
     // Также обновляем SalesRepresentative, если он существует
     await SalesRepresentative.findOneAndUpdate(
       { email: salesRepresentativeUser.email },
@@ -696,7 +771,15 @@ async function removeSalesRepresentative(req, res) {
     ).catch(() => {
       // Игнорируем ошибку, если записи нет
     });
-    
+
+    // Логируем действие
+    await logDistributorActivity(
+      distributorId,
+      'REMOVE_SALES_REPRESENTATIVE',
+      `Удален торговый представитель "${salesRepresentativeUser.email || salesRepresentativeId}"`,
+      { salesRepresentativeId, email: salesRepresentativeUser.email }
+    );
+
     res.json({
       message: 'Торговый представитель успешно откреплен',
       salesRepresentative: updatedSalesRepresentative
@@ -803,6 +886,14 @@ async function addStoreToSalesRepresentative(req, res) {
       distributorId
     });
 
+    // Логируем действие
+    await logDistributorActivity(
+      distributorId,
+      'ADD_STORE_TO_SALES_REP',
+      `Добавлен магазин "${store.name || storeId}" торговому представителю`,
+      { salesRepresentativeId: resolved.linkId, storeId, storeName: store.name }
+    );
+
     res.status(201).json({
       message: 'Магазин успешно добавлен торговому представителю',
       link: link.toObject()
@@ -846,9 +937,9 @@ async function addStoresToSalesRepresentative(req, res) {
     const notFoundStoreIds = storeIds.filter(id => !foundStoreIds.has(id));
 
     if (notFoundStoreIds.length > 0) {
-      return res.status(404).json({ 
+      return res.status(404).json({
         error: 'Некоторые магазины не найдены',
-        notFoundStoreIds 
+        notFoundStoreIds
       });
     }
 
@@ -865,9 +956,9 @@ async function addStoresToSalesRepresentative(req, res) {
     const notAssignedStoreIds = storeIds.filter(id => !storeIdsByDistributor.has(id));
 
     if (notAssignedStoreIds.length > 0) {
-      return res.status(409).json({ 
+      return res.status(409).json({
         error: 'Некоторые магазины не закреплены за этим дистрибьютором',
-        notAssignedStoreIds 
+        notAssignedStoreIds
       });
     }
 
@@ -882,7 +973,7 @@ async function addStoresToSalesRepresentative(req, res) {
     const newStoreIds = storeIds.filter(id => !existingStoreIds.has(id));
 
     if (newStoreIds.length === 0) {
-      return res.status(409).json({ 
+      return res.status(409).json({
         error: 'Все указанные магазины уже закреплены за этим ТП',
         alreadyAssigned: Array.from(existingStoreIds)
       });
@@ -898,6 +989,21 @@ async function addStoresToSalesRepresentative(req, res) {
           distributorId
         })
       )
+    );
+
+    // Логируем действие
+    const newStores = await Store.find({ id: { $in: newStoreIds } }).lean();
+    await logDistributorActivity(
+      distributorId,
+      'ADD_STORES_TO_SALES_REP_BATCH',
+      `Добавлено ${links.length} магазинов торговому представителю`,
+      {
+        salesRepresentativeId: resolved.linkId,
+        storeIds: newStoreIds,
+        storeNames: newStores.map(s => s.name),
+        totalAdded: links.length,
+        totalSkipped: existingStoreIds.size
+      }
     );
 
     res.status(201).json({
@@ -946,6 +1052,15 @@ async function removeStoreFromSalesRepresentative(req, res) {
     }
 
     await SalesRepresentativeStore.deleteOne({ id: link.id });
+
+    // Логируем действие
+    const store = await Store.findOne({ id: storeId }).lean();
+    await logDistributorActivity(
+      distributorId,
+      'REMOVE_STORE_FROM_SALES_REP',
+      `Удален магазин "${store?.name || storeId}" у торгового представителя`,
+      { salesRepresentativeId: resolved.linkId, storeId, storeName: store?.name }
+    );
 
     res.json({
       message: 'Магазин успешно откреплен от торгового представителя'
@@ -1063,9 +1178,9 @@ async function getDistributorStores(req, res) {
       );
       const salesReps = salesRepIds.length
         ? await User.find({
-            id: { $in: salesRepIds },
-            role: 'SALES_REPRESENTATIVE'
-          }).lean()
+          id: { $in: salesRepIds },
+          role: 'SALES_REPRESENTATIVE'
+        }).lean()
         : [];
 
       const salesRepMap = new Map(salesReps.map(rep => [rep.id, rep]));
@@ -1157,6 +1272,14 @@ async function addDistributorStore(req, res) {
       { distributorId, updatedAt: new Date() }
     );
 
+    // Логируем действие
+    await logDistributorActivity(
+      distributorId,
+      'ADD_STORE',
+      `Добавлен магазин "${store.name || storeId}" к дистрибьютору`,
+      { storeId, storeName: store.name }
+    );
+
     res.status(200).json({
       message: 'Магазин успешно добавлен',
       store
@@ -1210,6 +1333,14 @@ async function removeDistributorStore(req, res) {
     await User.updateMany(
       { storeId, role: { $in: STORE_ROLES }, distributorId },
       { distributorId: null, updatedAt: new Date() }
+    );
+
+    // Логируем действие
+    await logDistributorActivity(
+      distributorId,
+      'REMOVE_STORE',
+      `Удален магазин "${store.name || storeId}" от дистрибьютора`,
+      { storeId, storeName: store.name }
     );
 
     res.json({
@@ -1319,6 +1450,14 @@ async function addProductToSalesRepresentative(req, res) {
       distributorId
     });
 
+    // Логируем действие
+    await logDistributorActivity(
+      distributorId,
+      'ADD_PRODUCT_TO_SALES_REP',
+      `Добавлен товар "${product.name || productId}" торговому представителю`,
+      { salesRepresentativeId: resolved.linkId, productId, productName: product.name, sku: product.sku }
+    );
+
     res.status(201).json({
       message: 'Товар успешно добавлен торговому представителю',
       link: link.toObject()
@@ -1362,9 +1501,9 @@ async function addProductsToSalesRepresentative(req, res) {
     const notFoundProductIds = productIds.filter(id => !foundProductIds.has(id));
 
     if (notFoundProductIds.length > 0) {
-      return res.status(404).json({ 
+      return res.status(404).json({
         error: 'Некоторые товары не найдены',
-        notFoundProductIds 
+        notFoundProductIds
       });
     }
 
@@ -1380,7 +1519,7 @@ async function addProductsToSalesRepresentative(req, res) {
     const notAllowedProducts = products.filter(p => !allowedBrandIds.has(p.brandId));
 
     if (notAllowedProducts.length > 0) {
-      return res.status(403).json({ 
+      return res.status(403).json({
         error: 'Некоторые товары принадлежат брендам, не подключенным к этому дистрибьютору',
         notAllowedProductIds: notAllowedProducts.map(p => p.id)
       });
@@ -1397,7 +1536,7 @@ async function addProductsToSalesRepresentative(req, res) {
     const newProductIds = productIds.filter(id => !existingProductIds.has(id));
 
     if (newProductIds.length === 0) {
-      return res.status(409).json({ 
+      return res.status(409).json({
         error: 'Все указанные товары уже закреплены за этим ТП',
         alreadyAssigned: Array.from(existingProductIds)
       });
@@ -1413,6 +1552,21 @@ async function addProductsToSalesRepresentative(req, res) {
           distributorId
         })
       )
+    );
+
+    // Логируем действие
+    const newProducts = await Product.find({ id: { $in: newProductIds } }).lean();
+    await logDistributorActivity(
+      distributorId,
+      'ADD_PRODUCTS_TO_SALES_REP_BATCH',
+      `Добавлено ${links.length} товаров торговому представителю`,
+      {
+        salesRepresentativeId: resolved.linkId,
+        productIds: newProductIds,
+        productNames: newProducts.map(p => p.name),
+        totalAdded: links.length,
+        totalSkipped: existingProductIds.size
+      }
     );
 
     res.status(201).json({
@@ -1461,6 +1615,15 @@ async function removeProductFromSalesRepresentative(req, res) {
     }
 
     await SalesRepresentativeProduct.deleteOne({ id: link.id });
+
+    // Логируем действие
+    const product = await Product.findOne({ id: productId }).lean();
+    await logDistributorActivity(
+      distributorId,
+      'REMOVE_PRODUCT_FROM_SALES_REP',
+      `Удален товар "${product?.name || productId}" у торгового представителя`,
+      { salesRepresentativeId: resolved.linkId, productId, productName: product?.name, sku: product?.sku }
+    );
 
     res.json({
       message: 'Товар успешно откреплен от торгового представителя'
@@ -1524,9 +1687,9 @@ async function getDistributorProducts(req, res) {
     const productIds = products.map(p => p.id);
     const costPrices = productIds.length > 0
       ? await DistributorProductPrice.find({
-          distributorId,
-          productId: { $in: productIds }
-        }).lean()
+        distributorId,
+        productId: { $in: productIds }
+      }).lean()
       : [];
     const costPriceByProductId = new Map(costPrices.map(cp => [cp.productId, cp]));
 
@@ -1620,6 +1783,14 @@ async function setProductCostPrice(req, res) {
       costPriceRecord = costPriceRecord.toObject();
     }
 
+    // Логируем действие
+    await logDistributorActivity(
+      distributorId,
+      'SET_PRODUCT_COST_PRICE',
+      `Установлена себестоимость товара "${product.name || productId}": ${costPrice} ${currency}`,
+      { productId, productName: product.name, sku: product.sku, costPrice, costCurrency: currency }
+    );
+
     res.json({
       message: 'Себестоимость товара успешно установлена',
       product: {
@@ -1675,10 +1846,10 @@ async function getProductCostPrice(req, res) {
       },
       costPrice: costPriceRecord
         ? {
-            id: costPriceRecord.id,
-            costPrice: costPriceRecord.costPrice,
-            costCurrency: costPriceRecord.costCurrency
-          }
+          id: costPriceRecord.id,
+          costPrice: costPriceRecord.costPrice,
+          costCurrency: costPriceRecord.costCurrency
+        }
         : null
     });
   } catch (error) {
@@ -1710,6 +1881,15 @@ async function deleteProductCostPrice(req, res) {
       return res.status(404).json({ error: 'Себестоимость товара не найдена' });
     }
 
+    // Логируем действие
+    const product = await Product.findOne({ id: productId }).lean();
+    await logDistributorActivity(
+      distributorId,
+      'DELETE_PRODUCT_COST_PRICE',
+      `Удалена себестоимость товара "${product?.name || productId}"`,
+      { productId, productName: product?.name, sku: product?.sku }
+    );
+
     res.json({
       message: 'Себестоимость товара успешно удалена'
     });
@@ -1725,7 +1905,7 @@ async function deleteProductCostPrice(req, res) {
 async function getDistributorAnalyticsSummary(req, res) {
   try {
     const distributorId = req.user && req.user.distributorId;
-    
+
     if (!distributorId) {
       return res.status(403).json({ error: 'Только дистрибьюторы могут просматривать аналитику' });
     }
@@ -1753,10 +1933,10 @@ async function getDistributorAnalyticsSummary(req, res) {
     const allowedBrandIds = brandDistributorConnections.map(conn => conn.brandId);
     const productsCount = allowedBrandIds.length > 0
       ? await Product.countDocuments({
-          brandId: { $in: allowedBrandIds },
-          isPayed: true,
-          paymentExpiresAt: { $gt: new Date() }
-        })
+        brandId: { $in: allowedBrandIds },
+        isPayed: true,
+        paymentExpiresAt: { $gt: new Date() }
+      })
       : 0;
 
     res.json({
@@ -1774,7 +1954,7 @@ async function getDistributorAnalyticsSummary(req, res) {
 async function getDistributorStockByStores(req, res) {
   try {
     const distributorId = req.user && req.user.distributorId;
-    
+
     if (!distributorId) {
       return res.status(403).json({ error: 'Только дистрибьюторы могут просматривать остатки' });
     }
@@ -1787,7 +1967,7 @@ async function getDistributorStockByStores(req, res) {
     }).lean();
 
     const storeIds = Array.from(new Set(storeUsers.map(user => user.storeId).filter(Boolean)));
-    
+
     if (storeIds.length === 0) {
       return res.json({
         items: [],
@@ -1818,28 +1998,28 @@ async function getDistributorStockByStores(req, res) {
     const salesRepIds = Array.from(
       new Set(salesRepStoreLinks.map(link => link.salesRepresentativeId))
     );
-    
+
     // Получаем из модели SalesRepresentative
     const salesRepsFromModel = salesRepIds.length
       ? await SalesRepresentative.find({ id: { $in: salesRepIds } }).lean()
       : [];
-    
+
     // Получаем email'ы для поиска в User
     const salesRepEmails = salesRepsFromModel.map(rep => rep.email);
-    
+
     // Получаем пользователей по email и по id
     const salesRepUsers = salesRepIds.length || salesRepEmails.length
       ? await User.find({
-          $or: [
-            { id: { $in: salesRepIds }, role: 'SALES_REPRESENTATIVE' },
-            { email: { $in: salesRepEmails }, role: 'SALES_REPRESENTATIVE' }
-          ]
-        }).lean()
+        $or: [
+          { id: { $in: salesRepIds }, role: 'SALES_REPRESENTATIVE' },
+          { email: { $in: salesRepEmails }, role: 'SALES_REPRESENTATIVE' }
+        ]
+      }).lean()
       : [];
 
     // Создаем мапу: salesRepresentativeId -> данные пользователя
     const salesRepMap = new Map();
-    
+
     // Сначала добавляем по id из SalesRepresentative
     salesRepsFromModel.forEach(rep => {
       const user = salesRepUsers.find(u => u.id === rep.id || u.email === rep.email);
@@ -1867,7 +2047,7 @@ async function getDistributorStockByStores(req, res) {
         });
       }
     });
-    
+
     // Добавляем пользователей, которые могут быть найдены только по id (если salesRepresentativeId = user.id)
     salesRepUsers.forEach(user => {
       // Добавляем по user.id (на случай если в связях используется user.id напрямую)
@@ -1890,7 +2070,7 @@ async function getDistributorStockByStores(req, res) {
 
     // Получаем все офферы для этих магазинов
     const offers = await Offer.find({ storeId: { $in: storeIds } }).lean();
-    
+
     // Получаем информацию о товарах
     const productIds = [...new Set(offers.map(offer => offer.productId))];
     const products = productIds.length > 0
@@ -1900,7 +2080,7 @@ async function getDistributorStockByStores(req, res) {
 
     // Группируем по магазинам
     const stockByStore = new Map();
-    
+
     storeIds.forEach(storeId => {
       const store = storeById.get(storeId);
       if (store) {
@@ -1974,7 +2154,7 @@ async function getDistributorTurnover(req, res) {
   try {
     const distributorId = req.user && req.user.distributorId;
     const { type, startDate, endDate } = req.query; // type: 'store', 'brand', 'product'
-    
+
     if (!distributorId) {
       return res.status(403).json({ error: 'Только дистрибьюторы могут просматривать оборот' });
     }
@@ -1987,7 +2167,7 @@ async function getDistributorTurnover(req, res) {
     }).lean();
 
     const storeIds = Array.from(new Set(storeUsers.map(user => user.storeId).filter(Boolean)));
-    
+
     if (storeIds.length === 0) {
       return res.json({
         type: type || 'store',
@@ -2184,7 +2364,7 @@ async function getDistributorSalesRepKPI(req, res) {
   try {
     const distributorId = req.user && req.user.distributorId;
     const { period, startDate, endDate } = req.query; // period: 'month', 'quarter', 'year' или custom dates
-    
+
     if (!distributorId) {
       return res.status(403).json({ error: 'Только дистрибьюторы могут просматривать KPI торговых представителей' });
     }
@@ -2266,9 +2446,9 @@ async function getDistributorSalesRepKPI(req, res) {
     const allStoreIds = Array.from(new Set(links.map(link => link.storeId)));
     const allSales = allStoreIds.length > 0
       ? await Sale.find({
-          storeId: { $in: allStoreIds },
-          status: 'COMPLETED'
-        }).lean()
+        storeId: { $in: allStoreIds },
+        status: 'COMPLETED'
+      }).lean()
       : [];
 
     // Фильтруем по дате: используем completedAt, если он есть, иначе createdAt
@@ -2365,7 +2545,7 @@ async function getSalesRepresentativeProductSales(req, res) {
   try {
     const distributorId = req.user && req.user.distributorId;
     const { salesRepresentativeId, productId } = req.params;
-    
+
     if (!distributorId) {
       return res.status(403).json({ error: 'Только дистрибьюторы могут просматривать продажи торговых представителей' });
     }
@@ -2395,7 +2575,7 @@ async function getSalesRepresentativeProductSales(req, res) {
     }).lean();
 
     const storeIds = Array.from(new Set(links.map(link => link.storeId)));
-    
+
     if (storeIds.length === 0) {
       return res.json({
         salesRepresentativeId,
@@ -2427,7 +2607,7 @@ async function getSalesRepresentativeProductSales(req, res) {
     // Парсим даты из query параметров
     let startDate = req.query.startDate ? new Date(req.query.startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000); // По умолчанию 30 дней
     let endDate = req.query.endDate ? new Date(req.query.endDate) : new Date();
-    
+
     // Устанавливаем startDate на начало дня (00:00:00)
     startDate.setHours(0, 0, 0, 0);
     // Устанавливаем endDate на конец дня (23:59:59.999)
@@ -2451,7 +2631,7 @@ async function getSalesRepresentativeProductSales(req, res) {
     const sales = allCompletedSales.filter(sale => {
       const saleDate = sale.completedAt ? new Date(sale.completedAt) : new Date(sale.createdAt);
       if (saleDate < startDate || saleDate > endDate) return false;
-      
+
       // Проверяем, есть ли в продаже нужный товар
       if (!sale.items || !Array.isArray(sale.items)) return false;
       return sale.items.some(item => item.productId === productId);
@@ -2459,7 +2639,7 @@ async function getSalesRepresentativeProductSales(req, res) {
 
     // Группируем продажи по магазинам
     const storeSalesMap = new Map();
-    
+
     // Инициализируем статистику для каждого магазина
     stores.forEach(store => {
       storeSalesMap.set(store.id, {
@@ -2545,6 +2725,340 @@ async function getSalesRepresentativeProductSales(req, res) {
   }
 }
 
+// Вспомогательная функция для получения контекста магазинов дистрибьютора
+async function getDistributorStoresContext(req) {
+  const distributorId = req.user && req.user.distributorId;
+
+  if (!distributorId) {
+    return {
+      storeIds: [],
+      storesById: new Map(),
+      stores: [],
+      isFound: false
+    };
+  }
+
+  const distributor = await Distributor.findOne({ id: distributorId }).lean();
+  if (!distributor) {
+    return {
+      storeIds: [],
+      storesById: new Map(),
+      stores: [],
+      isFound: false
+    };
+  }
+
+  const storeUsers = await User.find({
+    role: { $in: STORE_ROLES },
+    distributorId,
+    isActive: true
+  }).lean();
+
+  const storeIds = Array.from(
+    new Set(storeUsers.map(user => user.storeId).filter(Boolean))
+  );
+
+  const stores = storeIds.length
+    ? await Store.find({ id: { $in: storeIds } }).lean()
+    : [];
+
+  const storesById = new Map(stores.map(store => [store.id, store]));
+
+  return {
+    storeIds,
+    storesById,
+    stores,
+    isFound: true
+  };
+}
+
+// Вспомогательная функция для загрузки предложений и товаров
+async function loadDistributorOffersWithProducts(storeIds) {
+  const offers = storeIds.length
+    ? await Offer.find({ storeId: { $in: storeIds } }).lean()
+    : [];
+  const productIds = Array.from(new Set(offers.map(offer => offer.productId)));
+  const products = productIds.length
+    ? await Product.find({ id: { $in: productIds } }).lean()
+    : [];
+  const productById = new Map(products.map(product => [product.id, product]));
+
+  return { offers, productById, products };
+}
+
+// Получение товаров, которые плохо продаются (для дистрибьютора)
+async function getDistributorPoorlySellingProducts(req, res) {
+  try {
+    const context = await getDistributorStoresContext(req);
+    if (!context.isFound) {
+      return res.status(404).json({ error: 'Дистрибьютор не найден' });
+    }
+
+    if (!context.storeIds.length) {
+      return res.json({ items: [], total: 0 });
+    }
+
+    // Парсим параметры
+    const minQuantity = parseNumber(req.query.minQuantity, 10); // Минимальный остаток для попадания в список
+    const periodDays = parseNumber(req.query.periodDays, 30); // Период для анализа продаж (дней)
+    const maxSales = parseNumber(req.query.maxSales, 5); // Максимальное количество продаж за период
+
+    const storeIds = context.storeIds;
+    const { offers, productById } = await loadDistributorOffersWithProducts(storeIds);
+
+    // Вычисляем период для анализа продаж
+    const endDate = new Date();
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - periodDays);
+
+    // Получаем все завершенные продажи за период
+    const sales = await Sale.find({
+      storeId: { $in: storeIds },
+      status: 'COMPLETED',
+      $or: [
+        {
+          completedAt: { $exists: true, $ne: null, $gte: startDate, $lte: endDate }
+        },
+        {
+          $or: [
+            { completedAt: { $exists: false } },
+            { completedAt: null }
+          ],
+          createdAt: { $gte: startDate, $lte: endDate }
+        }
+      ]
+    }).lean();
+
+    // Подсчитываем количество продаж по каждому товару
+    const productSalesCount = new Map(); // productId -> количество продаж
+    const productSalesQuantity = new Map(); // productId -> общее количество проданных штук
+
+    sales.forEach(sale => {
+      if (sale.items) {
+        sale.items.forEach(item => {
+          const currentCount = productSalesCount.get(item.productId) || 0;
+          productSalesCount.set(item.productId, currentCount + 1);
+
+          const currentQuantity = productSalesQuantity.get(item.productId) || 0;
+          productSalesQuantity.set(item.productId, currentQuantity + (item.quantity || 0));
+        });
+      }
+    });
+
+    // Формируем список товаров, которые плохо продаются
+    const poorlySellingItems = [];
+
+    offers.forEach(offer => {
+      const product = productById.get(offer.productId);
+      if (!product) return;
+
+      const store = context.storesById.get(offer.storeId);
+      if (!store) return;
+
+      const quantity = offer.quantity || 0;
+
+      // Проверяем, попадает ли товар под критерии "плохо продается"
+      // 1. Остаток больше минимального
+      // 2. Количество продаж за период меньше максимального (или 0)
+      if (quantity >= minQuantity) {
+        const salesCount = productSalesCount.get(product.id) || 0;
+        const soldQuantity = productSalesQuantity.get(product.id) || 0;
+
+        if (salesCount <= maxSales) {
+          poorlySellingItems.push({
+            offerId: offer.id,
+            storeId: store.id,
+            storeName: store.name,
+            storeAddress: store.address,
+            productId: product.id,
+            productName: product.name,
+            sku: product.sku,
+            brandId: product.brandId,
+            brandName: product.brandName,
+            quantity: quantity,
+            price: offer.price || 0,
+            currency: offer.currency || 'RUB',
+            salesCount: salesCount, // Количество продаж за период
+            soldQuantity: soldQuantity, // Количество проданных штук за период
+            periodDays: periodDays
+          });
+        }
+      }
+    });
+
+    // Сортируем: сначала товары с большим остатком и нулевыми продажами, потом по остатку
+    poorlySellingItems.sort((a, b) => {
+      // Сначала товары без продаж
+      if (a.salesCount === 0 && b.salesCount > 0) return -1;
+      if (a.salesCount > 0 && b.salesCount === 0) return 1;
+      // Потом по остатку (от большего к меньшему)
+      return b.quantity - a.quantity;
+    });
+
+    res.json({
+      items: poorlySellingItems,
+      total: poorlySellingItems.length
+    });
+  } catch (error) {
+    console.error('Ошибка при получении товаров, которые плохо продаются:', error);
+    res.status(500).json({ error: 'Ошибка при получении товаров, которые плохо продаются' });
+  }
+}
+
+// Получение продаж конкретного товара по магазинам (для дистрибьютора)
+async function getDistributorProductSalesByStores(req, res) {
+  try {
+    const { productId } = req.params;
+
+    if (!productId) {
+      return res.status(400).json({ error: 'ID товара обязателен' });
+    }
+
+    const context = await getDistributorStoresContext(req);
+    if (!context.isFound) {
+      return res.status(404).json({ error: 'Дистрибьютор не найден' });
+    }
+
+    if (!context.storeIds.length) {
+      return res.json({
+        productId,
+        product: null,
+        period: {
+          startDate: null,
+          endDate: null
+        },
+        stores: [],
+        total: 0,
+        summary: {
+          totalSales: 0,
+          totalRevenue: 0,
+          totalQuantity: 0
+        }
+      });
+    }
+
+    // Парсим даты из query параметров
+    let startDate = req.query.startDate ? new Date(req.query.startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000); // По умолчанию 30 дней
+    let endDate = req.query.endDate ? new Date(req.query.endDate) : new Date();
+
+    // Устанавливаем startDate на начало дня (00:00:00)
+    startDate.setHours(0, 0, 0, 0);
+    // Устанавливаем endDate на конец дня (23:59:59.999)
+    endDate.setHours(23, 59, 59, 999);
+
+    // Получаем информацию о товаре
+    const product = await Product.findOne({ id: productId }).lean();
+    if (!product) {
+      return res.status(404).json({ error: 'Товар не найден' });
+    }
+
+    // Получаем все завершенные продажи из магазинов дистрибьютора
+    const allCompletedSales = await Sale.find({
+      storeId: { $in: context.storeIds },
+      status: 'COMPLETED'
+    })
+      .sort({ completedAt: -1, createdAt: -1 })
+      .lean();
+
+    // Фильтруем по дате и товару
+    const sales = allCompletedSales.filter(sale => {
+      const saleDate = sale.completedAt ? new Date(sale.completedAt) : new Date(sale.createdAt);
+      if (saleDate < startDate || saleDate > endDate) return false;
+
+      // Проверяем, есть ли в продаже нужный товар
+      if (!sale.items || !Array.isArray(sale.items)) return false;
+      return sale.items.some(item => item.productId === productId);
+    });
+
+    // Группируем продажи по магазинам
+    const storeSalesMap = new Map();
+
+    // Инициализируем статистику для каждого магазина
+    context.stores.forEach(store => {
+      storeSalesMap.set(store.id, {
+        storeId: store.id,
+        storeName: store.name,
+        storeAddress: store.address,
+        sales: [],
+        totalSales: 0,
+        totalRevenue: 0,
+        totalQuantity: 0
+      });
+    });
+
+    // Обрабатываем каждую продажу
+    sales.forEach(sale => {
+      const storeStat = storeSalesMap.get(sale.storeId);
+      if (!storeStat) return;
+
+      // Находим товар в продаже
+      const productItem = sale.items.find(item => item.productId === productId);
+      if (!productItem) return;
+
+      const quantity = productItem.quantity || 0;
+      const price = productItem.price || 0;
+      const revenue = quantity * price;
+      const saleDate = sale.completedAt ? new Date(sale.completedAt) : new Date(sale.createdAt);
+
+      storeStat.sales.push({
+        saleId: sale.id,
+        saleDate: saleDate.toISOString(),
+        quantity,
+        price,
+        revenue: Math.round(revenue * 100) / 100,
+        totalAmount: sale.totalAmount || 0,
+        currency: sale.currency || 'RUB'
+      });
+
+      storeStat.totalSales += 1;
+      storeStat.totalQuantity += quantity;
+      storeStat.totalRevenue += revenue;
+    });
+
+    // Преобразуем в массив и сортируем
+    const stores = Array.from(storeSalesMap.values())
+      .filter(store => store.totalSales > 0) // Только магазины с продажами
+      .sort((a, b) => b.totalRevenue - a.totalRevenue); // Сортируем по выручке
+
+    // Общая статистика
+    const summary = {
+      totalSales: sales.length,
+      totalRevenue: Math.round(
+        stores.reduce((sum, store) => sum + store.totalRevenue, 0) * 100
+      ) / 100,
+      totalQuantity: stores.reduce((sum, store) => sum + store.totalQuantity, 0)
+    };
+
+    res.json({
+      productId,
+      product: {
+        id: product.id,
+        name: product.name,
+        sku: product.sku,
+        brandId: product.brandId,
+        brandName: product.brandName
+      },
+      period: {
+        startDate: startDate.toISOString(),
+        endDate: endDate.toISOString()
+      },
+      stores,
+      total: stores.length,
+      summary
+    });
+  } catch (error) {
+    console.error('Ошибка при получении продаж товара по магазинам:', error);
+    res.status(500).json({ error: 'Ошибка при получении продаж товара по магазинам' });
+  }
+}
+
+// Вспомогательная функция для парсинга чисел
+function parseNumber(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const parsed = Number(value);
+  return Number.isNaN(parsed) ? fallback : parsed;
+}
+
 module.exports = {
   createDistributor,
   getDistributorById,
@@ -2580,6 +3094,65 @@ module.exports = {
   getDistributorStockByStores,
   getDistributorTurnover,
   getDistributorSalesRepKPI,
-  getSalesRepresentativeProductSales
+  getSalesRepresentativeProductSales,
+  getDistributorActivityHistory,
+  getDistributorPoorlySellingProducts,
+  getDistributorProductSalesByStores
 };
 
+// Получение истории действий дистрибьютора
+async function getDistributorActivityHistory(req, res) {
+  try {
+    const distributorId = req.user && req.user.distributorId;
+
+    if (!distributorId) {
+      return res.status(403).json({ error: 'Только дистрибьюторы могут просматривать историю действий' });
+    }
+
+    const { limit = 100, offset = 0, actionType } = req.query;
+
+    // Получаем историю действий
+    const history = await DistributorActivityHistory.findOne({ distributorId }).lean();
+
+    if (!history || !history.actions || history.actions.length === 0) {
+      return res.json({
+        distributorId,
+        items: [],
+        total: 0,
+        limit: parseInt(limit, 10),
+        offset: parseInt(offset, 10)
+      });
+    }
+
+    // Фильтруем по типу действия, если указан
+    let actions = history.actions;
+    if (actionType) {
+      actions = actions.filter(action => action.actionType === actionType);
+    }
+
+    // Сортируем по времени (новые сначала)
+    actions.sort((a, b) => {
+      const timeA = new Date(a.timestamp).getTime();
+      const timeB = new Date(b.timestamp).getTime();
+      return timeB - timeA;
+    });
+
+    // Применяем пагинацию
+    const total = actions.length;
+    const startIndex = parseInt(offset, 10);
+    const endIndex = startIndex + parseInt(limit, 10);
+    const paginatedActions = actions.slice(startIndex, endIndex);
+
+    res.json({
+      distributorId,
+      items: paginatedActions,
+      total,
+      limit: parseInt(limit, 10),
+      offset: parseInt(offset, 10),
+      hasMore: endIndex < total
+    });
+  } catch (error) {
+    console.error('Ошибка при получении истории действий дистрибьютора:', error);
+    res.status(500).json({ error: 'Ошибка при получении истории действий дистрибьютора' });
+  }
+}
