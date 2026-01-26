@@ -10,6 +10,7 @@ const {
   updateStock,
   getWarehouseAnalytics,
   processInvoice,
+  confirmInvoiceItems,
   // Функции для продавца магазина (QR-сканер)
   findProductByBarcode,
   quickAddStockByBarcode
@@ -42,9 +43,12 @@ router.put('/stock/update', requireStoreOwner, updateStock);
 // Аналитика склада
 router.get('/analytics', requireStoreOwner, getWarehouseAnalytics);
 
-// Обработка накладной с помощью ИИ
+// Обработка накладной с помощью ИИ (только анализ, без добавления на склад)
 // Принимаем файл с любым именем поля (file, invoice, image и т.д.)
 router.post('/invoice/process', requireStoreOwner, upload.any(), processInvoice);
+
+// Подтверждение и добавление товаров из накладной на склад
+router.post('/invoice/confirm', requireStoreOwner, confirmInvoiceItems);
 
 // ========== МАРШРУТЫ ДЛЯ ПРОДАВЦА МАГАЗИНА (QR-СКАНЕР) ==========
 // Только быстрый приход товара по штрих-коду

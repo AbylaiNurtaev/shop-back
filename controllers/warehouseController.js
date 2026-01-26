@@ -643,11 +643,11 @@ async function processInvoice(req, res) {
       });
     }
 
-    // Обрабатываем каждый товар из накладной
+    // Анализируем каждый товар из накладной (без добавления на склад)
     const results = {
-      processed: [],
-      notFound: [],
-      errors: []
+      found: [],      // Товары, найденные в базе
+      notFound: [],   // Товары, не найденные в базе
+      errors: []      // Товары с ошибками
     };
 
     for (const item of invoiceData.items) {
@@ -699,7 +699,138 @@ async function processInvoice(req, res) {
             productName: item.productName,
             sku: item.sku,
             brand: item.brand,
-            quantity: item.quantity
+            quantity: item.quantity,
+            unit: item.unit,
+            notes: item.notes
+          });
+          continue;
+        }
+
+        // Проверяем связь бренда с дистрибьютором (если магазин привязан к дистрибьютору)
+        let brandError = null;
+        if (storeUser.distributorId) {
+          const brandDistributorConnection = await BrandDistributorRequest.findOne({
+            brandId: product.brandId,
+            distributorId: storeUser.distributorId,
+            status: 'ACCEPTED'
+          }).lean();
+
+          if (!brandDistributorConnection) {
+            brandError = 'Бренд товара не подключен к дистрибьютору этого магазина';
+          }
+        }
+
+        // Проверяем текущее количество на складе (если оффер уже существует)
+        const existingOffer = await Offer.findOne({ productId: product.id, storeId }).lean();
+        const currentQuantity = existingOffer ? (existingOffer.quantity || 0) : 0;
+
+        // Добавляем информацию о найденном товаре (без добавления на склад)
+        results.found.push({
+          // Исходные данные из накладной
+          originalItem: {
+            productName: item.productName,
+            quantity: item.quantity,
+            sku: item.sku,
+            brand: item.brand,
+            unit: item.unit,
+            notes: item.notes
+          },
+          // Найденный товар в базе
+          product: {
+            id: product.id,
+            name: product.name,
+            sku: product.sku,
+            brandName: product.brandName,
+            brandId: product.brandId
+          },
+          // Информация о количестве
+          quantity: item.quantity,
+          currentQuantity: currentQuantity,
+          newQuantity: currentQuantity + item.quantity,
+          // Ошибки (если есть)
+          error: brandError,
+          // Флаг, можно ли добавить товар
+          canAdd: !brandError
+        });
+      } catch (error) {
+        console.error('Ошибка при анализе товара из накладной:', error);
+        results.errors.push({
+          item,
+          error: error.message
+        });
+      }
+    }
+
+    res.json({
+      message: 'Накладная проанализирована. Проверьте найденные товары и подтвердите добавление на склад.',
+      invoiceInfo: {
+        invoiceNumber: invoiceData.invoiceNumber,
+        date: invoiceData.date,
+        supplier: invoiceData.supplier
+      },
+      summary: {
+        total: invoiceData.items.length,
+        found: results.found.length,
+        notFound: results.notFound.length,
+        errors: results.errors.length
+      },
+      found: results.found,
+      notFound: results.notFound,
+      errors: results.errors
+    });
+  } catch (error) {
+    console.error('Ошибка при обработке накладной:', error);
+    res.status(500).json({ error: 'Ошибка при обработке накладной' });
+  }
+}
+
+// Подтверждение и добавление товаров из накладной на склад
+async function confirmInvoiceItems(req, res) {
+  try {
+    const storeId = await getStoreIdForStoreOwner(req.user);
+    if (!storeId) {
+      return res.status(404).json({ error: 'Магазин не найден для текущего пользователя' });
+    }
+
+    const { items } = req.body;
+
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'Список товаров для добавления не передан' });
+    }
+
+    // Получаем пользователя магазина для проверки дистрибьютора
+    const storeUser = await User.findOne({
+      storeId,
+      role: { $in: STORE_ROLES },
+      isActive: true
+    }).lean();
+
+    if (!storeUser) {
+      return res.status(404).json({ error: 'Магазин не найден или не активен' });
+    }
+
+    const results = {
+      processed: [],
+      errors: []
+    };
+
+    for (const item of items) {
+      try {
+        // Проверяем обязательные поля
+        if (!item.productId || !item.quantity || item.quantity <= 0) {
+          results.errors.push({
+            item,
+            error: 'Отсутствует productId или неверное количество'
+          });
+          continue;
+        }
+
+        // Получаем товар из базы
+        const product = await Product.findOne({ id: item.productId }).lean();
+        if (!product) {
+          results.errors.push({
+            item,
+            error: 'Товар не найден в базе данных'
           });
           continue;
         }
@@ -756,7 +887,7 @@ async function processInvoice(req, res) {
           offerId: offer.id
         });
       } catch (error) {
-        console.error('Ошибка при обработке товара из накладной:', error);
+        console.error('Ошибка при добавлении товара на склад:', error);
         results.errors.push({
           item,
           error: error.message
@@ -765,25 +896,18 @@ async function processInvoice(req, res) {
     }
 
     res.json({
-      message: 'Накладная обработана',
-      invoiceInfo: {
-        invoiceNumber: invoiceData.invoiceNumber,
-        date: invoiceData.date,
-        supplier: invoiceData.supplier
-      },
+      message: 'Товары добавлены на склад',
       summary: {
-        total: invoiceData.items.length,
+        total: items.length,
         processed: results.processed.length,
-        notFound: results.notFound.length,
         errors: results.errors.length
       },
       processed: results.processed,
-      notFound: results.notFound,
       errors: results.errors
     });
   } catch (error) {
-    console.error('Ошибка при обработке накладной:', error);
-    res.status(500).json({ error: 'Ошибка при обработке накладной' });
+    console.error('Ошибка при подтверждении товаров из накладной:', error);
+    res.status(500).json({ error: 'Ошибка при подтверждении товаров из накладной' });
   }
 }
 
@@ -795,6 +919,7 @@ module.exports = {
   updateStock,
   getWarehouseAnalytics,
   processInvoice,
+  confirmInvoiceItems,
   // Функции для продавца (QR-сканер)
   findProductByBarcode,
   quickAddStockByBarcode
