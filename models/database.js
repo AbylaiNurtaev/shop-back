@@ -57,6 +57,7 @@ const userSchema = new mongoose.Schema(
     role: { type: String, required: true },
     email: { type: String, required: true },
     firstName: { type: String, required: false },
+    lastName: { type: String, required: false },
     storeId: { type: String, default: null },
     distributorId: { type: String, default: null },
     isActive: { type: Boolean, default: true }
@@ -99,6 +100,9 @@ const salesRepresentativeSchema = new mongoose.Schema(
   {
     id: { type: String, required: true, unique: true },
     name: { type: String, required: true },
+    firstName: { type: String, required: false },
+    lastName: { type: String, required: false },
+    middleName: { type: String, required: false },
     email: { type: String, required: true, unique: true },
     distributorId: { type: String, default: null, index: true }
   },

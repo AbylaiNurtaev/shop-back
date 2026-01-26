@@ -1115,9 +1115,43 @@ async function getMySalesRepresentativeStores(req, res) {
       ? await Store.find({ id: { $in: storeIds } }).lean()
       : [];
 
+    // Получаем информацию о владельцах магазинов (пользователи с ролью 'STORE')
+    const storeOwners = storeIds.length
+      ? await User.find({
+          storeId: { $in: storeIds },
+          role: 'STORE',
+          isActive: true
+        }).lean()
+      : [];
+
+    // Создаем карту владельцев по storeId
+    const ownerMap = new Map();
+    storeOwners.forEach(owner => {
+      if (owner.storeId && !ownerMap.has(owner.storeId)) {
+        // Формируем полное имя владельца
+        const ownerName = [owner.firstName, owner.lastName].filter(Boolean).join(' ').trim() || owner.firstName || null;
+        
+        ownerMap.set(owner.storeId, {
+          name: ownerName,
+          firstName: owner.firstName || null,
+          lastName: owner.lastName || null,
+          phoneNumber: owner.phoneNumber || null
+        });
+      }
+    });
+
+    // Добавляем информацию о владельце к каждому магазину
+    const storesWithOwners = stores.map(store => {
+      const owner = ownerMap.get(store.id) || null;
+      return {
+        ...store,
+        owner: owner
+      };
+    });
+
     res.json({
-      items: stores,
-      total: stores.length
+      items: storesWithOwners,
+      total: storesWithOwners.length
     });
   } catch (error) {
     console.error('Ошибка при получении магазинов ТП:', error);

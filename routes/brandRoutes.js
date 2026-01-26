@@ -1,4 +1,5 @@
 const express = require('express');
+const multer = require('multer');
 const router = express.Router();
 const { authenticateToken } = require('../middleware/auth');
 const {
@@ -13,9 +14,16 @@ const {
   getMyBrand,
   getMyBrandSettings,
   updateMyBrandSettings,
-  getBrandSearchStatistics
+  getBrandSearchStatistics,
+  validateProductImageForBrand
 } = require('../controllers/brandController');
 const { getBrandProducts } = require('../controllers/productController');
+
+// Настройка multer для загрузки изображений
+const upload = multer({ 
+  storage: multer.memoryStorage(), 
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB
+});
 
 // Создание бренда - без авторизации (публичный эндпоинт для регистрации)
 router.post('/', createBrand);
@@ -31,6 +39,9 @@ router.get('/me', getMyBrand);
 router.get('/me/settings', getMyBrandSettings);
 router.put('/me/settings', updateMyBrandSettings);
 router.get('/me/search-statistics', getBrandSearchStatistics);
+
+// Валидация изображения товара
+router.post('/products/validate-image', upload.single('image'), validateProductImageForBrand);
 
 // Список всех брендов (для админ-панели)
 router.get('/', getBrands);

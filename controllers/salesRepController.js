@@ -447,10 +447,13 @@ async function getMySalesRepresentative(req, res) {
       return res.status(404).json({ error: 'Торговый представитель не найден' });
     }
 
-    // Возвращаем только email и firstName
+    // Возвращаем email, firstName, lastName, middleName
+    // Приоритет: данные из SalesRepresentative (более полные), если нет - из User
     const result = {
       email: user ? user.email : salesRep.email,
-      firstName: user ? user.firstName : (salesRep ? salesRep.name : null)
+      firstName: salesRep?.firstName || user?.firstName || null,
+      lastName: salesRep?.lastName || user?.lastName || null,
+      middleName: salesRep?.middleName || null
     };
 
     res.json(result);
@@ -464,14 +467,15 @@ async function updateMySalesRepresentative(req, res) {
   try {
     const tokenSalesRepId = req.user && req.user.salesRepresentativeId;
     const tokenUserId = req.user && req.user.userId;
-    const { firstName } = req.body;
+    const { firstName, lastName, middleName } = req.body;
 
     if (!tokenSalesRepId && !tokenUserId) {
       return res.status(403).json({ error: 'Только торговые представители могут обновлять свои данные' });
     }
 
-    if (!firstName) {
-      return res.status(400).json({ error: 'Поле firstName обязательно' });
+    // Валидация обязательных полей
+    if (!firstName || !lastName) {
+      return res.status(400).json({ error: 'Поля firstName и lastName обязательны' });
     }
 
     // Получаем данные из User
@@ -494,11 +498,18 @@ async function updateMySalesRepresentative(req, res) {
       return res.status(404).json({ error: 'Торговый представитель не найден' });
     }
 
+    // Формируем полное имя для обратной совместимости
+    const fullName = [lastName, firstName, middleName].filter(Boolean).join(' ').trim() || firstName;
+
     // Обновляем User, если он существует
     if (user) {
       await User.findOneAndUpdate(
         { id: user.id },
-        { firstName, updatedAt: new Date() }
+        { 
+          firstName, 
+          lastName: lastName || '',
+          updatedAt: new Date() 
+        }
       );
     }
 
@@ -506,21 +517,29 @@ async function updateMySalesRepresentative(req, res) {
     if (salesRep) {
       await SalesRepresentative.findOneAndUpdate(
         { id: salesRep.id },
-        { name: firstName, updatedAt: new Date() }
+        { 
+          name: fullName,
+          firstName,
+          lastName,
+          middleName: middleName || null,
+          updatedAt: new Date() 
+        }
       );
     }
 
-    // Возвращаем обновленные данные (только email и firstName)
+    // Возвращаем обновленные данные
     const updatedUser = user ? await User.findOne({ id: user.id }).lean() : null;
     const updatedSalesRep = salesRep ? await SalesRepresentative.findOne({ id: salesRep.id }).lean() : null;
 
     const result = {
       email: updatedUser ? updatedUser.email : updatedSalesRep.email,
-      firstName: updatedUser ? updatedUser.firstName : (updatedSalesRep ? updatedSalesRep.name : null)
+      firstName: updatedSalesRep?.firstName || updatedUser?.firstName || null,
+      lastName: updatedSalesRep?.lastName || updatedUser?.lastName || null,
+      middleName: updatedSalesRep?.middleName || null
     };
 
     res.json({
-      message: 'Имя успешно обновлено',
+      message: 'Данные успешно обновлены',
       salesRepresentative: result
     });
   } catch (error) {

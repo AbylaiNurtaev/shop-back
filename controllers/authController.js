@@ -475,13 +475,13 @@ async function registerSalesRepresentative(req, res) {
   let email = null;
 
   try {
-    const { name, email: emailParam, password } = req.body;
+    const { firstName, lastName, middleName, email: emailParam, password } = req.body;
     email = emailParam;
 
     // Валидация обязательных полей
-    if (!name || !email || !password) {
+    if (!firstName || !lastName || !email || !password) {
       return res.status(400).json({
-        error: 'Отсутствуют обязательные поля: name, email, password'
+        error: 'Отсутствуют обязательные поля: firstName, lastName, email, password'
       });
     }
 
@@ -513,14 +513,17 @@ async function registerSalesRepresentative(req, res) {
     const userId = generateId();
     createdUserId = userId;
 
+    // Формируем полное имя для обратной совместимости
+    const fullName = [lastName, firstName, middleName].filter(Boolean).join(' ').trim() || firstName;
+
     // Создаем пользователя торгового представителя
     try {
       await User.create({
         id: userId,
         role: 'SALES_REPRESENTATIVE',
         email,
-        firstName: name,
-        lastName: '',
+        firstName,
+        lastName: lastName || '',
         storeId: null,
         distributorId: null,
         isActive: true
@@ -560,7 +563,10 @@ async function registerSalesRepresentative(req, res) {
     try {
       const salesRepresentative = await SalesRepresentative.create({
         id: salesRepresentativeId,
-        name,
+        name: fullName,
+        firstName,
+        lastName,
+        middleName: middleName || null,
         email,
         distributorId: null
       });

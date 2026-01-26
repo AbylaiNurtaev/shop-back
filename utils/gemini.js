@@ -726,6 +726,146 @@ async function getDemandForecastFromAI({ prompt, context = '' }) {
   }
 }
 
+// ============================================================================
+// ВАЛИДАЦИЯ ИЗОБРАЖЕНИЯ ТОВАРА ДЛЯ БРЕНДОВ
+// ============================================================================
+
+async function validateProductImage({ buffer, mimeType, productInfo }) {
+  if (!GEMINI_API_KEY) {
+    throw new Error('GEMINI_API_KEY не задан');
+  }
+  if (!buffer || !mimeType) {
+    throw new Error('Нет данных для анализа изображения');
+  }
+  if (!productInfo) {
+    throw new Error('Не указана информация о товаре');
+  }
+
+  const prompt = `Ты эксперт по валидации изображений товаров для каталога. Проанализируй это изображение и проверь его соответствие требованиям.
+
+ИНФОРМАЦИЯ О ТОВАРЕ:
+- Название: ${productInfo.name || 'не указано'}
+- Бренд: ${productInfo.brandName || 'не указано'}
+- SKU: ${productInfo.sku || 'не указано'}
+- Упаковка: ${productInfo.packageInfo || 'не указано'}
+- Описание: ${productInfo.description || 'не указано'}
+
+ТРЕБОВАНИЯ К ИЗОБРАЖЕНИЮ:
+1. Изображение должно быть КВАДРАТНЫМ (соотношение сторон 1:1, ширина = высота)
+   - Допускается небольшое отклонение до 5% (например, 1000x1020 или 1020x1000)
+   - Но идеально должно быть точно 1:1
+2. На изображении НЕ должно быть лишних элементов:
+   - Рамок вокруг товара (черные, белые, цветные границы)
+   - Фоновых элементов, отвлекающих от товара
+   - Текста, логотипов, водяных знаков (кроме самого товара на упаковке)
+   - Других товаров или объектов
+   - Теней, отражений, декоративных элементов
+3. Товар на изображении должен СООТВЕТСТВОВАТЬ указанному товару:
+   - Правильный бренд (сравни с "${productInfo.brandName || 'не указано'}")
+   - Правильное название (сравни с "${productInfo.name || 'не указано'}")
+   - Правильная упаковка (если указана "${productInfo.packageInfo || 'не указано'}")
+   - Правильный тип товара
+
+ВАЖНО:
+- Будь строгим в проверке - изображение должно быть идеальным для каталога
+- Если есть сомнения - указывай проблемы
+- Проверь пропорции изображения (ширина должна быть равна высоте с точностью до 5%)
+- Проверь, что товар занимает большую часть изображения (минимум 70% площади)
+- Проверь, что нет посторонних элементов (рамок, фонов, других объектов)
+- Проверь, что товар четко виден и хорошо освещен
+
+ФОРМАТ ОТВЕТА (ТОЛЬКО JSON):
+{
+  "isValid": true/false,
+  "isSquare": true/false,
+  "hasExtraElements": true/false,
+  "matchesProduct": true/false,
+  "issues": ["список конкретных проблем, если есть"],
+  "recommendations": ["рекомендации по улучшению, если есть"],
+  "detectedProduct": {
+    "name": "что видно на изображении",
+    "brand": "какой бренд виден",
+    "packageInfo": "какая упаковка видна"
+  },
+  "confidence": 0.0-1.0,
+  "aspectRatio": "примерное соотношение сторон (например, '1:1' или '4:3')"
+}
+
+ПРИМЕРЫ ПРОБЛЕМ:
+- "Изображение не квадратное (соотношение 4:3)"
+- "На изображении есть черная рамка вокруг товара"
+- "На изображении виден другой товар"
+- "Товар на изображении не соответствует указанному бренду"
+- "На изображении есть водяной знак или логотип магазина"
+
+ВЕРНИ ТОЛЬКО JSON!`;
+
+  const payload = JSON.stringify({
+    contents: [{
+      parts: [
+        { text: prompt },
+        {
+          inline_data: {
+            mime_type: mimeType,
+            data: buffer.toString('base64')
+          }
+        }
+      ]
+    }],
+    generationConfig: {
+      temperature: 0,
+      maxOutputTokens: 1000
+    }
+  });
+
+  const options = {
+    hostname: 'generativelanguage.googleapis.com',
+    path: `/${GEMINI_API_VERSION}/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(payload)
+    },
+    timeout: 20000
+  };
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, res => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          return reject(new Error(`Gemini ${res.statusCode}: ${data}`));
+        }
+        try {
+          const parsed = JSON.parse(data);
+          const text = parsed?.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (!text) {
+            return reject(new Error('Пустой ответ от Gemini'));
+          }
+
+          const extracted = extractJson(text);
+          if (!extracted) {
+            return reject(new Error('Не удалось извлечь JSON из ответа Gemini'));
+          }
+
+          resolve(extracted);
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Timeout'));
+    });
+    req.write(payload);
+    req.end();
+  });
+}
+
 // Экспорт всех функций
 module.exports = {
   getIntentFromGemini,
@@ -734,7 +874,8 @@ module.exports = {
   analyzeProductImage,
   analyzeInvoice,
   getDistributorAIAssistantResponse,
-  getDemandForecastFromAI
+  getDemandForecastFromAI,
+  validateProductImage
 };
 
 // Для совместимости с разными способами импорта
@@ -745,3 +886,4 @@ module.exports.analyzeProductImage = analyzeProductImage;
 module.exports.analyzeInvoice = analyzeInvoice;
 module.exports.getDistributorAIAssistantResponse = getDistributorAIAssistantResponse;
 module.exports.getDemandForecastFromAI = getDemandForecastFromAI;
+module.exports.validateProductImage = validateProductImage;

@@ -2,6 +2,7 @@ const { generateId } = require('../utils/uuid');
 const { models } = require('../models/database');
 const { hashPassword } = require('../utils/password');
 const { sendEmail } = require('../utils/email');
+const { validateProductImage } = require('../utils/gemini');
 
 const { Brand, Category, User, AuthCredential, ProductSearchLog, Product } = models;
 
@@ -619,6 +620,110 @@ async function getBrandSearchStatistics(req, res) {
   }
 }
 
+// Валидация изображения товара
+async function validateProductImageForBrand(req, res) {
+  try {
+    const userId = req.user && req.user.userId;
+    if (!userId) {
+      return res.status(401).json({ error: 'Токен доступа отсутствует' });
+    }
+
+    // Проверяем, что пользователь является брендом
+    const user = await User.findOne({ id: userId, role: 'BRAND' }).lean();
+    if (!user) {
+      return res.status(403).json({ error: 'Доступ разрешен только брендам' });
+    }
+
+    const brand = await Brand.findOne({ email: user.email }).lean();
+    if (!brand) {
+      return res.status(404).json({ error: 'Бренд не найден' });
+    }
+
+    // Получаем файл изображения
+    const file = req.file;
+    if (!file) {
+      return res.status(400).json({ error: 'Изображение не передано' });
+    }
+
+    // Проверяем тип файла
+    const allowedMimeTypes = ['image/jpeg', 'image/png', 'image/webp'];
+    if (!allowedMimeTypes.includes(file.mimetype)) {
+      return res.status(400).json({ 
+        error: 'Недопустимый тип файла. Разрешены: JPEG, PNG, WebP' 
+      });
+    }
+
+    // Получаем productId из запроса
+    const { productId } = req.body;
+    if (!productId) {
+      return res.status(400).json({ error: 'Не указан productId' });
+    }
+
+    // Получаем информацию о товаре
+    const product = await Product.findOne({ id: productId }).lean();
+    if (!product) {
+      return res.status(404).json({ error: 'Товар не найден' });
+    }
+
+    // Проверяем, что товар принадлежит этому бренду
+    if (product.brandId !== brand.id) {
+      return res.status(403).json({ 
+        error: 'Товар не принадлежит вашему бренду' 
+      });
+    }
+
+    // Подготавливаем информацию о товаре для валидации
+    const productInfo = {
+      name: product.name,
+      brandName: product.brandName,
+      sku: product.sku,
+      packageInfo: product.packageInfo,
+      description: product.description
+    };
+
+    // Выполняем валидацию через Gemini API
+    try {
+      const validationResult = await validateProductImage({
+        buffer: file.buffer,
+        mimeType: file.mimetype,
+        productInfo
+      });
+
+      // Определяем общий статус валидации
+      const isValid = validationResult.isValid === true && 
+                      validationResult.isSquare === true && 
+                      validationResult.hasExtraElements === false && 
+                      validationResult.matchesProduct === true;
+
+      // Возвращаем результат валидации
+      res.json({
+        productId: product.id,
+        productName: product.name,
+        isValid,
+        validation: {
+          isSquare: validationResult.isSquare || false,
+          hasExtraElements: validationResult.hasExtraElements || false,
+          matchesProduct: validationResult.matchesProduct || false,
+          confidence: validationResult.confidence || 0,
+          aspectRatio: validationResult.aspectRatio || 'unknown',
+          issues: validationResult.issues || [],
+          recommendations: validationResult.recommendations || [],
+          detectedProduct: validationResult.detectedProduct || null
+        }
+      });
+    } catch (geminiError) {
+      console.error('Ошибка при валидации изображения через Gemini:', geminiError);
+      return res.status(500).json({ 
+        error: 'Ошибка при анализе изображения',
+        details: geminiError.message 
+      });
+    }
+  } catch (error) {
+    console.error('Ошибка при валидации изображения товара:', error);
+    res.status(500).json({ error: 'Ошибка при валидации изображения товара' });
+  }
+}
+
 module.exports = {
   createBrand,
   getBrandById,
@@ -631,5 +736,6 @@ module.exports = {
   getMyBrand,
   getMyBrandSettings,
   updateMyBrandSettings,
-  getBrandSearchStatistics
+  getBrandSearchStatistics,
+  validateProductImageForBrand
 };
