@@ -15,6 +15,7 @@ const customerRoutes = require('./routes/customerRoutes');
 const warehouseRoutes = require('./routes/warehouseRoutes');
 const posRoutes = require('./routes/posRoutes');
 const planRoutes = require('./routes/planRoutes');
+const aiAssistantRoutes = require('./routes/aiAssistantRoutes');
 const { connectToDatabase } = require('./models/database');
 const { checkAndDisableExpiredPayments } = require('./utils/paymentExpiration');
 
@@ -42,6 +43,7 @@ app.use('/api/customers', customerRoutes);
 app.use('/api/warehouse', warehouseRoutes);
 app.use('/api/pos', posRoutes);
 app.use('/api/plans', planRoutes);
+app.use('/api/ai-assistant', aiAssistantRoutes);
 
 // Обработка ошибок
 app.use((err, req, res, next) => {

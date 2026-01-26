@@ -16,7 +16,7 @@ function requestGemini(prompt, config = {}) {
   const payload = JSON.stringify({
     contents: [{ parts: [{ text: prompt }] }],
     generationConfig: {
-      temperature: 0,
+      temperature: config.temperature !== undefined ? config.temperature : 0,
       maxOutputTokens: config.maxOutputTokens || 300,
       topP: 0.95,
       topK: 40
@@ -31,7 +31,7 @@ function requestGemini(prompt, config = {}) {
       'Content-Type': 'application/json',
       'Content-Length': Buffer.byteLength(payload)
     },
-    timeout: 10000
+    timeout: config.timeout || 10000
   };
 
   return new Promise((resolve, reject) => {
@@ -626,13 +626,115 @@ async function analyzeInvoice({ buffer, mimeType }) {
   });
 }
 
+// ============================================================================
+// ИИ-ПОМОЩНИК ДЛЯ ДИСТРИБЬЮТОРОВ
+// ============================================================================
+
+const DISTRIBUTOR_AI_PROMPT = `Ты — AI-помощник дистрибьютора в B2B-системе управления продуктами, магазинами и торговыми представителями.
+
+Контекст системы:
+- В системе есть роли: Бренд, Дистрибьютор, Торговый представитель, Магазин, Покупатель.
+- Ты работаешь ИСКЛЮЧИТЕЛЬНО для роли Дистрибьютора.
+- Бренды создают и управляют эталонными карточками товаров (SKU).
+- Дистрибьютор формирует свой ассортимент на основе SKU брендов.
+- Магазины добавляют товары ТОЛЬКО из ассортимента дистрибьютора.
+- Торговые представители (ТП) принадлежат одному дистрибьютору и закрепляются за магазинами.
+- ТП не владеют товарами и не являются источником ассортимента.
+- Остатки, наличие, сроки годности и аналитика — ключевые данные системы.
+- KPI торговых представителей основаны на наличии товара, отсутствии дефицита, актуальности данных и рисках по срокам годности.
+- Геолокация магазинов используется для поиска товаров покупателями, но покупатели не являются твоей целевой аудиторией.
+
+Твоя задача:
+- Помогать дистрибьютору принимать решения.
+- Объяснять данные, аналитику, KPI и процессы системы.
+- Давать рекомендации по управлению ассортиментом, магазинами и торговыми представителями.
+- Отвечать ТОЛЬКО на вопросы, связанные с данной системой и ролью дистрибьютора.
+
+Ограничения:
+- Ты НЕ отвечаешь на вопросы, не связанные с системой (общие знания, программирование, политика, личные вопросы и т.п.).
+- Ты НЕ обсуждаешь покупателей, если вопрос не связан с аналитикой дистрибьютора.
+- Ты НЕ придумываешь данные, если их нет.
+- Если вопрос выходит за рамки системы, ты вежливо отказываешься и объясняешь, что можешь помогать только по вопросам дистрибьютора и данной платформы.
+
+Формат ответов:
+- Кратко и по делу.
+- Без воды.
+- На языке бизнеса и операций.
+- Если есть риск или проблема — указывай её прямо.
+- Если данных недостаточно — говори об этом явно.
+
+Если пользователь задаёт вопрос, не относящийся к управлению дистрибьютором, ассортиментом, магазинами, торговыми представителями, аналитикой или KPI — ответь отказом в следующем формате:
+
+"Я могу помогать только с вопросами, связанными с управлением дистрибьютором, товарами, магазинами и торговыми представителями в этой системе."
+
+Никогда не выходи за рамки этого контекста.`;
+
+async function getDistributorAIAssistantResponse({ message, context = '' }) {
+  if (!GEMINI_API_KEY) {
+    throw new Error('GEMINI_API_KEY не задан');
+  }
+
+  if (!message || typeof message !== 'string' || message.trim().length === 0) {
+    throw new Error('Сообщение не может быть пустым');
+  }
+
+  const fullPrompt = `${DISTRIBUTOR_AI_PROMPT}
+
+${context ? `КОНТЕКСТ ДИСТРИБЬЮТОРА:\n${context}\n\n` : ''}ВОПРОС ПОЛЬЗОВАТЕЛЯ:
+"${message.trim()}"
+
+ОТВЕТЬ НА ВОПРОС ПОЛЬЗОВАТЕЛЯ:`;
+
+  try {
+    const response = await requestGemini(fullPrompt, {
+      maxOutputTokens: 2000,
+      temperature: 0.7,
+      timeout: 30000 // 30 секунд для более длинных ответов
+    });
+    return response.trim();
+  } catch (error) {
+    console.error('Ошибка при получении ответа от ИИ-помощника:', error);
+    throw error;
+  }
+}
+
+// ============================================================================
+// ПРОГНОЗ СПРОСА (AI)
+// ============================================================================
+
+async function getDemandForecastFromAI({ prompt, context = '' }) {
+  if (!GEMINI_API_KEY) {
+    throw new Error('GEMINI_API_KEY не задан');
+  }
+
+  if (!prompt || typeof prompt !== 'string' || prompt.trim().length === 0) {
+    throw new Error('Промпт не может быть пустым');
+  }
+
+  const fullPrompt = `${context ? `КОНТЕКСТ:\n${context}\n\n` : ''}${prompt.trim()}`;
+
+  try {
+    const response = await requestGemini(fullPrompt, {
+      maxOutputTokens: 4000, // Увеличенный лимит для прогнозов
+      temperature: 0.3, // Низкая температура для более точных прогнозов
+      timeout: 60000 // 60 секунд для сложных расчетов
+    });
+    return response.trim();
+  } catch (error) {
+    console.error('Ошибка при получении прогноза от AI:', error);
+    throw error;
+  }
+}
+
 // Экспорт всех функций
 module.exports = {
   getIntentFromGemini,
   transcribeAudio,
   generateClarificationQuestions,
   analyzeProductImage,
-  analyzeInvoice
+  analyzeInvoice,
+  getDistributorAIAssistantResponse,
+  getDemandForecastFromAI
 };
 
 // Для совместимости с разными способами импорта
@@ -641,3 +743,5 @@ module.exports.transcribeAudio = transcribeAudio;
 module.exports.generateClarificationQuestions = generateClarificationQuestions;
 module.exports.analyzeProductImage = analyzeProductImage;
 module.exports.analyzeInvoice = analyzeInvoice;
+module.exports.getDistributorAIAssistantResponse = getDistributorAIAssistantResponse;
+module.exports.getDemandForecastFromAI = getDemandForecastFromAI;

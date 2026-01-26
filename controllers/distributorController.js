@@ -1156,6 +1156,25 @@ async function getDistributorStores(req, res) {
       ? await Store.find({ id: { $in: storeIds } }).lean()
       : [];
 
+    // Получаем информацию о владельцах магазинов (пользователи с ролью 'STORE')
+    const storeOwners = await User.find({
+      storeId: { $in: storeIds },
+      role: 'STORE',
+      isActive: true
+    }).lean();
+
+    // Создаем карту владельцев по storeId
+    const ownerMap = new Map();
+    storeOwners.forEach(owner => {
+      if (owner.storeId && !ownerMap.has(owner.storeId)) {
+        ownerMap.set(owner.storeId, {
+          firstName: owner.firstName || null,
+          email: owner.email || null,
+          phoneNumber: owner.phoneNumber || null
+        });
+      }
+    });
+
     // Если запрошена информация о торговых представителях
     if (withSalesReps === 'true') {
       const links = await SalesRepresentativeStore.find({
@@ -1185,7 +1204,7 @@ async function getDistributorStores(req, res) {
 
       const salesRepMap = new Map(salesReps.map(rep => [rep.id, rep]));
 
-      // Добавляем информацию о ТП к каждому магазину
+      // Добавляем информацию о ТП и владельце к каждому магазину
       const storesWithSalesReps = stores.map(store => {
         const salesRepIdsForStore = salesRepsByStore.get(store.id) || [];
         const salesRepsForStore = salesRepIdsForStore
@@ -1197,8 +1216,11 @@ async function getDistributorStores(req, res) {
             firstName: rep.firstName
           }));
 
+        const owner = ownerMap.get(store.id) || null;
+
         return {
           ...store,
+          owner: owner,
           salesRepresentatives: salesRepsForStore,
           salesRepresentativesCount: salesRepsForStore.length
         };
@@ -1210,9 +1232,18 @@ async function getDistributorStores(req, res) {
       });
     }
 
+    // Добавляем информацию о владельце к каждому магазину
+    const storesWithOwner = stores.map(store => {
+      const owner = ownerMap.get(store.id) || null;
+      return {
+        ...store,
+        owner: owner
+      };
+    });
+
     res.json({
-      items: stores,
-      total: stores.length
+      items: storesWithOwner,
+      total: storesWithOwner.length
     });
   } catch (error) {
     console.error('Ошибка при получении магазинов дистрибьютора:', error);

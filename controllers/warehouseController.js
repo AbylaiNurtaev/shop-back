@@ -168,12 +168,22 @@ async function addStock(req, res) {
       }
     }
 
+    // Преобразуем цену в число, если она передана как строка
+    if (price !== undefined && price !== null) {
+      const numPrice = typeof price === 'string' ? parseFloat(price) : price;
+      if (!isNaN(numPrice) && numPrice >= 0) {
+        price = numPrice;
+      } else {
+        price = undefined; // Игнорируем невалидную цену
+      }
+    }
+
     // Ищем или создаем оффер
     let offer = await Offer.findOne({ productId, storeId }).lean();
 
     if (!offer) {
       // Если оффера нет, создаем новый
-      const defaultPrice = price !== undefined ? price : 0;
+      const defaultPrice = price !== undefined && price !== null ? price : 0;
       const defaultCurrency = currency || 'RUB';
 
       offer = await Offer.create({
@@ -192,7 +202,10 @@ async function addStock(req, res) {
       const update = { quantity: newQuantity, updatedAt: new Date() };
 
       // Обновляем цену и валюту, если они указаны
-      if (price !== undefined) update.price = price;
+      if (price !== undefined && price !== null) {
+        update.price = price;
+        console.log(`Обновление цены товара ${productId} (SKU: ${product.sku}) при добавлении на склад: старая цена = ${offer.price}, новая цена = ${price}`);
+      }
       if (currency !== undefined) update.currency = currency;
 
       offer = await Offer.findOneAndUpdate(
@@ -289,7 +302,7 @@ async function updateStock(req, res) {
       return res.status(404).json({ error: 'Магазин не найден для текущего пользователя' });
     }
 
-    const { productId, quantity, price, currency } = req.body;
+    let { productId, quantity, price, currency } = req.body;
 
     if (!productId || quantity === undefined || quantity < 0) {
       return res.status(400).json({ error: 'Отсутствуют обязательные поля или неверное количество' });
@@ -300,8 +313,24 @@ async function updateStock(req, res) {
       return res.status(404).json({ error: 'Товар не найден на складе' });
     }
 
+    // Преобразуем цену в число, если она передана как строка
+    if (price !== undefined && price !== null) {
+      const numPrice = typeof price === 'string' ? parseFloat(price) : price;
+      if (isNaN(numPrice) || numPrice < 0) {
+        return res.status(400).json({ error: 'Цена должна быть неотрицательным числом' });
+      }
+      price = numPrice;
+    }
+
     const update = { quantity, updatedAt: new Date() };
-    if (price !== undefined) update.price = price;
+    // Явно обновляем цену, даже если она равна 0
+    if (price !== undefined && price !== null) {
+      update.price = price;
+      // Получаем информацию о товаре для логирования
+      const product = await Product.findOne({ id: productId }).lean();
+      const sku = product?.sku || 'N/A';
+      console.log(`Обновление цены товара ${productId} (SKU: ${sku}) в магазине ${storeId}: старая цена = ${offer.price}, новая цена = ${price}`);
+    }
     if (currency !== undefined) update.currency = currency;
 
     const updatedOffer = await Offer.findOneAndUpdate(
@@ -310,8 +339,10 @@ async function updateStock(req, res) {
       { new: true }
     ).lean();
 
-    // Получаем информацию о товаре
-    const product = await Product.findOne({ id: productId }).lean();
+    console.log(`Товар ${productId} обновлен. Финальная цена: ${updatedOffer.price}`);
+
+    // Получаем информацию о товаре (если еще не получена для логирования)
+    let product = await Product.findOne({ id: productId }).lean();
 
     res.json({
       message: 'Количество товара успешно обновлено',

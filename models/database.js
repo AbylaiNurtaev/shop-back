@@ -479,6 +479,28 @@ const distributorActivityHistorySchema = new mongoose.Schema(
   baseSchemaOptions
 );
 
+// Схема для логирования поисковых запросов через Gemini
+const productSearchLogSchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true, unique: true },
+    conversationId: { type: String, default: null, index: true },
+    searchQuery: { type: String, required: true }, // Текст запроса пользователя
+    productId: { type: String, default: null, index: true }, // ID найденного товара (если найден)
+    productName: { type: String, default: null }, // Название товара
+    brandId: { type: String, default: null, index: true }, // ID бренда
+    brandName: { type: String, default: null }, // Название бренда
+    intent: { type: Object, default: {} }, // Информация о намерении (brand, packageInfo, type и т.д.)
+    foundProducts: { type: [String], default: [] }, // Массив ID найденных товаров
+    searchResult: { type: String, enum: ['FOUND', 'NOT_FOUND', 'CLARIFICATION_NEEDED'], default: null } // Результат поиска
+  },
+  baseSchemaOptions
+);
+
+// Индексы для оптимизации запросов статистики
+productSearchLogSchema.index({ brandId: 1, createdAt: -1 });
+productSearchLogSchema.index({ productId: 1, createdAt: -1 });
+productSearchLogSchema.index({ createdAt: -1 });
+
 const User = mongoose.models.User || mongoose.model('User', userSchema);
 const Store = mongoose.models.Store || mongoose.model('Store', storeSchema);
 const Distributor =
@@ -528,6 +550,8 @@ const DistributorProductPrice =
   mongoose.models.DistributorProductPrice || mongoose.model('DistributorProductPrice', distributorProductPriceSchema);
 const DistributorActivityHistory =
   mongoose.models.DistributorActivityHistory || mongoose.model('DistributorActivityHistory', distributorActivityHistorySchema);
+const ProductSearchLog =
+  mongoose.models.ProductSearchLog || mongoose.model('ProductSearchLog', productSearchLogSchema);
 
 async function seedDefaults() {
   const categoryCount = await Category.countDocuments();
@@ -655,6 +679,7 @@ module.exports = {
     Plan,
     CategoryPlan,
     DistributorProductPrice,
-    DistributorActivityHistory
+    DistributorActivityHistory,
+    ProductSearchLog
   }
 };

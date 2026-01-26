@@ -17,7 +17,9 @@ const {
   Product,
   Offer,
   Store,
-  Category
+  Category,
+  ProductSearchLog,
+  Brand
 } = models;
 
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -45,6 +47,74 @@ function nowPlus(ms) {
 
 function normalizeText(value) {
   return String(value || '').trim().toLowerCase();
+}
+
+/**
+ * Логирование поискового запроса через Gemini
+ */
+async function logProductSearch({ conversationId, searchQuery, intent, candidates, selectedProduct, searchResult }) {
+  try {
+    const logData = {
+      id: generateId(),
+      conversationId: conversationId || null,
+      searchQuery: searchQuery || '',
+      productId: null,
+      productName: null,
+      brandId: null,
+      brandName: null,
+      intent: intent || {},
+      foundProducts: [],
+      searchResult: searchResult || null
+    };
+
+    // Если есть выбранный товар
+    if (selectedProduct) {
+      logData.productId = selectedProduct.id;
+      logData.productName = selectedProduct.name;
+      logData.brandId = selectedProduct.brandId || null;
+      logData.brandName = selectedProduct.brandName || null;
+      logData.foundProducts = [selectedProduct.id];
+      logData.searchResult = 'FOUND';
+    } else if (candidates && candidates.length > 0) {
+      // Если есть кандидаты, берем информацию из них
+      const firstCandidate = candidates[0];
+      logData.foundProducts = candidates.map(c => c.id);
+      logData.brandId = firstCandidate.brandId || null;
+      logData.brandName = firstCandidate.brandName || null;
+
+      // Если кандидатов много, значит нужны уточнения
+      if (candidates.length === 1) {
+        logData.productId = firstCandidate.id;
+        logData.productName = firstCandidate.name;
+        logData.searchResult = 'FOUND';
+      } else {
+        logData.searchResult = 'CLARIFICATION_NEEDED';
+      }
+    } else {
+      logData.searchResult = 'NOT_FOUND';
+    }
+
+    // Если brandId не найден, но есть brandName в intent, пытаемся найти бренд
+    if (!logData.brandId && intent && intent.brand) {
+      try {
+        const brand = await Brand.findOne({
+          name: { $regex: new RegExp(intent.brand, 'i') }
+        }).lean();
+        if (brand) {
+          logData.brandId = brand.id;
+          logData.brandName = brand.name;
+        }
+      } catch (error) {
+        // Игнорируем ошибку поиска бренда
+      }
+    }
+
+    // Сохраняем лог
+    await ProductSearchLog.create(logData);
+  } catch (error) {
+    // Не прерываем выполнение, если логирование не удалось
+    console.error('Ошибка при логировании поиска:', error);
+  }
 }
 
 /**
@@ -656,6 +726,26 @@ async function postMessage(req, res) {
             text: systemMessage
           });
 
+          // Логируем успешный поиск товара
+          await logProductSearch({
+            conversationId,
+            searchQuery: intent.rawText || text || '',
+            intent: {
+              brand: intent.brand || null,
+              packageInfo: intent.packageInfo || null,
+              type: intent.type || null,
+              packageType: intent.packageType || null
+            },
+            candidates: [selectedProduct],
+            selectedProduct: {
+              id: selectedProduct.id,
+              name: selectedProduct.name,
+              brandId: selectedProduct.brandId || null,
+              brandName: selectedProduct.brandName || null
+            },
+            searchResult: 'FOUND'
+          });
+
           return res.json({
             state: conversation.state,
             messageId: message.id,
@@ -717,6 +807,20 @@ async function postMessage(req, res) {
       intent.packageType = null;
       await intent.save();
 
+      // Логируем, что товар не найден
+      await logProductSearch({
+        conversationId,
+        searchQuery: text || intent.rawText || '',
+        intent: {
+          brand: null,
+          packageInfo: null,
+          type: null,
+          packageType: null
+        },
+        candidates: [],
+        searchResult: 'NOT_FOUND'
+      });
+
       return res.json({
         state: conversation.state,
         messageId: message.id,
@@ -749,6 +853,20 @@ async function postMessage(req, res) {
             type: intent.type || null,
             packageType: intent.packageType || null
           }
+        });
+
+        // Логируем поиск через Gemini
+        await logProductSearch({
+          conversationId,
+          searchQuery: text.trim(),
+          intent: {
+            brand: intent.brand || null,
+            packageInfo: intent.packageInfo || null,
+            type: intent.type || null,
+            packageType: intent.packageType || null
+          },
+          candidates,
+          searchResult: null // Пока не знаем результат
         });
       } catch (error) {
         console.error('Ошибка при получении intent от Gemini:', error);
@@ -950,6 +1068,26 @@ async function postMessage(req, res) {
         conversationId,
         sender: 'SYSTEM',
         text: systemMessage
+      });
+
+      // Логируем успешный поиск товара
+      await logProductSearch({
+        conversationId,
+        searchQuery: text || intent.rawText || '',
+        intent: {
+          brand: intent.brand || null,
+          packageInfo: intent.packageInfo || null,
+          type: intent.type || null,
+          packageType: intent.packageType || null
+        },
+        candidates: [candidates[0]],
+        selectedProduct: {
+          id: candidates[0].id,
+          name: candidates[0].name,
+          brandId: candidates[0].brandId || null,
+          brandName: candidates[0].brandName || null
+        },
+        searchResult: 'FOUND'
       });
 
       return res.json({
@@ -1542,6 +1680,20 @@ async function searchByImage(req, res) {
     console.log('Итоговое количество кандидатов:', candidates.length);
 
     if (candidates.length === 0) {
+      // Логируем, что товар не найден по изображению
+      await logProductSearch({
+        conversationId: conversationId || null,
+        searchQuery: `[Поиск по изображению] ${imageAnalysis.brand || ''} ${imageAnalysis.productName || ''}`.trim(),
+        intent: {
+          brand: imageAnalysis.brand || null,
+          packageInfo: imageAnalysis.packageInfo || null,
+          type: imageAnalysis.type || null,
+          packageType: imageAnalysis.packageType || null
+        },
+        candidates: [],
+        searchResult: 'NOT_FOUND'
+      });
+
       return res.json({
         success: false,
         message: 'Товар не найден в базе данных',
@@ -1714,6 +1866,27 @@ async function searchByImage(req, res) {
         offersInRadius: storeInfo.offersInRadius,
         nearestStore: storeInfo.nearestStore
       };
+    });
+
+    // Логируем поиск по изображению
+    const topCandidate = candidates[0];
+    await logProductSearch({
+      conversationId: conversationId || null,
+      searchQuery: `[Поиск по изображению] ${imageAnalysis.brand || ''} ${imageAnalysis.productName || ''}`.trim(),
+      intent: {
+        brand: imageAnalysis.brand || null,
+        packageInfo: imageAnalysis.packageInfo || null,
+        type: imageAnalysis.type || null,
+        packageType: imageAnalysis.packageType || null
+      },
+      candidates: candidates,
+      selectedProduct: candidates.length === 1 ? {
+        id: topCandidate.id,
+        name: topCandidate.name,
+        brandId: topCandidate.brandId || null,
+        brandName: topCandidate.brandName || null
+      } : null,
+      searchResult: candidates.length === 1 ? 'FOUND' : 'CLARIFICATION_NEEDED'
     });
 
     // Возвращаем результаты

@@ -9,7 +9,11 @@ const {
   approveBrand,
   rejectBrand,
   updateBrand,
-  deleteBrand
+  deleteBrand,
+  getMyBrand,
+  getMyBrandSettings,
+  updateMyBrandSettings,
+  getBrandSearchStatistics
 } = require('../controllers/brandController');
 const { getBrandProducts } = require('../controllers/productController');
 
@@ -21,6 +25,12 @@ router.get('/:brandId/products', getBrandProducts);
 
 // Все остальные роуты требуют авторизации
 router.use(authenticateToken);
+
+// Эндпоинты для брендов (настройки)
+router.get('/me', getMyBrand);
+router.get('/me/settings', getMyBrandSettings);
+router.put('/me/settings', updateMyBrandSettings);
+router.get('/me/search-statistics', getBrandSearchStatistics);
 
 // Список всех брендов (для админ-панели)
 router.get('/', getBrands);

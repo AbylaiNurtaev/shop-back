@@ -3,7 +3,7 @@ const { models } = require('../models/database');
 const { hashPassword } = require('../utils/password');
 const { sendEmail } = require('../utils/email');
 
-const { Brand, Category, User, AuthCredential } = models;
+const { Brand, Category, User, AuthCredential, ProductSearchLog, Product } = models;
 
 async function createBrand(req, res) {
   let createdUserId = null;
@@ -318,6 +318,307 @@ async function rejectBrand(req, res) {
   }
 }
 
+// Получение информации о текущем бренде пользователя
+async function getMyBrand(req, res) {
+  try {
+    const userId = req.user && req.user.userId;
+    if (!userId) {
+      return res.status(401).json({ error: 'Токен доступа отсутствует' });
+    }
+
+    const user = await User.findOne({ id: userId, role: 'BRAND' }).lean();
+    if (!user) {
+      return res.status(404).json({ error: 'Бренд не найден' });
+    }
+
+    const brand = await Brand.findOne({ email: user.email }).lean();
+    if (!brand) {
+      return res.status(404).json({ error: 'Бренд не найден' });
+    }
+
+    res.json(brand);
+  } catch (error) {
+    console.error('Ошибка при получении бренда:', error);
+    res.status(500).json({ error: 'Ошибка при получении бренда' });
+  }
+}
+
+// Получение настроек бренда
+async function getMyBrandSettings(req, res) {
+  try {
+    const userId = req.user && req.user.userId;
+    if (!userId) {
+      return res.status(401).json({ error: 'Токен доступа отсутствует' });
+    }
+
+    const user = await User.findOne({ id: userId, role: 'BRAND' }).lean();
+    if (!user) {
+      return res.status(404).json({ error: 'Бренд не найден' });
+    }
+
+    const brand = await Brand.findOne({ email: user.email }).lean();
+    if (!brand) {
+      return res.status(404).json({ error: 'Бренд не найден' });
+    }
+
+    // Возвращаем только настройки (исключаем служебные поля)
+    const settings = {
+      id: brand.id,
+      name: brand.name,
+      email: brand.email,
+      country: brand.country,
+      categoryId: brand.categoryId,
+      logoUrl: brand.logoUrl,
+      contactName: brand.contactName,
+      isAccepted: brand.isAccepted,
+      createdAt: brand.createdAt,
+      updatedAt: brand.updatedAt
+    };
+
+    res.json(settings);
+  } catch (error) {
+    console.error('Ошибка при получении настроек бренда:', error);
+    res.status(500).json({ error: 'Ошибка при получении настроек бренда' });
+  }
+}
+
+// Обновление настроек бренда
+async function updateMyBrandSettings(req, res) {
+  try {
+    const userId = req.user && req.user.userId;
+    if (!userId) {
+      return res.status(401).json({ error: 'Токен доступа отсутствует' });
+    }
+
+    const user = await User.findOne({ id: userId, role: 'BRAND' }).lean();
+    if (!user) {
+      return res.status(404).json({ error: 'Бренд не найден' });
+    }
+
+    const brand = await Brand.findOne({ email: user.email }).lean();
+    if (!brand) {
+      return res.status(404).json({ error: 'Бренд не найден' });
+    }
+
+    const {
+      name,
+      country,
+      categoryId,
+      logoUrl,
+      contactName
+    } = req.body;
+
+    // Получаем старые данные для логирования
+    const oldBrand = brand;
+    const update = { updatedAt: new Date() };
+    const changes = [];
+
+    // Валидация и обновление полей
+    if (name !== undefined) {
+      if (typeof name !== 'string' || name.trim().length === 0) {
+        return res.status(400).json({ error: 'Имя должно быть непустой строкой' });
+      }
+      update.name = name.trim();
+      if (oldBrand.name !== name.trim()) {
+        changes.push(`имя: "${oldBrand.name}" → "${name.trim()}"`);
+      }
+    }
+
+    if (country !== undefined) {
+      if (typeof country !== 'string' || country.trim().length === 0) {
+        return res.status(400).json({ error: 'Страна должна быть непустой строкой' });
+      }
+      update.country = country.trim();
+      if (oldBrand.country !== country.trim()) {
+        changes.push(`страна: "${oldBrand.country}" → "${country.trim()}"`);
+      }
+    }
+
+    if (categoryId !== undefined) {
+      if (typeof categoryId !== 'string' || categoryId.trim().length === 0) {
+        return res.status(400).json({ error: 'ID категории должен быть непустой строкой' });
+      }
+      // Проверяем существование категории
+      const category = await Category.findOne({ id: categoryId }).lean();
+      if (!category) {
+        return res.status(400).json({ error: 'Категория не найдена' });
+      }
+      update.categoryId = categoryId;
+      if (oldBrand.categoryId !== categoryId) {
+        changes.push(`категория обновлена`);
+      }
+    }
+
+    if (logoUrl !== undefined) {
+      update.logoUrl = logoUrl === null || logoUrl === '' ? null : logoUrl;
+      if (oldBrand.logoUrl !== update.logoUrl) {
+        changes.push('логотип обновлен');
+      }
+    }
+
+    if (contactName !== undefined) {
+      update.contactName = contactName === null || contactName === '' ? null : contactName.trim();
+      if (oldBrand.contactName !== update.contactName) {
+        changes.push(`контактное лицо: "${oldBrand.contactName || 'не указано'}" → "${update.contactName || 'не указано'}"`);
+      }
+    }
+
+    // Проверяем, есть ли что обновлять
+    if (Object.keys(update).length === 1) {
+      // Только updatedAt
+      return res.status(400).json({ error: 'Нет полей для обновления' });
+    }
+
+    const updatedBrand = await Brand.findOneAndUpdate(
+      { id: brand.id },
+      update,
+      { new: true }
+    ).lean();
+
+    if (!updatedBrand) {
+      return res.status(404).json({ error: 'Бренд не найден' });
+    }
+
+    // Обновляем firstName пользователя, если изменилось contactName
+    if (contactName !== undefined && contactName !== null && contactName.trim() !== '') {
+      await User.findOneAndUpdate(
+        { id: userId },
+        { firstName: contactName.trim() },
+        { new: true }
+      );
+    }
+
+    res.json(updatedBrand);
+  } catch (error) {
+    console.error('Ошибка при обновлении настроек бренда:', error);
+    res.status(500).json({ error: 'Ошибка при обновлении настроек бренда' });
+  }
+}
+
+// Получение статистики поисков по бренду
+async function getBrandSearchStatistics(req, res) {
+  try {
+    const userId = req.user && req.user.userId;
+    if (!userId) {
+      return res.status(401).json({ error: 'Токен доступа отсутствует' });
+    }
+
+    const user = await User.findOne({ id: userId, role: 'BRAND' }).lean();
+    if (!user) {
+      return res.status(404).json({ error: 'Бренд не найден' });
+    }
+
+    const brand = await Brand.findOne({ email: user.email }).lean();
+    if (!brand) {
+      return res.status(404).json({ error: 'Бренд не найден' });
+    }
+
+    // Параметры фильтрации
+    const startDate = req.query.startDate ? new Date(req.query.startDate) : null;
+    const endDate = req.query.endDate ? new Date(req.query.endDate) : null;
+    const limit = parseInt(req.query.limit) || 50;
+
+    // Формируем запрос для поиска логов
+    const query = { brandId: brand.id };
+    
+    if (startDate || endDate) {
+      query.createdAt = {};
+      if (startDate) {
+        query.createdAt.$gte = startDate;
+      }
+      if (endDate) {
+        query.createdAt.$lte = endDate;
+      }
+    }
+
+    // Получаем все логи поисков для этого бренда
+    // Ищем по brandId или по brandName (для обратной совместимости)
+    const searchLogs = await ProductSearchLog.find({
+      $or: [
+        { brandId: brand.id },
+        { brandName: { $regex: new RegExp(brand.name, 'i') } }
+      ],
+      ...(query.createdAt ? { createdAt: query.createdAt } : {})
+    })
+      .sort({ createdAt: -1 })
+      .limit(1000) // Ограничиваем для производительности
+      .lean();
+
+    // Агрегируем статистику по товарам
+    const productStats = new Map();
+
+    searchLogs.forEach(log => {
+      if (log.productId && log.searchResult === 'FOUND') {
+        if (!productStats.has(log.productId)) {
+          productStats.set(log.productId, {
+            productId: log.productId,
+            productName: log.productName || 'Неизвестный товар',
+            searchCount: 0,
+            lastSearched: null,
+            queries: []
+          });
+        }
+
+        const stat = productStats.get(log.productId);
+        stat.searchCount += 1;
+        if (!stat.lastSearched || new Date(log.createdAt) > new Date(stat.lastSearched)) {
+          stat.lastSearched = log.createdAt;
+        }
+        if (log.searchQuery && !stat.queries.includes(log.searchQuery)) {
+          stat.queries.push(log.searchQuery);
+        }
+      }
+    });
+
+    // Преобразуем в массив и сортируем по количеству поисков
+    const topProducts = Array.from(productStats.values())
+      .sort((a, b) => b.searchCount - a.searchCount)
+      .slice(0, limit)
+      .map(stat => ({
+        productId: stat.productId,
+        productName: stat.productName,
+        searchCount: stat.searchCount,
+        lastSearched: stat.lastSearched,
+        topQueries: stat.queries.slice(0, 5) // Топ 5 запросов для этого товара
+      }));
+
+    // Общая статистика
+    const totalSearches = searchLogs.length;
+    const foundSearches = searchLogs.filter(log => log.searchResult === 'FOUND').length;
+    const notFoundSearches = searchLogs.filter(log => log.searchResult === 'NOT_FOUND').length;
+    const clarificationNeeded = searchLogs.filter(log => log.searchResult === 'CLARIFICATION_NEEDED').length;
+
+    // Статистика по брендам (если есть поиски с указанием бренда)
+    const brandSearchCount = searchLogs.filter(log => 
+      log.intent && log.intent.brand && 
+      log.intent.brand.toLowerCase().includes(brand.name.toLowerCase())
+    ).length;
+
+    res.json({
+      brand: {
+        id: brand.id,
+        name: brand.name
+      },
+      period: {
+        startDate: startDate ? startDate.toISOString() : null,
+        endDate: endDate ? endDate.toISOString() : null
+      },
+      summary: {
+        totalSearches,
+        foundSearches,
+        notFoundSearches,
+        clarificationNeeded,
+        uniqueProductsFound: productStats.size,
+        brandSearchCount
+      },
+      topProducts
+    });
+  } catch (error) {
+    console.error('Ошибка при получении статистики поисков:', error);
+    res.status(500).json({ error: 'Ошибка при получении статистики поисков' });
+  }
+}
+
 module.exports = {
   createBrand,
   getBrandById,
@@ -326,5 +627,9 @@ module.exports = {
   approveBrand,
   rejectBrand,
   updateBrand,
-  deleteBrand
+  deleteBrand,
+  getMyBrand,
+  getMyBrandSettings,
+  updateMyBrandSettings,
+  getBrandSearchStatistics
 };

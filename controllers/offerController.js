@@ -172,7 +172,7 @@ async function getOffers(req, res) {
 async function updateOffer(req, res) {
   try {
     const { offerId } = req.params;
-    const { price, currency, isAvailable, quantity } = req.body;
+    let { price, currency, isAvailable, quantity } = req.body;
 
     // Проверяем существование оффера
     const offer = await Offer.findOne({ id: offerId }).lean();
@@ -198,15 +198,21 @@ async function updateOffer(req, res) {
       }
     }
 
-    // Валидация цены
-    if (price !== undefined) {
-      if (typeof price !== 'number' || price < 0) {
+    // Преобразуем цену в число, если она передана как строка
+    if (price !== undefined && price !== null) {
+      const numPrice = typeof price === 'string' ? parseFloat(price) : price;
+      if (isNaN(numPrice) || numPrice < 0) {
         return res.status(400).json({ error: 'Цена должна быть неотрицательным числом' });
       }
+      price = numPrice;
     }
 
     const update = { updatedAt: new Date() };
-    if (price !== undefined) update.price = price;
+    // Явно обновляем цену, даже если она равна 0
+    if (price !== undefined && price !== null) {
+      update.price = price;
+      console.log(`Обновление цены оффера ${offerId}: старая цена = ${offer.price}, новая цена = ${price}`);
+    }
     if (currency !== undefined) update.currency = currency;
     if (isAvailable !== undefined) update.isAvailable = isAvailable;
     if (quantity !== undefined) update.quantity = quantity;
@@ -214,6 +220,8 @@ async function updateOffer(req, res) {
     const updatedOffer = await Offer.findOneAndUpdate({ id: offerId }, update, {
       new: true
     }).lean();
+
+    console.log(`Оффер ${offerId} обновлен. Финальная цена: ${updatedOffer.price}`);
 
     res.json(updatedOffer);
   } catch (error) {
