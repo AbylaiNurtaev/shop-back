@@ -447,13 +447,14 @@ async function getMySalesRepresentative(req, res) {
       return res.status(404).json({ error: 'Торговый представитель не найден' });
     }
 
-    // Возвращаем email, firstName, lastName, middleName
+    // Возвращаем email, firstName, lastName, middleName, phoneNumber
     // Приоритет: данные из SalesRepresentative (более полные), если нет - из User
     const result = {
       email: user ? user.email : salesRep.email,
       firstName: salesRep?.firstName || user?.firstName || null,
       lastName: salesRep?.lastName || user?.lastName || null,
-      middleName: salesRep?.middleName || null
+      middleName: salesRep?.middleName || null,
+      phoneNumber: salesRep?.phoneNumber || null
     };
 
     res.json(result);
@@ -467,7 +468,7 @@ async function updateMySalesRepresentative(req, res) {
   try {
     const tokenSalesRepId = req.user && req.user.salesRepresentativeId;
     const tokenUserId = req.user && req.user.userId;
-    const { firstName, lastName, middleName } = req.body;
+    const { firstName, lastName, middleName, phoneNumber } = req.body;
 
     if (!tokenSalesRepId && !tokenUserId) {
       return res.status(403).json({ error: 'Только торговые представители могут обновлять свои данные' });
@@ -522,6 +523,7 @@ async function updateMySalesRepresentative(req, res) {
           firstName,
           lastName,
           middleName: middleName || null,
+          phoneNumber: phoneNumber || null,
           updatedAt: new Date() 
         }
       );
@@ -535,7 +537,8 @@ async function updateMySalesRepresentative(req, res) {
       email: updatedUser ? updatedUser.email : updatedSalesRep.email,
       firstName: updatedSalesRep?.firstName || updatedUser?.firstName || null,
       lastName: updatedSalesRep?.lastName || updatedUser?.lastName || null,
-      middleName: updatedSalesRep?.middleName || null
+      middleName: updatedSalesRep?.middleName || null,
+      phoneNumber: updatedSalesRep?.phoneNumber || null
     };
 
     res.json({

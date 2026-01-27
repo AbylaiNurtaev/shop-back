@@ -76,7 +76,11 @@ const storeSchema = new mongoose.Schema(
       lng: { type: Number, default: null }
     },
     description: { type: String, default: null },
-    photos: { type: [String], default: [] }
+    photos: { type: [String], default: [] },
+    firstName: { type: String, default: null },
+    lastName: { type: String, default: null },
+    middleName: { type: String, default: null },
+    phoneNumber: { type: String, default: null }
   },
   baseSchemaOptions
 );
@@ -104,6 +108,7 @@ const salesRepresentativeSchema = new mongoose.Schema(
     lastName: { type: String, required: false },
     middleName: { type: String, required: false },
     email: { type: String, required: true, unique: true },
+    phoneNumber: { type: String, default: null },
     distributorId: { type: String, default: null, index: true }
   },
   baseSchemaOptions
@@ -505,6 +510,74 @@ productSearchLogSchema.index({ brandId: 1, createdAt: -1 });
 productSearchLogSchema.index({ productId: 1, createdAt: -1 });
 productSearchLogSchema.index({ createdAt: -1 });
 
+// Схема истории накладных
+const invoiceHistorySchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true, unique: true },
+    storeId: { type: String, required: true, index: true },
+    storeOwnerId: { type: String, required: true, index: true }, // ID владельца магазина (userId)
+    imageUrl: { type: String, required: true }, // URL сжатого изображения на S3
+    imageKey: { type: String, required: true }, // Ключ файла на S3
+    originalSize: { type: Number, default: null }, // Размер оригинального файла в байтах
+    compressedSize: { type: Number, default: null }, // Размер сжатого файла в байтах
+    mimeType: { type: String, required: true },
+    // Данные, извлеченные из накладной ИИ
+    invoiceData: {
+      items: { type: [Object], default: [] },
+      invoiceNumber: { type: String, default: null },
+      date: { type: String, default: null },
+      supplier: { type: String, default: null }
+    },
+    // Результаты анализа товаров
+    analysisResults: {
+      found: { type: [Object], default: [] },
+      notFound: { type: [Object], default: [] },
+      errors: { type: [Object], default: [] },
+      summary: {
+        total: { type: Number, default: 0 },
+        found: { type: Number, default: 0 },
+        notFound: { type: Number, default: 0 },
+        errors: { type: Number, default: 0 }
+      }
+    },
+    // Статус обработки накладной
+    status: {
+      type: String,
+      enum: ['PROCESSED', 'CONFIRMED', 'CANCELLED'],
+      default: 'PROCESSED'
+    }
+  },
+  baseSchemaOptions
+);
+
+// Индексы для оптимизации запросов
+invoiceHistorySchema.index({ storeId: 1, createdAt: -1 });
+invoiceHistorySchema.index({ storeOwnerId: 1, createdAt: -1 });
+
+// Схема действия в истории действий владельца магазина (вложенный документ)
+const storeActivityActionSchema = new mongoose.Schema({
+  actionType: { type: String, required: true }, // Тип действия (например, 'ADD_STOCK', 'REMOVE_STOCK', 'UPDATE_PRICE', 'UPDATE_QUANTITY', 'CONFIRM_INVOICE')
+  description: { type: String, required: true }, // Описание действия
+  metadata: { type: Object, default: {} }, // Дополнительные данные (productId, productName, quantity, price, oldValue, newValue и т.д.)
+  timestamp: { type: Date, default: Date.now } // Время действия
+}, { _id: false });
+
+// Схема истории действий владельца магазина
+// Одна запись = один магазин, внутри массив действий
+const storeActivityHistorySchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true, unique: true },
+    storeId: { type: String, required: true, unique: true, index: true },
+    storeOwnerId: { type: String, required: true, index: true }, // ID владельца магазина (userId)
+    actions: [storeActivityActionSchema] // Массив действий
+  },
+  baseSchemaOptions
+);
+
+// Индексы для оптимизации запросов
+storeActivityHistorySchema.index({ storeId: 1 });
+storeActivityHistorySchema.index({ storeOwnerId: 1 });
+
 const User = mongoose.models.User || mongoose.model('User', userSchema);
 const Store = mongoose.models.Store || mongoose.model('Store', storeSchema);
 const Distributor =
@@ -556,6 +629,10 @@ const DistributorActivityHistory =
   mongoose.models.DistributorActivityHistory || mongoose.model('DistributorActivityHistory', distributorActivityHistorySchema);
 const ProductSearchLog =
   mongoose.models.ProductSearchLog || mongoose.model('ProductSearchLog', productSearchLogSchema);
+const InvoiceHistory =
+  mongoose.models.InvoiceHistory || mongoose.model('InvoiceHistory', invoiceHistorySchema);
+const StoreActivityHistory =
+  mongoose.models.StoreActivityHistory || mongoose.model('StoreActivityHistory', storeActivityHistorySchema);
 
 async function seedDefaults() {
   const categoryCount = await Category.countDocuments();
@@ -684,6 +761,8 @@ module.exports = {
     CategoryPlan,
     DistributorProductPrice,
     DistributorActivityHistory,
-    ProductSearchLog
+    ProductSearchLog,
+    InvoiceHistory,
+    StoreActivityHistory
   }
 };

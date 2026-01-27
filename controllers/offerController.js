@@ -1,5 +1,6 @@
 const { generateId } = require('../utils/uuid');
 const { models } = require('../models/database');
+const { logStoreActivity } = require('../utils/storeActivityLogger');
 
 const { Offer, Product, Category, User, BrandDistributorRequest } = models;
 
@@ -67,6 +68,28 @@ async function createOffer(req, res) {
       isAvailable: isAvailable !== undefined ? isAvailable : true,
       quantity: quantity || 0
     });
+
+    // Логируем действие, если это владелец магазина
+    const userStoreId = await getStoreIdForStoreOwner(req.user);
+    if (userStoreId && userStoreId === storeId && product) {
+      await logStoreActivity(
+        storeId,
+        req.user.userId,
+        'CREATE_OFFER',
+        `Создан новый оффер для товара "${product.name}" (SKU: ${product.sku}). Цена: ${price} ${currency}, количество: ${quantity || 0}`,
+        {
+          productId: product.id,
+          productName: product.name,
+          sku: product.sku,
+          brandName: product.brandName,
+          price: price,
+          currency: currency,
+          quantity: quantity || 0,
+          isAvailable: isAvailable !== undefined ? isAvailable : true,
+          offerId: offer.id
+        }
+      );
+    }
 
     res.status(201).json(offer.toObject());
   } catch (error) {
@@ -207,6 +230,11 @@ async function updateOffer(req, res) {
       price = numPrice;
     }
 
+    const oldPrice = offer.price;
+    const oldQuantity = offer.quantity || 0;
+    const oldIsAvailable = offer.isAvailable;
+    const oldCurrency = offer.currency;
+
     const update = { updatedAt: new Date() };
     // Явно обновляем цену, даже если она равна 0
     if (price !== undefined && price !== null) {
@@ -223,6 +251,72 @@ async function updateOffer(req, res) {
 
     console.log(`Оффер ${offerId} обновлен. Финальная цена: ${updatedOffer.price}`);
 
+    // Логируем действия, если это владелец магазина
+    if (userStoreId && userStoreId === offer.storeId) {
+      const product = await Product.findOne({ id: offer.productId }).lean();
+      
+      if (product) {
+        // Логируем изменение цены
+        if (price !== undefined && price !== null && oldPrice !== price) {
+          await logStoreActivity(
+            offer.storeId,
+            req.user.userId,
+            'UPDATE_PRICE',
+            `Изменена цена товара "${product.name}" (SKU: ${product.sku}). Старая цена: ${oldPrice} ${oldCurrency}, новая цена: ${price} ${updatedOffer.currency}`,
+            {
+              productId: product.id,
+              productName: product.name,
+              sku: product.sku,
+              brandName: product.brandName,
+              oldPrice: oldPrice,
+              newPrice: price,
+              oldCurrency: oldCurrency,
+              newCurrency: updatedOffer.currency,
+              offerId: updatedOffer.id
+            }
+          );
+        }
+
+        // Логируем изменение количества
+        if (quantity !== undefined && oldQuantity !== quantity) {
+          await logStoreActivity(
+            offer.storeId,
+            req.user.userId,
+            'UPDATE_QUANTITY',
+            `Изменено количество товара "${product.name}" (SKU: ${product.sku}) на складе. Старое количество: ${oldQuantity}, новое количество: ${quantity}`,
+            {
+              productId: product.id,
+              productName: product.name,
+              sku: product.sku,
+              brandName: product.brandName,
+              oldQuantity: oldQuantity,
+              newQuantity: quantity,
+              offerId: updatedOffer.id
+            }
+          );
+        }
+
+        // Логируем изменение доступности товара
+        if (isAvailable !== undefined && oldIsAvailable !== isAvailable) {
+          await logStoreActivity(
+            offer.storeId,
+            req.user.userId,
+            'UPDATE_AVAILABILITY',
+            `Изменена доступность товара "${product.name}" (SKU: ${product.sku}). ${isAvailable ? 'Товар доступен' : 'Товар недоступен'}`,
+            {
+              productId: product.id,
+              productName: product.name,
+              sku: product.sku,
+              brandName: product.brandName,
+              oldIsAvailable: oldIsAvailable,
+              newIsAvailable: isAvailable,
+              offerId: updatedOffer.id
+            }
+          );
+        }
+      }
+    }
+
     res.json(updatedOffer);
   } catch (error) {
     console.error('Ошибка при обновлении оффера:', error);
@@ -233,6 +327,51 @@ async function updateOffer(req, res) {
 async function deleteOffer(req, res) {
   try {
     const { offerId } = req.params;
+    
+    // Получаем оффер перед удалением для логирования
+    const offer = await Offer.findOne({ id: offerId }).lean();
+    if (!offer) {
+      return res.status(404).json({ error: 'Оффер не найден' });
+    }
+
+    // Проверяем права доступа
+    const userStoreId = await getStoreIdForStoreOwner(req.user);
+    if (userStoreId && offer.storeId !== userStoreId) {
+      return res.status(403).json({ 
+        error: 'Нет доступа к этому офферу. Вы можете удалять только офферы своего магазина' 
+      });
+    }
+
+    if (!userStoreId) {
+      if (req.user.role !== 'ADMIN') {
+        return res.status(403).json({ 
+          error: 'Только владелец магазина может удалять офферы' 
+        });
+      }
+    }
+
+    // Логируем действие перед удалением
+    if (userStoreId && userStoreId === offer.storeId) {
+      const product = await Product.findOne({ id: offer.productId }).lean();
+      if (product) {
+        await logStoreActivity(
+          offer.storeId,
+          req.user.userId,
+          'DELETE_OFFER',
+          `Удален оффер для товара "${product.name}" (SKU: ${product.sku}) со склада`,
+          {
+            productId: product.id,
+            productName: product.name,
+            sku: product.sku,
+            brandName: product.brandName,
+            offerId: offer.id,
+            lastPrice: offer.price,
+            lastQuantity: offer.quantity || 0
+          }
+        );
+      }
+    }
+
     const result = await Offer.deleteOne({ id: offerId });
     if (result.deletedCount === 0) {
       return res.status(404).json({ error: 'Оффер не найден' });

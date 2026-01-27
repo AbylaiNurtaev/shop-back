@@ -54,10 +54,13 @@ async function createUser(req, res) {
     let resolvedDistributorId = distributorId || null;
 
     if (store) {
-      const { name, address, location, description, photos, images } = store;
+      const { name, address, location, description, photos, images, firstName, lastName, middleName, phoneNumber } = store;
       const normalizedLocation = normalizeLocation(location);
       if (!name || !address || !normalizedLocation) {
         return res.status(400).json({ error: 'Отсутствуют обязательные поля магазина' });
+      }
+      if (!firstName || !lastName) {
+        return res.status(400).json({ error: 'Фамилия и Имя обязательны для заполнения при создании магазина' });
       }
       const coords = await getCoordinatesFromLink(normalizedLocation);
       const createdStore = await Store.create({
@@ -67,7 +70,11 @@ async function createUser(req, res) {
         location: normalizedLocation,
         locationCoords: coords ? { lat: coords.lat, lng: coords.lon } : null,
         description: description || null,
-        photos: photos || images || []
+        photos: photos || images || [],
+        firstName: firstName || null,
+        lastName: lastName || null,
+        middleName: middleName || null,
+        phoneNumber: phoneNumber || null
       });
       resolvedStoreId = createdStore.id;
     }

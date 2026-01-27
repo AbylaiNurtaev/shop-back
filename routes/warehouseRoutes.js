@@ -11,14 +11,17 @@ const {
   getWarehouseAnalytics,
   processInvoice,
   confirmInvoiceItems,
+  getInvoiceHistory,
+  getInvoiceDetails,
+  getStoreActivityHistory,
   // Функции для продавца магазина (QR-сканер)
   findProductByBarcode,
   quickAddStockByBarcode
 } = require('../controllers/warehouseController');
 
 // Настройка multer для загрузки файлов
-const upload = multer({ 
-  storage: multer.memoryStorage(), 
+const upload = multer({
+  storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 } // 10MB
 });
 
@@ -49,6 +52,15 @@ router.post('/invoice/process', requireStoreOwner, upload.any(), processInvoice)
 
 // Подтверждение и добавление товаров из накладной на склад
 router.post('/invoice/confirm', requireStoreOwner, confirmInvoiceItems);
+
+// Получение истории накладных
+router.get('/invoice/history', requireStoreOwner, getInvoiceHistory);
+
+// Получение детальной информации о конкретной накладной
+router.get('/invoice/:invoiceId', requireStoreOwner, getInvoiceDetails);
+
+// Получение истории действий владельца магазина
+router.get('/activity/history', requireStoreOwner, getStoreActivityHistory);
 
 // ========== МАРШРУТЫ ДЛЯ ПРОДАВЦА МАГАЗИНА (QR-СКАНЕР) ==========
 // Только быстрый приход товара по штрих-коду

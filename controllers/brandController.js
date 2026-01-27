@@ -623,6 +623,10 @@ async function getBrandSearchStatistics(req, res) {
 // Валидация изображения товара
 async function validateProductImageForBrand(req, res) {
   try {
+    console.log('=== Валидация изображения товара ===');
+    console.log('req.body:', req.body);
+    console.log('req.file:', req.file ? { name: req.file.originalname, size: req.file.size, mimetype: req.file.mimetype } : null);
+    
     const userId = req.user && req.user.userId;
     if (!userId) {
       return res.status(401).json({ error: 'Токен доступа отсутствует' });
@@ -653,32 +657,26 @@ async function validateProductImageForBrand(req, res) {
       });
     }
 
-    // Получаем productId из запроса
-    const { productId } = req.body;
-    if (!productId) {
-      return res.status(400).json({ error: 'Не указан productId' });
-    }
-
-    // Получаем информацию о товаре
-    const product = await Product.findOne({ id: productId }).lean();
-    if (!product) {
-      return res.status(404).json({ error: 'Товар не найден' });
-    }
-
-    // Проверяем, что товар принадлежит этому бренду
-    if (product.brandId !== brand.id) {
-      return res.status(403).json({ 
-        error: 'Товар не принадлежит вашему бренду' 
+    // Получаем название товара из запроса
+    // Multer может поместить поля формы в req.body, но иногда они могут быть в другом формате
+    const name = req.body?.name || req.body?.productName || null;
+    
+    if (!name || typeof name !== 'string' || name.trim().length === 0) {
+      console.log('Получен запрос валидации изображения:', {
+        body: req.body,
+        hasFile: !!file,
+        bodyKeys: Object.keys(req.body || {})
       });
+      return res.status(400).json({ error: 'Не указано название товара' });
     }
 
     // Подготавливаем информацию о товаре для валидации
     const productInfo = {
-      name: product.name,
-      brandName: product.brandName,
-      sku: product.sku,
-      packageInfo: product.packageInfo,
-      description: product.description
+      name: name.trim(),
+      brandName: brand.name,
+      sku: null,
+      packageInfo: null,
+      description: null
     };
 
     // Выполняем валидацию через Gemini API
@@ -689,27 +687,38 @@ async function validateProductImageForBrand(req, res) {
         productInfo
       });
 
-      // Определяем общий статус валидации
-      const isValid = validationResult.isValid === true && 
-                      validationResult.isSquare === true && 
-                      validationResult.hasExtraElements === false && 
-                      validationResult.matchesProduct === true;
+      console.log('Результат валидации от Gemini:', JSON.stringify(validationResult, null, 2));
 
-      // Возвращаем результат валидации
-      res.json({
-        productId: product.id,
-        productName: product.name,
-        isValid,
-        validation: {
-          isSquare: validationResult.isSquare || false,
-          hasExtraElements: validationResult.hasExtraElements || false,
-          matchesProduct: validationResult.matchesProduct || false,
-          confidence: validationResult.confidence || 0,
-          aspectRatio: validationResult.aspectRatio || 'unknown',
-          issues: validationResult.issues || [],
-          recommendations: validationResult.recommendations || [],
-          detectedProduct: validationResult.detectedProduct || null
+      // Определяем общий статус валидации (только проверка на лишние элементы)
+      const isValid = validationResult.isValid === true && 
+                      validationResult.hasExtraElements === false;
+
+      // Собираем причины отказа
+      const reasons = [];
+      
+      if (validationResult.hasExtraElements === true) {
+        // Добавляем конкретные проблемы из issues
+        if (validationResult.issues && validationResult.issues.length > 0) {
+          reasons.push(...validationResult.issues);
+        } else {
+          reasons.push('На изображении есть лишние элементы (рамки, фоны, другие объекты)');
         }
+      }
+
+      // Формируем краткое сообщение
+      let message = isValid 
+        ? 'Изображение прошло валидацию' 
+        : 'Изображение не прошло валидацию';
+
+      if (reasons.length > 0) {
+        message += '. Причины: ' + reasons.join('; ');
+      }
+
+      // Возвращаем упрощенный результат
+      res.json({
+        isValid,
+        message,
+        reasons: reasons
       });
     } catch (geminiError) {
       console.error('Ошибка при валидации изображения через Gemini:', geminiError);

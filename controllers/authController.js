@@ -475,7 +475,7 @@ async function registerSalesRepresentative(req, res) {
   let email = null;
 
   try {
-    const { firstName, lastName, middleName, email: emailParam, password } = req.body;
+    const { firstName, lastName, middleName, email: emailParam, password, phoneNumber } = req.body;
     email = emailParam;
 
     // Валидация обязательных полей
@@ -568,6 +568,7 @@ async function registerSalesRepresentative(req, res) {
         lastName,
         middleName: middleName || null,
         email,
+        phoneNumber: phoneNumber || null,
         distributorId: null
       });
 

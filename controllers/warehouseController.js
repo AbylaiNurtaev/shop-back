@@ -1,8 +1,11 @@
 const { generateId } = require('../utils/uuid');
 const { models } = require('../models/database');
 const { analyzeInvoice } = require('../utils/gemini');
+const { compressImage } = require('../utils/imageCompression');
+const { uploadImage } = require('../utils/s3');
+const { logStoreActivity } = require('../utils/storeActivityLogger');
 
-const { Offer, Product, Store, User, SalesRepresentativeStore, SalesRepresentative, BrandDistributorRequest } = models;
+const { Offer, Product, Store, User, SalesRepresentativeStore, SalesRepresentative, BrandDistributorRequest, InvoiceHistory, StoreActivityHistory } = models;
 
 const STORE_ROLES = ['STORE', 'STORE_USER'];
 
@@ -180,6 +183,8 @@ async function addStock(req, res) {
 
     // Ищем или создаем оффер
     let offer = await Offer.findOne({ productId, storeId }).lean();
+    const oldPrice = offer ? offer.price : null;
+    const isNewOffer = !offer;
 
     if (!offer) {
       // Если оффера нет, создаем новый
@@ -213,6 +218,67 @@ async function addStock(req, res) {
         update,
         { new: true }
       ).lean();
+    }
+
+    // Логируем действие
+    if (isNewOffer) {
+      // Логируем создание нового оффера
+      await logStoreActivity(
+        storeId,
+        req.user.userId,
+        'CREATE_OFFER',
+        `Создан новый оффер для товара "${product.name}" (SKU: ${product.sku}). Цена: ${offer.price} ${offer.currency}, количество: ${quantity}`,
+        {
+          productId: product.id,
+          productName: product.name,
+          sku: product.sku,
+          brandName: product.brandName,
+          price: offer.price,
+          currency: offer.currency,
+          quantity: quantity,
+          offerId: offer.id
+        }
+      );
+    } else {
+      // Логируем добавление товара на склад
+      await logStoreActivity(
+        storeId,
+        req.user.userId,
+        'ADD_STOCK',
+        `Добавлен товар "${product.name}" (SKU: ${product.sku}) на склад. Количество: +${quantity}, итого: ${offer.quantity}`,
+        {
+          productId: product.id,
+          productName: product.name,
+          sku: product.sku,
+          brandName: product.brandName,
+          quantity: quantity,
+          totalQuantity: offer.quantity,
+          price: offer.price,
+          currency: offer.currency,
+          offerId: offer.id
+        }
+      );
+
+      // Логируем изменение цены, если она изменилась
+      if (price !== undefined && price !== null && oldPrice !== null && oldPrice !== price) {
+        await logStoreActivity(
+          storeId,
+          req.user.userId,
+          'UPDATE_PRICE',
+          `Изменена цена товара "${product.name}" (SKU: ${product.sku}) при добавлении на склад. Старая цена: ${oldPrice} ${offer.currency}, новая цена: ${price} ${offer.currency}`,
+          {
+            productId: product.id,
+            productName: product.name,
+            sku: product.sku,
+            brandName: product.brandName,
+            oldPrice: oldPrice,
+            newPrice: price,
+            oldCurrency: offer.currency,
+            newCurrency: offer.currency,
+            offerId: offer.id
+          }
+        );
+      }
     }
 
     // Получаем информацию о товаре для ответа
@@ -271,6 +337,26 @@ async function removeStock(req, res) {
     // Получаем информацию о товаре
     const product = await Product.findOne({ id: productId }).lean();
 
+    // Логируем действие
+    if (product) {
+      await logStoreActivity(
+        storeId,
+        req.user.userId,
+        'REMOVE_STOCK',
+        `Списан товар "${product.name}" (SKU: ${product.sku}) со склада. Количество: -${quantity}, остаток: ${newQuantity}`,
+        {
+          productId: product.id,
+          productName: product.name,
+          sku: product.sku,
+          brandName: product.brandName,
+          quantity: quantity,
+          oldQuantity: currentQuantity,
+          newQuantity: newQuantity,
+          offerId: updatedOffer.id
+        }
+      );
+    }
+
     res.json({
       message: 'Товар успешно списан со склада',
       product: product
@@ -323,6 +409,9 @@ async function updateStock(req, res) {
     }
 
     const update = { quantity, updatedAt: new Date() };
+    const oldPrice = offer.price;
+    const oldQuantity = offer.quantity || 0;
+    
     // Явно обновляем цену, даже если она равна 0
     if (price !== undefined && price !== null) {
       update.price = price;
@@ -343,6 +432,49 @@ async function updateStock(req, res) {
 
     // Получаем информацию о товаре (если еще не получена для логирования)
     let product = await Product.findOne({ id: productId }).lean();
+
+    // Логируем действия
+    if (product) {
+      // Логируем изменение цены (наценки), если цена изменилась
+      if (price !== undefined && price !== null && oldPrice !== price) {
+        await logStoreActivity(
+          storeId,
+          req.user.userId,
+          'UPDATE_PRICE',
+          `Изменена цена товара "${product.name}" (SKU: ${product.sku}). Старая цена: ${oldPrice} ${offer.currency || 'RUB'}, новая цена: ${price} ${updatedOffer.currency || 'RUB'}`,
+          {
+            productId: product.id,
+            productName: product.name,
+            sku: product.sku,
+            brandName: product.brandName,
+            oldPrice: oldPrice,
+            newPrice: price,
+            oldCurrency: offer.currency,
+            newCurrency: updatedOffer.currency,
+            offerId: updatedOffer.id
+          }
+        );
+      }
+
+      // Логируем изменение количества, если количество изменилось
+      if (oldQuantity !== quantity) {
+        await logStoreActivity(
+          storeId,
+          req.user.userId,
+          'UPDATE_QUANTITY',
+          `Изменено количество товара "${product.name}" (SKU: ${product.sku}) на складе. Старое количество: ${oldQuantity}, новое количество: ${quantity}`,
+          {
+            productId: product.id,
+            productName: product.name,
+            sku: product.sku,
+            brandName: product.brandName,
+            oldQuantity: oldQuantity,
+            newQuantity: quantity,
+            offerId: updatedOffer.id
+          }
+        );
+      }
+    }
 
     res.json({
       message: 'Количество товара успешно обновлено',
@@ -643,6 +775,20 @@ async function processInvoice(req, res) {
       });
     }
 
+    // Сжимаем изображение перед сохранением
+    const originalSize = file.buffer.length;
+    let compressedImage;
+    try {
+      compressedImage = await compressImage(file.buffer, file.mimetype);
+    } catch (error) {
+      console.error('Ошибка при сжатии изображения:', error);
+      // Продолжаем с оригинальным изображением в случае ошибки
+      compressedImage = {
+        buffer: file.buffer,
+        mimeType: file.mimetype
+      };
+    }
+
     // Анализируем каждый товар из накладной (без добавления на склад)
     const results = {
       found: [],      // Товары, найденные в базе
@@ -761,8 +907,64 @@ async function processInvoice(req, res) {
       }
     }
 
+    // Сохраняем накладную на S3
+    let imageUrl, imageKey;
+    try {
+      const uploadResult = await uploadImage({
+        buffer: compressedImage.buffer,
+        contentType: compressedImage.mimeType,
+        folder: 'invoices'
+      });
+      imageUrl = uploadResult.url;
+      imageKey = uploadResult.key;
+    } catch (error) {
+      console.error('Ошибка при загрузке накладной на S3:', error);
+      return res.status(500).json({
+        error: 'Ошибка при сохранении накладной',
+        details: error.message
+      });
+    }
+
+    // Сохраняем накладную в БД
+    const invoiceHistoryId = generateId();
+    try {
+      await InvoiceHistory.create({
+        id: invoiceHistoryId,
+        storeId,
+        storeOwnerId: req.user.userId,
+        imageUrl,
+        imageKey,
+        originalSize,
+        compressedSize: compressedImage.buffer.length,
+        mimeType: compressedImage.mimeType,
+        invoiceData: {
+          items: invoiceData.items,
+          invoiceNumber: invoiceData.invoiceNumber,
+          date: invoiceData.date,
+          supplier: invoiceData.supplier
+        },
+        analysisResults: {
+          found: results.found,
+          notFound: results.notFound,
+          errors: results.errors,
+          summary: {
+            total: invoiceData.items.length,
+            found: results.found.length,
+            notFound: results.notFound.length,
+            errors: results.errors.length
+          }
+        },
+        status: 'PROCESSED'
+      });
+    } catch (error) {
+      console.error('Ошибка при сохранении накладной в БД:', error);
+      // Не возвращаем ошибку, так как анализ уже выполнен
+      // Просто логируем ошибку
+    }
+
     res.json({
       message: 'Накладная проанализирована. Проверьте найденные товары и подтвердите добавление на склад.',
+      invoiceId: invoiceHistoryId,
       invoiceInfo: {
         invoiceNumber: invoiceData.invoiceNumber,
         date: invoiceData.date,
@@ -776,7 +978,8 @@ async function processInvoice(req, res) {
       },
       found: results.found,
       notFound: results.notFound,
-      errors: results.errors
+      errors: results.errors,
+      imageUrl // Добавляем URL изображения для предпросмотра
     });
   } catch (error) {
     console.error('Ошибка при обработке накладной:', error);
@@ -895,6 +1098,29 @@ async function confirmInvoiceItems(req, res) {
       }
     }
 
+    // Логируем действие подтверждения товаров из накладной
+    if (results.processed.length > 0) {
+      const productsList = results.processed.map(p => `${p.productName} (${p.quantity} шт.)`).join(', ');
+      await logStoreActivity(
+        storeId,
+        req.user.userId,
+        'CONFIRM_INVOICE',
+        `Подтверждены товары из накладной. Добавлено товаров: ${results.processed.length}. ${productsList}`,
+        {
+          totalItems: items.length,
+          processedCount: results.processed.length,
+          errorsCount: results.errors.length,
+          products: results.processed.map(p => ({
+            productId: p.productId,
+            productName: p.productName,
+            sku: p.sku,
+            quantity: p.quantity,
+            totalQuantity: p.totalQuantity
+          }))
+        }
+      );
+    }
+
     res.json({
       message: 'Товары добавлены на склад',
       summary: {
@@ -911,6 +1137,149 @@ async function confirmInvoiceItems(req, res) {
   }
 }
 
+// Получение истории накладных для владельца магазина
+async function getInvoiceHistory(req, res) {
+  try {
+    const storeId = await getStoreIdForStoreOwner(req.user);
+    if (!storeId) {
+      return res.status(404).json({ error: 'Магазин не найден для текущего пользователя' });
+    }
+
+    // Получаем параметры пагинации
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const skip = (page - 1) * limit;
+
+    // Получаем накладные для этого магазина
+    const invoices = await InvoiceHistory.find({ storeId })
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean();
+
+    // Получаем общее количество накладных
+    const total = await InvoiceHistory.countDocuments({ storeId });
+
+    // Форматируем ответ
+    const formattedInvoices = invoices.map(invoice => ({
+      id: invoice.id,
+      imageUrl: invoice.imageUrl,
+      invoiceInfo: invoice.invoiceData,
+      summary: invoice.analysisResults.summary,
+      status: invoice.status,
+      createdAt: invoice.createdAt,
+      originalSize: invoice.originalSize,
+      compressedSize: invoice.compressedSize
+    }));
+
+    res.json({
+      invoices: formattedInvoices,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit)
+      }
+    });
+  } catch (error) {
+    console.error('Ошибка при получении истории накладных:', error);
+    res.status(500).json({ error: 'Ошибка при получении истории накладных' });
+  }
+}
+
+// Получение детальной информации о конкретной накладной
+async function getInvoiceDetails(req, res) {
+  try {
+    const storeId = await getStoreIdForStoreOwner(req.user);
+    if (!storeId) {
+      return res.status(404).json({ error: 'Магазин не найден для текущего пользователя' });
+    }
+
+    const { invoiceId } = req.params;
+    if (!invoiceId) {
+      return res.status(400).json({ error: 'ID накладной не указан' });
+    }
+
+    const invoice = await InvoiceHistory.findOne({
+      id: invoiceId,
+      storeId
+    }).lean();
+
+    if (!invoice) {
+      return res.status(404).json({ error: 'Накладная не найдена' });
+    }
+
+    res.json({
+      id: invoice.id,
+      imageUrl: invoice.imageUrl,
+      invoiceInfo: invoice.invoiceData,
+      analysisResults: invoice.analysisResults,
+      status: invoice.status,
+      createdAt: invoice.createdAt,
+      originalSize: invoice.originalSize,
+      compressedSize: invoice.compressedSize,
+      mimeType: invoice.mimeType
+    });
+  } catch (error) {
+    console.error('Ошибка при получении деталей накладной:', error);
+    res.status(500).json({ error: 'Ошибка при получении деталей накладной' });
+  }
+}
+
+// Получение истории действий владельца магазина
+async function getStoreActivityHistory(req, res) {
+  try {
+    const storeId = await getStoreIdForStoreOwner(req.user);
+    if (!storeId) {
+      return res.status(404).json({ error: 'Магазин не найден для текущего пользователя' });
+    }
+
+    // Получаем параметры пагинации
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 50;
+    const skip = (page - 1) * limit;
+
+    // Получаем историю действий для этого магазина
+    const activityHistory = await StoreActivityHistory.findOne({ storeId }).lean();
+
+    if (!activityHistory || !activityHistory.actions || activityHistory.actions.length === 0) {
+      return res.json({
+        actions: [],
+        pagination: {
+          page,
+          limit,
+          total: 0,
+          totalPages: 0
+        }
+      });
+    }
+
+    // Сортируем действия по времени (новые сначала)
+    const sortedActions = [...activityHistory.actions].sort((a, b) => {
+      const timeA = new Date(a.timestamp || a.createdAt || 0).getTime();
+      const timeB = new Date(b.timestamp || b.createdAt || 0).getTime();
+      return timeB - timeA;
+    });
+
+    // Применяем пагинацию
+    const paginatedActions = sortedActions.slice(skip, skip + limit);
+    const total = sortedActions.length;
+
+    res.json({
+      actions: paginatedActions,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit)
+      }
+    });
+  } catch (error) {
+    console.error('Ошибка при получении истории действий:', error);
+    res.status(500).json({ error: 'Ошибка при получении истории действий' });
+  }
+}
+
 module.exports = {
   // Функции для владельца магазина
   getWarehouseInventory,
@@ -920,6 +1289,9 @@ module.exports = {
   getWarehouseAnalytics,
   processInvoice,
   confirmInvoiceItems,
+  getInvoiceHistory,
+  getInvoiceDetails,
+  getStoreActivityHistory,
   // Функции для продавца (QR-сканер)
   findProductByBarcode,
   quickAddStockByBarcode
