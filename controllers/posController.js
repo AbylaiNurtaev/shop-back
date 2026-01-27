@@ -4,6 +4,77 @@ const mongoose = require('mongoose');
 
 const { Sale, Offer, Product, Store, User } = models;
 
+// -----------------------------------------------------------------------------
+// АККАУНТ ПРОДАВЦА МАГАЗИНА
+// -----------------------------------------------------------------------------
+
+// Получение настроек аккаунта продавца магазина (кассира)
+async function getStoreSellerAccount(req, res) {
+  try {
+    if (!req.user || !req.user.userId) {
+      return res.status(401).json({ error: 'Требуется авторизация' });
+    }
+
+    const user = await User.findOne({ id: req.user.userId, role: 'STORE_SELLER' }).lean();
+    if (!user) {
+      return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+
+    let store = null;
+    if (user.storeId) {
+      store = await Store.findOne({ id: user.storeId }).lean();
+    }
+
+    return res.json({
+      id: user.id,
+      role: user.role,
+      name: user.firstName || null,
+      email: user.email,
+      storeId: user.storeId || null,
+      storeName: store ? store.name : null
+    });
+  } catch (error) {
+    console.error('Ошибка при получении аккаунта продавца магазина:', error);
+    return res.status(500).json({ error: 'Ошибка при получении аккаунта продавца магазина' });
+  }
+}
+
+// Обновление настроек аккаунта продавца магазина (сейчас только имя)
+async function updateStoreSellerAccount(req, res) {
+  try {
+    if (!req.user || !req.user.userId) {
+      return res.status(401).json({ error: 'Требуется авторизация' });
+    }
+
+    const { name } = req.body;
+
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ error: 'Поле name обязательно' });
+    }
+
+    const updatedUser = await User.findOneAndUpdate(
+      { id: req.user.userId, role: 'STORE_SELLER' },
+      { firstName: name.trim(), updatedAt: new Date() },
+      { new: true }
+    ).lean();
+
+    if (!updatedUser) {
+      return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+
+    return res.json({
+      id: updatedUser.id,
+      role: updatedUser.role,
+      name: updatedUser.firstName || null,
+      email: updatedUser.email,
+      storeId: updatedUser.storeId || null
+    });
+  } catch (error) {
+    console.error('Ошибка при обновлении аккаунта продавца магазина:', error);
+    return res.status(500).json({ error: 'Ошибка при обновлении аккаунта продавца магазина' });
+  }
+}
+
 // Получение storeId для продавца магазина
 async function getStoreIdForStoreSeller(user) {
   if (!user || !user.userId) {
@@ -576,6 +647,8 @@ async function getSalesStatistics(req, res) {
 }
 
 module.exports = {
+  getStoreSellerAccount,
+  updateStoreSellerAccount,
   createSale,
   getCurrentSale,
   addItemToSale,
