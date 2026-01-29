@@ -2,6 +2,7 @@ const https = require('https');
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = 'gemini-2.0-flash-exp';
+const GEMINI_MODEL_FLASH = 'gemini-2.5-flash';
 const GEMINI_API_VERSION = 'v1beta';
 
 // ============================================================================
@@ -68,15 +69,38 @@ function requestGemini(prompt, config = {}) {
 function extractJson(text) {
   if (!text) return null;
 
-  let cleaned = text.replace(/```json\s*/g, '').replace(/```\s*/g, '');
-  const match = cleaned.match(/\{[\s\S]*\}/);
-  if (!match) return null;
-
-  try {
-    return JSON.parse(match[0]);
-  } catch {
-    return null;
+  // 1) Сначала пробуем распарсить весь ответ целиком (вдруг это уже чистый JSON)
+  const direct = text.trim();
+  if (direct) {
+    try {
+      const parsed = JSON.parse(direct);
+      if (parsed && typeof parsed === 'object') {
+        return parsed;
+      }
+    } catch (e) {
+      // игнорируем и пробуем вытащить JSON из текста ниже
+    }
   }
+
+  // 2) Убираем ```json/``` и пытаемся вытащить первый объект {...}
+  let cleaned = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '');
+
+  // Ищем ВСЕ возможные JSON-объекты и пробуем распарсить каждый
+  const matches = cleaned.match(/\{[\s\S]*?\}/g);
+  if (!matches) return null;
+
+  for (const candidate of matches) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === 'object') {
+        return parsed;
+      }
+    } catch {
+      // просто пробуем следующий кандидат
+    }
+  }
+
+  return null;
 }
 
 // ============================================================================
@@ -392,7 +416,7 @@ async function analyzeProductImage({ buffer, mimeType }) {
 
   const options = {
     hostname: 'generativelanguage.googleapis.com',
-    path: `/${GEMINI_API_VERSION}/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+    path: `/${GEMINI_API_VERSION}/models/${GEMINI_MODEL_FLASH}:generateContent?key=${GEMINI_API_KEY}`,
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -522,38 +546,35 @@ async function analyzeInvoice({ buffer, mimeType }) {
     throw new Error('Нет данных для анализа накладной');
   }
 
-  const prompt = `Ты эксперт по анализу накладных и товарных документов. Проанализируй это изображение накладной и извлеки список всех товаров с их количеством.
+  const prompt = `Ты — специализированный OCR-агент. Твоя задача: извлечь данные из накладной и вернуть СТРОГО валидный JSON-объект.
 
-ВАЖНО:
-- Прочитай весь текст на изображении
-- Найди таблицу или список товаров
-- Для каждого товара извлеки: название, количество (штук), артикул/SKU (если есть), бренд (если видно)
-- Количество может быть указано в разных единицах (шт, уп, коробка и т.д.) - конвертируй в штуки если возможно
-- Если количество указано как "уп" (упаковка), "коробка" и т.д., попробуй определить количество штук в упаковке или оставь как есть
+ПРАВИЛА ОБРАБОТКИ:
+1. Найди таблицу товаров. Для каждого товара извлеки: полное название, количество, артикул (SKU), бренд.
+2. Конвертация: если указано "10 уп по 6 шт", запиши "quantity": 60 и "unit": "шт". Если количество штук в упаковке неизвестно, оставь количество как есть и укажи "unit": "уп" или "коробка".
+3. Поля "invoiceNumber", "date" и "supplier" обязательны в JSON-объекте. Если данные не найдены, запиши null.
 
-ФОРМАТ ОТВЕТА (ТОЛЬКО JSON):
+СТРУКТУРА JSON:
 {
   "items": [
     {
-      "productName": "полное название товара",
-      "quantity": число (количество штук),
-      "sku": "артикул или null",
-      "brand": "название бренда или null",
-      "unit": "шт/уп/коробка и т.д.",
-      "notes": "дополнительные заметки или null"
+      "productName": string,
+      "quantity": number,
+      "sku": string|null,
+      "brand": string|null,
+      "unit": string,
+      "notes": string|null
     }
   ],
-  "invoiceNumber": "номер накладной или null",
-  "date": "дата накладной или null",
-  "supplier": "поставщик или null"
+  "invoiceNumber": string|null,
+  "date": string|null,
+  "supplier": string|null
 }
 
-ПРИМЕРЫ:
-- "Coca-Cola 0.5л x 24 шт" → {"productName": "Coca-Cola 0.5л", "quantity": 24, "unit": "шт"}
-- "Пепси 1л, 10 уп по 6 шт" → {"productName": "Пепси 1л", "quantity": 60, "unit": "шт", "notes": "10 уп по 6 шт"}
-- "Fanta 2л - 5 коробок" → {"productName": "Fanta 2л", "quantity": 5, "unit": "коробка"}
-
-ВЕРНИ ТОЛЬКО JSON!`;
+КРИТИЧЕСКИЕ ТРЕБОВАНИЯ:
+- ЗАПРЕЩЕНО добавлять любой текст до или после JSON.
+- ЗАПРЕЩЕНО использовать разметку \`\`\`json или любые другие пояснения.
+- Ответ ДОЛЖЕН начинаться с символа { и заканчиваться символом }.
+- Весь текст внутри JSON (названия товаров, бренды и т.д.) должен быть на языке оригинала из документа.`;
 
   const payload = JSON.stringify({
     contents: [{
@@ -569,13 +590,14 @@ async function analyzeInvoice({ buffer, mimeType }) {
     }],
     generationConfig: {
       temperature: 0,
-      maxOutputTokens: 2000
+      maxOutputTokens: 2000,
+      responseMimeType: 'application/json'
     }
   });
 
   const options = {
     hostname: 'generativelanguage.googleapis.com',
-    path: `/${GEMINI_API_VERSION}/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+    path: `/${GEMINI_API_VERSION}/models/${GEMINI_MODEL_FLASH}:generateContent?key=${GEMINI_API_KEY}`,
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -786,7 +808,7 @@ async function validateProductImage({ buffer, mimeType, productInfo }) {
 
   const options = {
     hostname: 'generativelanguage.googleapis.com',
-    path: `/${GEMINI_API_VERSION}/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+    path: `/${GEMINI_API_VERSION}/models/${GEMINI_MODEL_FLASH}:generateContent?key=${GEMINI_API_KEY}`,
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
