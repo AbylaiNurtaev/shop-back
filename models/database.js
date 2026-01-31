@@ -183,6 +183,7 @@ const productSchema = new mongoose.Schema(
     images: { type: [String], default: [] },
     sku: { type: String, required: true },
     packageInfo: { type: String, default: null },
+    unitsPerPack: { type: Number, default: null },
     // Себестоимость товара от бренда (цена закупки)
     costPrice: { type: Number, default: null },
     costCurrency: { type: String, default: 'RUB' },

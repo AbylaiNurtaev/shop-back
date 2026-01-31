@@ -230,6 +230,22 @@ async function updateOffer(req, res) {
       price = numPrice;
     }
 
+    // Валидация quantity
+    if (quantity !== undefined && quantity !== null) {
+      const numQuantity = typeof quantity === 'string' ? parseInt(quantity, 10) : quantity;
+      if (isNaN(numQuantity) || numQuantity < 0) {
+        return res.status(400).json({ error: 'Количество должно быть неотрицательным числом' });
+      }
+      quantity = numQuantity;
+    }
+
+    // Валидация isAvailable
+    if (isAvailable !== undefined && isAvailable !== null) {
+      if (typeof isAvailable !== 'boolean') {
+        return res.status(400).json({ error: 'isAvailable должен быть булевым значением (true/false)' });
+      }
+    }
+
     const oldPrice = offer.price;
     const oldQuantity = offer.quantity || 0;
     const oldIsAvailable = offer.isAvailable;

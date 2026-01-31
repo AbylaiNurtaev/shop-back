@@ -324,6 +324,7 @@ async function updateProduct(req, res) {
       sku,
       brandId,
       packageInfo,
+      unitsPerPack,
       // Себестоимость от бренда
       costPrice,
       costCurrency,
@@ -346,6 +347,17 @@ async function updateProduct(req, res) {
     if (images !== undefined) update.images = images;
     if (sku !== undefined) update.sku = sku;
     if (packageInfo !== undefined) update.packageInfo = packageInfo !== null ? String(packageInfo) : null;
+    if (unitsPerPack !== undefined) {
+      if (unitsPerPack === null) {
+        update.unitsPerPack = null;
+      } else {
+        const numUnitsPerPack = typeof unitsPerPack === 'string' ? parseInt(unitsPerPack, 10) : unitsPerPack;
+        if (isNaN(numUnitsPerPack) || numUnitsPerPack < 1) {
+          return res.status(400).json({ error: 'unitsPerPack должен быть положительным числом' });
+        }
+        update.unitsPerPack = numUnitsPerPack;
+      }
+    }
 
     // Себестоимость от бренда
     if (costPrice !== undefined) update.costPrice = costPrice;
