@@ -12,7 +12,7 @@ async function createBrand(req, res) {
   let email = null;
 
   try {
-    const { name, country, categoryId, logoUrl, email: emailParam, password, contactName } = req.body;
+    const { name, country, city, categoryId, logoUrl, email: emailParam, password, contactName, phone } = req.body;
     email = emailParam;
 
     if (!name || !country || !categoryId || !email || !password) {
@@ -101,10 +101,12 @@ async function createBrand(req, res) {
         id: brandId,
         name,
         country,
+        city: city || null,
         categoryId,
         logoUrl: logoUrl || null,
         email,
-        contactName: contactName || null
+        contactName: contactName || null,
+        phone: phone || null
       });
 
       res.status(201).json(brand.toObject());
@@ -171,7 +173,7 @@ async function getBrands(req, res) {
 async function updateBrand(req, res) {
   try {
     const { brandId } = req.params;
-    const { name, country, categoryId, logoUrl } = req.body;
+    const { name, country, city, categoryId, logoUrl, phone } = req.body;
 
     const brand = await Brand.findOne({ id: brandId }).lean();
     if (!brand) {
@@ -189,8 +191,10 @@ async function updateBrand(req, res) {
     const update = { updatedAt: new Date() };
     if (name !== undefined) update.name = name;
     if (country !== undefined) update.country = country;
+    if (city !== undefined) update.city = city === null || city === '' ? null : city;
     if (categoryId !== undefined) update.categoryId = categoryId;
     if (logoUrl !== undefined) update.logoUrl = logoUrl;
+    if (phone !== undefined) update.phone = phone === null || phone === '' ? null : phone;
 
     const updatedBrand = await Brand.findOneAndUpdate({ id: brandId }, update, { new: true }).lean();
     if (!updatedBrand) {
@@ -368,9 +372,11 @@ async function getMyBrandSettings(req, res) {
       name: brand.name,
       email: brand.email,
       country: brand.country,
+      city: brand.city,
       categoryId: brand.categoryId,
       logoUrl: brand.logoUrl,
       contactName: brand.contactName,
+      phone: brand.phone,
       isAccepted: brand.isAccepted,
       createdAt: brand.createdAt,
       updatedAt: brand.updatedAt
@@ -404,9 +410,11 @@ async function updateMyBrandSettings(req, res) {
     const {
       name,
       country,
+      city,
       categoryId,
       logoUrl,
-      contactName
+      contactName,
+      phone
     } = req.body;
 
     // Получаем старые данные для логирования
@@ -432,6 +440,13 @@ async function updateMyBrandSettings(req, res) {
       update.country = country.trim();
       if (oldBrand.country !== country.trim()) {
         changes.push(`страна: "${oldBrand.country}" → "${country.trim()}"`);
+      }
+    }
+
+    if (city !== undefined) {
+      update.city = city === null || city === '' ? null : city.trim();
+      if (oldBrand.city !== update.city) {
+        changes.push(`город: "${oldBrand.city || 'не указан'}" → "${update.city || 'не указан'}"`);
       }
     }
 
@@ -461,6 +476,13 @@ async function updateMyBrandSettings(req, res) {
       update.contactName = contactName === null || contactName === '' ? null : contactName.trim();
       if (oldBrand.contactName !== update.contactName) {
         changes.push(`контактное лицо: "${oldBrand.contactName || 'не указано'}" → "${update.contactName || 'не указано'}"`);
+      }
+    }
+
+    if (phone !== undefined) {
+      update.phone = phone === null || phone === '' ? null : phone.trim();
+      if (oldBrand.phone !== update.phone) {
+        changes.push(`телефон: "${oldBrand.phone || 'не указан'}" → "${update.phone || 'не указан'}"`);
       }
     }
 

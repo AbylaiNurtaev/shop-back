@@ -149,11 +149,13 @@ const brandSchema = new mongoose.Schema(
     id: { type: String, required: true, unique: true },
     name: { type: String, required: true },
     country: { type: String, required: true },
+    city: { type: String, default: null },
     categoryId: { type: String, required: true },
     logoUrl: { type: String, default: null },
     // Данные аккаунта бренда
     email: { type: String, required: true },
     contactName: { type: String, default: null },
+    phone: { type: String, default: null },
     // Флаг одобрения бренда администратором
     isAccepted: { type: Boolean, default: false },
     // Причина отклонения (если заявка отклонена)

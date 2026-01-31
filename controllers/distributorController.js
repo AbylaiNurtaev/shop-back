@@ -1115,13 +1115,25 @@ async function getMySalesRepresentativeStores(req, res) {
       ? await Store.find({ id: { $in: storeIds } }).lean()
       : [];
 
+    // Получаем distributorId из первой связи (все связи должны иметь одинаковый distributorId)
+    const distributorId = links.length > 0 ? links[0].distributorId : null;
+
+    // Получаем товары, закрепленные за торговым представителем
+    const productLinks = distributorId && linkQueryIds.length
+      ? await SalesRepresentativeProduct.find({
+        salesRepresentativeId: { $in: linkQueryIds },
+        distributorId
+      }).lean()
+      : [];
+    const assignedProductIds = new Set(productLinks.map(link => link.productId));
+
     // Получаем информацию о владельцах магазинов (пользователи с ролью 'STORE')
     const storeOwners = storeIds.length
       ? await User.find({
-          storeId: { $in: storeIds },
-          role: 'STORE',
-          isActive: true
-        }).lean()
+        storeId: { $in: storeIds },
+        role: 'STORE',
+        isActive: true
+      }).lean()
       : [];
 
     // Создаем карту владельцев по storeId
@@ -1130,7 +1142,7 @@ async function getMySalesRepresentativeStores(req, res) {
       if (owner.storeId && !ownerMap.has(owner.storeId)) {
         // Формируем полное имя владельца
         const ownerName = [owner.firstName, owner.lastName].filter(Boolean).join(' ').trim() || owner.firstName || null;
-        
+
         ownerMap.set(owner.storeId, {
           name: ownerName,
           firstName: owner.firstName || null,
@@ -1140,12 +1152,59 @@ async function getMySalesRepresentativeStores(req, res) {
       }
     });
 
-    // Добавляем информацию о владельце к каждому магазину
+    // Получаем товары (офферы) только для закрепленных товаров в магазинах торгового представителя
+    const offers = storeIds.length && assignedProductIds.size
+      ? await Offer.find({
+        storeId: { $in: storeIds },
+        productId: { $in: Array.from(assignedProductIds) }
+      }).lean()
+      : [];
+
+    // Получаем информацию о продуктах
+    const productIds = Array.from(new Set(offers.map(offer => offer.productId)));
+    const products = productIds.length
+      ? await Product.find({ id: { $in: productIds } }).lean()
+      : [];
+    const productById = new Map(products.map(product => [product.id, product]));
+
+    // Группируем товары по магазинам (только закрепленные товары)
+    const productsByStore = new Map();
+    offers.forEach(offer => {
+      // Проверяем, что товар закреплен за торговым представителем
+      if (!assignedProductIds.has(offer.productId)) {
+        return;
+      }
+      if (!productsByStore.has(offer.storeId)) {
+        productsByStore.set(offer.storeId, []);
+      }
+      const product = productById.get(offer.productId);
+      if (product) {
+        productsByStore.get(offer.storeId).push({
+          id: product.id,
+          name: product.name,
+          sku: product.sku,
+          brandName: product.brandName,
+          packageInfo: product.packageInfo,
+          images: product.images || [],
+          // Информация из оффера
+          offerId: offer.id,
+          price: offer.price,
+          currency: offer.currency,
+          quantity: offer.quantity || 0,
+          isAvailable: offer.isAvailable
+        });
+      }
+    });
+
+    // Добавляем информацию о владельце и товарах к каждому магазину
     const storesWithOwners = stores.map(store => {
       const owner = ownerMap.get(store.id) || null;
+      const storeProducts = productsByStore.get(store.id) || [];
       return {
         ...store,
-        owner: owner
+        owner: owner,
+        products: storeProducts,
+        productsCount: storeProducts.length
       };
     });
 
