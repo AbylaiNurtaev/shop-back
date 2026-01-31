@@ -1,6 +1,7 @@
 const { generateId } = require('../utils/uuid');
 const { models } = require('../models/database');
 const { logDistributorActivity } = require('../utils/distributorActivityLogger');
+const { createNotificationForDistributorUsers, createNotificationForBrandUsers } = require('./notificationController');
 
 const { Distributor, User, Store, Brand, BrandDistributorRequest, SalesRepresentative, SalesRepresentativeStore, SalesRepresentativeProduct, Product, Offer, Sale, Plan, DistributorProductPrice, DistributorActivityHistory } = models;
 
@@ -431,6 +432,25 @@ async function sendConnectionRequest(req, res) {
       // Не прерываем процесс, если email не отправился
     }
 
+    // Создаем уведомление для всех пользователей дистрибьютора
+    try {
+      await createNotificationForDistributorUsers({
+        distributorId,
+        type: 'BRAND_CONNECTION_REQUEST',
+        title: 'Новый запрос на подключение',
+        message: `Бренд "${brand.name}" отправил запрос на подключение к вашей дистрибьюторской сети`,
+        metadata: {
+          brandId,
+          distributorId,
+          requestId: request.id,
+          brandName: brand.name
+        }
+      });
+    } catch (notificationError) {
+      console.error('Ошибка при создании уведомления для дистрибьютора:', notificationError);
+      // Не прерываем процесс, если уведомление не создалось
+    }
+
     res.status(201).json({
       message: 'Запрос на подключение отправлен',
       request: request.toObject()
@@ -501,6 +521,10 @@ async function acceptConnectionRequest(req, res) {
       return res.status(400).json({ error: 'Запрос уже обработан' });
     }
 
+    // Получаем информацию о бренде и дистрибьюторе перед обновлением
+    const brand = await Brand.findOne({ id: request.brandId }).lean();
+    const distributor = await Distributor.findOne({ id: distributorId }).lean();
+
     // Обновляем статус запроса
     await BrandDistributorRequest.updateOne(
       { id: requestId },
@@ -515,10 +539,28 @@ async function acceptConnectionRequest(req, res) {
       { brandId: request.brandId, requestId }
     );
 
-    // Отправляем email бренду
-    const brand = await Brand.findOne({ id: request.brandId }).lean();
-    const distributor = await Distributor.findOne({ id: distributorId }).lean();
+    // Создаем уведомление для всех пользователей дистрибьютора о принятом запросе
+    if (brand && distributor) {
+      try {
+        await createNotificationForDistributorUsers({
+          distributorId,
+          type: 'REQUEST_ACCEPTED',
+          title: 'Запрос на подключение принят',
+          message: `Вы приняли запрос на подключение от бренда "${brand.name}"`,
+          metadata: {
+            brandId: request.brandId,
+            brandName: brand.name,
+            distributorId,
+            requestId
+          }
+        });
+      } catch (notificationError) {
+        console.error('Ошибка при создании уведомления для дистрибьютора о принятом запросе:', notificationError);
+        // Не прерываем процесс, если уведомление не создалось
+      }
+    }
 
+    // Отправляем email бренду
     if (brand && distributor) {
       const { sendEmail } = require('../utils/email');
       try {
@@ -529,6 +571,25 @@ async function acceptConnectionRequest(req, res) {
         });
       } catch (emailError) {
         console.error('Ошибка при отправке email бренду:', emailError);
+      }
+
+      // Создаем уведомление для всех пользователей бренда
+      try {
+        await createNotificationForBrandUsers({
+          brandId: request.brandId,
+          type: 'DISTRIBUTOR_ACCEPTED_REQUEST',
+          title: 'Запрос на подключение принят',
+          message: `Дистрибьютор "${distributor.name}" принял ваш запрос на подключение`,
+          metadata: {
+            brandId: request.brandId,
+            distributorId,
+            requestId,
+            distributorName: distributor.name
+          }
+        });
+      } catch (notificationError) {
+        console.error('Ошибка при создании уведомления для бренда:', notificationError);
+        // Не прерываем процесс, если уведомление не создалось
       }
     }
 
@@ -710,6 +771,28 @@ async function addSalesRepresentative(req, res) {
       `Добавлен торговый представитель "${salesRepresentativeUser.email || salesRepresentativeId}"`,
       { salesRepresentativeId, email: salesRepresentativeUser.email }
     );
+
+    // Создаем уведомление для всех пользователей дистрибьютора
+    try {
+      const salesRepName = salesRepresentativeUser.firstName && salesRepresentativeUser.lastName
+        ? `${salesRepresentativeUser.firstName} ${salesRepresentativeUser.lastName}`.trim()
+        : salesRepresentativeUser.email || salesRepresentativeId;
+
+      await createNotificationForDistributorUsers({
+        distributorId,
+        type: 'NEW_SALES_REPRESENTATIVE',
+        title: 'Добавлен новый торговый представитель',
+        message: `В вашу дистрибьюторскую сеть добавлен новый торговый представитель: ${salesRepName}`,
+        metadata: {
+          distributorId,
+          salesRepresentativeId,
+          salesRepresentativeEmail: salesRepresentativeUser.email
+        }
+      });
+    } catch (notificationError) {
+      console.error('Ошибка при создании уведомления о добавлении ТП:', notificationError);
+      // Не прерываем процесс, если уведомление не создалось
+    }
 
     res.status(200).json({
       message: 'Торговый представитель успешно добавлен',

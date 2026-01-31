@@ -26,7 +26,7 @@ function requestGemini(prompt, config = {}) {
 
   const options = {
     hostname: 'generativelanguage.googleapis.com',
-    path: `/${GEMINI_API_VERSION}/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+    path: `/${GEMINI_API_VERSION}/models/${GEMINI_MODEL_FLASH}:generateContent?key=${GEMINI_API_KEY}`,
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -82,14 +82,37 @@ function extractJson(text) {
     }
   }
 
-  // 2) Убираем ```json/``` и пытаемся вытащить первый объект {...}
-  let cleaned = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '');
+  // 2) Убираем ```json/``` и markdown форматирование
+  let cleaned = text
+    .replace(/```json\s*/gi, '')
+    .replace(/```\s*/g, '')
+    .replace(/^[^{]*/, '') // Убираем текст до первой {
+    .replace(/[^}]*$/, ''); // Убираем текст после последней }
 
-  // Ищем ВСЕ возможные JSON-объекты и пробуем распарсить каждый
+  // 3) Ищем самый большой JSON-объект (от первой { до последней })
+  const firstBrace = cleaned.indexOf('{');
+  const lastBrace = cleaned.lastIndexOf('}');
+
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    const jsonCandidate = cleaned.substring(firstBrace, lastBrace + 1);
+    try {
+      const parsed = JSON.parse(jsonCandidate);
+      if (parsed && typeof parsed === 'object') {
+        return parsed;
+      }
+    } catch (e) {
+      // Пробуем найти все JSON-объекты
+    }
+  }
+
+  // 4) Ищем ВСЕ возможные JSON-объекты и пробуем распарсить каждый (от большего к меньшему)
   const matches = cleaned.match(/\{[\s\S]*?\}/g);
   if (!matches) return null;
 
-  for (const candidate of matches) {
+  // Сортируем по длине (от большего к меньшему), чтобы попробовать сначала большие объекты
+  const sortedMatches = matches.sort((a, b) => b.length - a.length);
+
+  for (const candidate of sortedMatches) {
     try {
       const parsed = JSON.parse(candidate);
       if (parsed && typeof parsed === 'object') {
@@ -733,7 +756,8 @@ async function getDemandForecastFromAI({ prompt, context = '' }) {
     throw new Error('Промпт не может быть пустым');
   }
 
-  const fullPrompt = `${context ? `КОНТЕКСТ:\n${context}\n\n` : ''}${prompt.trim()}`;
+  // Добавляем явное указание вернуть только JSON в конце промпта
+  const fullPrompt = `${context ? `КОНТЕКСТ:\n${context}\n\n` : ''}${prompt.trim()}\n\nВАЖНО: Верни ТОЛЬКО валидный JSON без дополнительных комментариев, объяснений или форматирования. Начни ответ сразу с символа { и закончи символом }.`;
 
   try {
     const response = await requestGemini(fullPrompt, {
@@ -741,7 +765,15 @@ async function getDemandForecastFromAI({ prompt, context = '' }) {
       temperature: 0.3, // Низкая температура для более точных прогнозов
       timeout: 60000 // 60 секунд для сложных расчетов
     });
-    return response.trim();
+
+    const trimmedResponse = response.trim();
+
+    // Логируем ответ для отладки (первые 500 символов)
+    if (trimmedResponse.length > 0) {
+      console.log('Ответ AI (первые 500 символов):', trimmedResponse.substring(0, 500));
+    }
+
+    return trimmedResponse;
   } catch (error) {
     console.error('Ошибка при получении прогноза от AI:', error);
     throw error;

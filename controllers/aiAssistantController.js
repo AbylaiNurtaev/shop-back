@@ -49,8 +49,8 @@ async function handleAIAssistantMessage(req, res) {
     // Проверяем, что пользователь является дистрибьютором
     const user = await User.findOne({ id: userId }).lean();
     if (!user || !user.distributorId) {
-      return res.status(403).json({ 
-        error: 'Доступ запрещен. Только дистрибьюторы могут использовать ИИ-помощника' 
+      return res.status(403).json({
+        error: 'Доступ запрещен. Только дистрибьюторы могут использовать ИИ-помощника'
       });
     }
 
@@ -62,9 +62,9 @@ async function handleAIAssistantMessage(req, res) {
 
     // Получаем информацию о дистрибьюторе для контекста
     const distributor = await Distributor.findOne({ id: user.distributorId }).lean();
-    
+
     // Формируем контекст (можно расширить в будущем)
-    const context = distributor 
+    const context = distributor
       ? `Дистрибьютор: ${distributor.name || 'Не указано'}\nID: ${distributor.id}`
       : '';
 
@@ -81,9 +81,9 @@ async function handleAIAssistantMessage(req, res) {
     });
   } catch (error) {
     console.error('Ошибка при обработке сообщения ИИ-помощника:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Ошибка при обработке сообщения',
-      message: error.message 
+      message: error.message
     });
   }
 }
@@ -101,8 +101,8 @@ async function getSalesRepsCount(req, res) {
 
     const user = await User.findOne({ id: userId }).lean();
     if (!user || !user.distributorId) {
-      return res.status(403).json({ 
-        error: 'Доступ запрещен. Только дистрибьюторы могут использовать ИИ-помощника' 
+      return res.status(403).json({
+        error: 'Доступ запрещен. Только дистрибьюторы могут использовать ИИ-помощника'
       });
     }
 
@@ -115,7 +115,7 @@ async function getSalesRepsCount(req, res) {
 
     const data = { count };
     const question = 'Сколько торговых представителей у меня сейчас?';
-    
+
     const response = await getDistributorAIAssistantResponse({
       message: `${question}\n\nДанные: ${JSON.stringify(data, null, 2)}`,
       context: `Дистрибьютор: ${user.distributorId}`
@@ -130,9 +130,9 @@ async function getSalesRepsCount(req, res) {
     });
   } catch (error) {
     console.error('Ошибка при получении количества торговых представителей:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Ошибка при обработке запроса',
-      message: error.message 
+      message: error.message
     });
   }
 }
@@ -150,8 +150,8 @@ async function getStoresWithoutSalesReps(req, res) {
 
     const user = await User.findOne({ id: userId }).lean();
     if (!user || !user.distributorId) {
-      return res.status(403).json({ 
-        error: 'Доступ запрещен. Только дистрибьюторы могут использовать ИИ-помощника' 
+      return res.status(403).json({
+        error: 'Доступ запрещен. Только дистрибьюторы могут использовать ИИ-помощника'
       });
     }
 
@@ -191,7 +191,7 @@ async function getStoresWithoutSalesReps(req, res) {
     };
 
     const question = 'Какие магазины сейчас без торгового представителя?';
-    
+
     const response = await getDistributorAIAssistantResponse({
       message: `${question}\n\nДанные: ${JSON.stringify(data, null, 2)}`,
       context: `Дистрибьютор: ${user.distributorId}`
@@ -206,9 +206,9 @@ async function getStoresWithoutSalesReps(req, res) {
     });
   } catch (error) {
     console.error('Ошибка при получении магазинов без торговых представителей:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Ошибка при обработке запроса',
-      message: error.message 
+      message: error.message
     });
   }
 }
@@ -226,8 +226,8 @@ async function getTopBrandsTurnover(req, res) {
 
     const user = await User.findOne({ id: userId }).lean();
     if (!user || !user.distributorId) {
-      return res.status(403).json({ 
-        error: 'Доступ запрещен. Только дистрибьюторы могут использовать ИИ-помощника' 
+      return res.status(403).json({
+        error: 'Доступ запрещен. Только дистрибьюторы могут использовать ИИ-помощника'
       });
     }
 
@@ -340,7 +340,7 @@ async function getTopBrandsTurnover(req, res) {
     };
 
     const question = 'Какие бренды сейчас дают наибольший оборот?';
-    
+
     const response = await getDistributorAIAssistantResponse({
       message: `${question}\n\nДанные: ${JSON.stringify(data, null, 2)}`,
       context: `Дистрибьютор: ${user.distributorId}`
@@ -355,9 +355,9 @@ async function getTopBrandsTurnover(req, res) {
     });
   } catch (error) {
     console.error('Ошибка при получении оборота по брендам:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Ошибка при обработке запроса',
-      message: error.message 
+      message: error.message
     });
   }
 }
@@ -375,8 +375,8 @@ async function getExpiringProducts(req, res) {
 
     const user = await User.findOne({ id: userId }).lean();
     if (!user || !user.distributorId) {
-      return res.status(403).json({ 
-        error: 'Доступ запрещен. Только дистрибьюторы могут использовать ИИ-помощника' 
+      return res.status(403).json({
+        error: 'Доступ запрещен. Только дистрибьюторы могут использовать ИИ-помощника'
       });
     }
 
@@ -451,7 +451,7 @@ async function getExpiringProducts(req, res) {
 
       if (expiryDate) {
         daysLeft = Math.ceil((expiryDate - now) / (24 * 60 * 60 * 1000));
-        
+
         // Добавляем товар, если срок годности истекает в ближайшие warningDays дней
         if (daysLeft >= 0 && daysLeft <= warningDays) {
           expiringItems.push({
@@ -480,7 +480,7 @@ async function getExpiringProducts(req, res) {
     };
 
     const question = 'Какие товары скоро истекают по сроку годности?';
-    
+
     const response = await getDistributorAIAssistantResponse({
       message: `${question}\n\nДанные: ${JSON.stringify(data, null, 2)}`,
       context: `Дистрибьютор: ${user.distributorId}`
@@ -495,9 +495,9 @@ async function getExpiringProducts(req, res) {
     });
   } catch (error) {
     console.error('Ошибка при получении товаров с истекающим сроком годности:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Ошибка при обработке запроса',
-      message: error.message 
+      message: error.message
     });
   }
 }
@@ -523,8 +523,8 @@ async function getDemandForecast(req, res) {
 
     const user = await User.findOne({ id: userId }).lean();
     if (!user || !user.distributorId) {
-      return res.status(403).json({ 
-        error: 'Доступ запрещен. Только дистрибьюторы могут использовать прогноз спроса' 
+      return res.status(403).json({
+        error: 'Доступ запрещен. Только дистрибьюторы могут использовать прогноз спроса'
       });
     }
 
@@ -571,7 +571,7 @@ async function getDemandForecast(req, res) {
     }
 
     // Фильтруем магазины, если указан storeId
-    const storeIds = storeId 
+    const storeIds = storeId
       ? (allStoreIds.includes(storeId) ? [storeId] : [])
       : allStoreIds;
 
@@ -752,16 +752,18 @@ ${brandStats.size > 0 ? `СТАТИСТИКА ПО БРЕНДАМ:\n${JSON.strin
 4. Рассчитай прогнозируемую выручку на основе средних цен
 5. Укажи уровень уверенности прогноза (high/medium/low)
 
-ФОРМАТ ОТВЕТА (ТОЛЬКО JSON):
+КРИТИЧЕСКИ ВАЖНО: Верни ТОЛЬКО валидный JSON без дополнительного текста, комментариев или объяснений. Начни ответ сразу с символа открывающей фигурной скобки и закончи символом закрывающей фигурной скобки.
+
+ФОРМАТ ОТВЕТА (ТОЛЬКО JSON, БЕЗ МАРКДАУНА):
 {
   "forecast": {
     "products": [
       {
         "productId": "id товара",
         "productName": "название",
-        "forecastedQuantity": число (прогноз количества на период),
-        "forecastedRevenue": число (прогноз выручки на период),
-        "dailyAverage": число (средний дневной спрос),
+        "forecastedQuantity": число,
+        "forecastedRevenue": число,
+        "dailyAverage": число,
         "confidence": "high/medium/low",
         "trend": "increasing/stable/decreasing",
         "notes": "краткое пояснение"
@@ -775,13 +777,14 @@ ${brandStats.size > 0 ? `СТАТИСТИКА ПО БРЕНДАМ:\n${JSON.strin
   }
 }
 
-ВАЖНО:
+ПРАВИЛА:
 - Если данных недостаточно для прогноза, укажи confidence: "low"
 - Если тренд неясен, укажи trend: "stable"
 - Будь реалистичным в прогнозах, не завышай цифры
 - Учитывай, что если товар продавался редко, прогноз должен быть консервативным
-
-ВЕРНИ ТОЛЬКО JSON!`;
+- НЕ добавляй markdown форматирование
+- НЕ добавляй пояснения до или после JSON
+- Верни ТОЛЬКО чистый JSON объект`;
 
     // Получаем прогноз от AI
     let aiForecast;
@@ -795,6 +798,9 @@ ${brandStats.size > 0 ? `СТАТИСТИКА ПО БРЕНДАМ:\n${JSON.strin
       aiForecast = extractJson(aiResponse);
       if (!aiForecast) {
         console.warn('Не удалось извлечь JSON из ответа AI, используем экстраполяцию');
+        console.warn('Ответ AI (первые 1000 символов):', aiResponse ? aiResponse.substring(0, 1000) : 'пустой ответ');
+      } else {
+        console.log('Успешно извлечен JSON из ответа AI');
       }
     } catch (error) {
       console.error('Ошибка при получении прогноза от AI:', error);
@@ -841,7 +847,7 @@ ${brandStats.size > 0 ? `СТАТИСТИКА ПО БРЕНДАМ:\n${JSON.strin
     // Добавляем информацию о категориях и брендах
     const categoriesForecast = Array.from(categoryStats.entries()).map(([categoryId, stat]) => {
       const categoryProducts = productsData.filter(p => p.categoryId === categoryId);
-      const categoryForecast = aiForecast.forecast.products.filter(p => 
+      const categoryForecast = aiForecast.forecast.products.filter(p =>
         categoryProducts.some(cp => cp.productId === p.productId)
       );
       return {
@@ -856,7 +862,7 @@ ${brandStats.size > 0 ? `СТАТИСТИКА ПО БРЕНДАМ:\n${JSON.strin
 
     const brandsForecast = Array.from(brandStats.entries()).map(([brandName, stat]) => {
       const brandProducts = productsData.filter(p => p.brandName === brandName);
-      const brandForecast = aiForecast.forecast.products.filter(p => 
+      const brandForecast = aiForecast.forecast.products.filter(p =>
         brandProducts.some(bp => bp.productId === p.productId)
       );
       return {
@@ -897,9 +903,9 @@ ${brandStats.size > 0 ? `СТАТИСТИКА ПО БРЕНДАМ:\n${JSON.strin
     });
   } catch (error) {
     console.error('Ошибка при получении прогноза спроса:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Ошибка при обработке запроса',
-      message: error.message 
+      message: error.message
     });
   }
 }

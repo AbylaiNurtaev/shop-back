@@ -581,6 +581,24 @@ const storeActivityHistorySchema = new mongoose.Schema(
 storeActivityHistorySchema.index({ storeId: 1 });
 storeActivityHistorySchema.index({ storeOwnerId: 1 });
 
+// Схема уведомлений
+const notificationSchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true, unique: true },
+    userId: { type: String, required: true, index: true }, // ID пользователя, которому отправлено уведомление
+    type: { type: String, required: true }, // Тип уведомления (например, 'BRAND_CONNECTION_REQUEST', 'DISTRIBUTOR_ACCEPTED_REQUEST')
+    title: { type: String, required: true }, // Заголовок уведомления
+    message: { type: String, required: true }, // Текст уведомления
+    isRead: { type: Boolean, default: false, index: true }, // Флаг прочитанности
+    metadata: { type: Object, default: {} } // Дополнительные данные (brandId, distributorId, requestId и т.д.)
+  },
+  baseSchemaOptions
+);
+
+// Индексы для оптимизации запросов
+notificationSchema.index({ userId: 1, isRead: 1 });
+notificationSchema.index({ userId: 1, createdAt: -1 });
+
 const User = mongoose.models.User || mongoose.model('User', userSchema);
 const Store = mongoose.models.Store || mongoose.model('Store', storeSchema);
 const Distributor =
@@ -636,6 +654,8 @@ const InvoiceHistory =
   mongoose.models.InvoiceHistory || mongoose.model('InvoiceHistory', invoiceHistorySchema);
 const StoreActivityHistory =
   mongoose.models.StoreActivityHistory || mongoose.model('StoreActivityHistory', storeActivityHistorySchema);
+const Notification =
+  mongoose.models.Notification || mongoose.model('Notification', notificationSchema);
 
 async function seedDefaults() {
   const categoryCount = await Category.countDocuments();
@@ -766,6 +786,7 @@ module.exports = {
     DistributorActivityHistory,
     ProductSearchLog,
     InvoiceHistory,
-    StoreActivityHistory
+    StoreActivityHistory,
+    Notification
   }
 };

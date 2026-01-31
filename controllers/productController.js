@@ -55,10 +55,18 @@ async function createProduct(req, res) {
 
     const resolvedBrandId = brandId || (req.user && req.user.brandId) || null;
 
-    // Проверка обязательных полей
-    if (!name || !categoryId || !sku || !resolvedBrandId || !storageLife || !productionDate) {
+    // Проверка обязательных полей (проверяем не только наличие, но и что строки не пустые)
+    const missingFields = [];
+    if (!name || (typeof name === 'string' && name.trim() === '')) missingFields.push('name');
+    if (!categoryId || (typeof categoryId === 'string' && categoryId.trim() === '')) missingFields.push('categoryId');
+    if (!sku || (typeof sku === 'string' && sku.trim() === '')) missingFields.push('sku');
+    if (!resolvedBrandId) missingFields.push('brandId');
+    if (!storageLife || (typeof storageLife === 'string' && storageLife.trim() === '')) missingFields.push('storageLife');
+    if (!productionDate) missingFields.push('productionDate');
+
+    if (missingFields.length > 0) {
       return res.status(400).json({
-        error: 'Отсутствуют обязательные поля: name, categoryId, sku, brandId, storageLife, productionDate'
+        error: `Отсутствуют обязательные поля: ${missingFields.join(', ')}`
       });
     }
 
@@ -98,6 +106,39 @@ async function createProduct(req, res) {
       allergens: allergens || null,
       ageRestrictions: ageRestrictions || null
     });
+
+    // Создаем уведомления для всех дистрибьюторов, подключенных к этому бренду
+    try {
+      const { createNotificationForDistributorUsers } = require('./notificationController');
+      const { models } = require('../models/database');
+      const { BrandDistributorRequest } = models;
+
+      // Находим всех дистрибьюторов, подключенных к этому бренду
+      const connections = await BrandDistributorRequest.find({
+        brandId: resolvedBrandId,
+        status: 'ACCEPTED'
+      }).lean();
+
+      // Создаем уведомления для каждого дистрибьютора
+      for (const connection of connections) {
+        await createNotificationForDistributorUsers({
+          distributorId: connection.distributorId,
+          type: 'NEW_PRODUCT_FROM_BRAND',
+          title: 'Новый товар от бренда',
+          message: `Бренд "${brandName}" выложил новый товар: ${name}`,
+          metadata: {
+            brandId: resolvedBrandId,
+            brandName,
+            productId: product.id,
+            productName: name,
+            distributorId: connection.distributorId
+          }
+        });
+      }
+    } catch (notificationError) {
+      console.error('Ошибка при создании уведомлений о новом товаре:', notificationError);
+      // Не прерываем процесс, если уведомления не создались
+    }
 
     res.status(201).json(product.toObject());
   } catch (error) {
