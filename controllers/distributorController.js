@@ -690,13 +690,38 @@ async function getSalesRepresentatives(req, res) {
     }
 
     // Получаем торговых представителей из User (role: 'SALES_REPRESENTATIVE' с distributorId)
-    const salesRepresentatives = await User.find({
+    const salesRepresentativesUsers = await User.find({
       role: 'SALES_REPRESENTATIVE',
       distributorId: distributorId,
       isActive: true
     })
       .sort({ createdAt: -1 })
       .lean();
+
+    // Получаем email'ы для поиска в SalesRepresentative
+    const emails = salesRepresentativesUsers.map(user => user.email).filter(Boolean);
+
+    // Получаем информацию о торговых представителях из SalesRepresentative
+    const salesRepresentativesData = emails.length > 0
+      ? await SalesRepresentative.find({
+        email: { $in: emails },
+        distributorId: distributorId
+      }).lean()
+      : [];
+
+    // Создаем мапу для быстрого поиска по email
+    const salesRepMap = new Map(
+      salesRepresentativesData.map(rep => [rep.email, rep])
+    );
+
+    // Объединяем данные из User и SalesRepresentative
+    const salesRepresentatives = salesRepresentativesUsers.map(user => {
+      const salesRepData = salesRepMap.get(user.email);
+      return {
+        ...user,
+        phoneNumber: salesRepData ? salesRepData.phoneNumber : null
+      };
+    });
 
     res.json({
       items: salesRepresentatives,

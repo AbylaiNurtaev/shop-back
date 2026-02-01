@@ -4,10 +4,102 @@ const { analyzeInvoice } = require('../utils/gemini');
 const { compressImage } = require('../utils/imageCompression');
 const { uploadImage } = require('../utils/s3');
 const { logStoreActivity } = require('../utils/storeActivityLogger');
+const { createNotificationForStoreUsers } = require('./notificationController');
 
 const { Offer, Product, Store, User, SalesRepresentativeStore, SalesRepresentative, BrandDistributorRequest, InvoiceHistory, StoreActivityHistory } = models;
 
 const STORE_ROLES = ['STORE', 'STORE_USER'];
+
+// Функция для парсинга срока годности
+function parseStorageLifeDays(storageLife) {
+  if (!storageLife) return null;
+  const raw = String(storageLife).trim().toLowerCase();
+  const match = raw.match(/(\d+(?:[.,]\d+)?)/);
+  if (!match) return null;
+  const value = Number(match[1].replace(',', '.'));
+  if (Number.isNaN(value) || value <= 0) return null;
+
+  if (raw.includes('нед')) return Math.round(value * 7);
+  if (raw.includes('мес')) return Math.round(value * 30);
+  if (raw.includes('год') || raw.includes('лет')) return Math.round(value * 365);
+  if (raw.includes('д')) return Math.round(value);
+
+  return Math.round(value);
+}
+
+// Функция для проверки товаров с истекающим сроком годности (3 дня) и отправки уведомлений
+async function checkExpiringProductsForStore(storeId) {
+  try {
+    const offers = await Offer.find({ storeId }).lean();
+    if (offers.length === 0) return;
+
+    const productIds = [...new Set(offers.map(offer => offer.productId))];
+    const products = productIds.length > 0
+      ? await Product.find({ id: { $in: productIds } }).lean()
+      : [];
+
+    const productById = new Map(products.map(product => [product.id, product]));
+    const now = new Date();
+    const expiringProducts = [];
+
+    for (const offer of offers) {
+      const product = productById.get(offer.productId);
+      if (!product) continue;
+
+      const quantity = offer.quantity || 0;
+      // Пропускаем товары без остатков
+      if (quantity <= 0) continue;
+
+      // Вычисляем дату истечения срока годности
+      let expiryDate = null;
+      if (product.expirationDate) {
+        expiryDate = new Date(product.expirationDate);
+      } else if (product.productionDate && product.storageLife) {
+        const storageDays = parseStorageLifeDays(product.storageLife);
+        if (storageDays) {
+          expiryDate = new Date(product.productionDate);
+          expiryDate.setDate(expiryDate.getDate() + storageDays);
+        }
+      }
+
+      if (expiryDate) {
+        const daysLeft = Math.ceil((expiryDate - now) / (24 * 60 * 60 * 1000));
+        // Проверяем, что осталось ровно 3 дня или меньше (но не истекло)
+        if (daysLeft >= 0 && daysLeft <= 3) {
+          expiringProducts.push({
+            productId: product.id,
+            productName: product.name,
+            sku: product.sku,
+            quantity,
+            daysLeft,
+            expiryDate: expiryDate.toISOString()
+          });
+        }
+      }
+    }
+
+    // Отправляем уведомление, если есть товары с истекающим сроком годности
+    if (expiringProducts.length > 0) {
+      const productsList = expiringProducts
+        .map(p => `${p.productName} (SKU: ${p.sku}, остаток: ${p.quantity}, осталось дней: ${p.daysLeft})`)
+        .join(', ');
+
+      await createNotificationForStoreUsers({
+        storeId,
+        type: 'EXPIRING_PRODUCTS',
+        title: 'Товары с истекающим сроком годности',
+        message: `У вас есть товары, у которых осталось 3 дня или меньше до истечения срока годности: ${productsList}`,
+        metadata: {
+          storeId,
+          expiringProducts,
+          count: expiringProducts.length
+        }
+      });
+    }
+  } catch (error) {
+    console.error('Ошибка при проверке товаров с истекающим сроком годности:', error);
+  }
+}
 
 // Получение storeId для владельца магазина
 async function getStoreIdForStoreOwner(user) {
@@ -281,6 +373,34 @@ async function addStock(req, res) {
       }
     }
 
+    // Проверяем товары с истекающим сроком годности и отправляем уведомления
+    try {
+      await checkExpiringProductsForStore(storeId);
+    } catch (error) {
+      console.error('Ошибка при проверке товаров с истекающим сроком годности:', error);
+    }
+
+    // Отправляем уведомление об изменении на складе
+    try {
+      await createNotificationForStoreUsers({
+        storeId,
+        type: 'WAREHOUSE_STOCK_CHANGED',
+        title: 'Изменение на складе',
+        message: `Товар "${product.name}" (SKU: ${product.sku}) добавлен на склад. Количество: +${quantity}, итого: ${offer.quantity}`,
+        metadata: {
+          storeId,
+          productId: product.id,
+          productName: product.name,
+          sku: product.sku,
+          action: 'ADD',
+          quantity: quantity,
+          totalQuantity: offer.quantity
+        }
+      });
+    } catch (error) {
+      console.error('Ошибка при отправке уведомления об изменении на складе:', error);
+    }
+
     // Получаем информацию о товаре для ответа
     res.json({
       message: 'Товар успешно добавлен на склад',
@@ -355,6 +475,37 @@ async function removeStock(req, res) {
           offerId: updatedOffer.id
         }
       );
+    }
+
+    // Проверяем товары с истекающим сроком годности и отправляем уведомления
+    try {
+      await checkExpiringProductsForStore(storeId);
+    } catch (error) {
+      console.error('Ошибка при проверке товаров с истекающим сроком годности:', error);
+    }
+
+    // Отправляем уведомление об изменении на складе
+    try {
+      if (product) {
+        await createNotificationForStoreUsers({
+          storeId,
+          type: 'WAREHOUSE_STOCK_CHANGED',
+          title: 'Изменение на складе',
+          message: `Товар "${product.name}" (SKU: ${product.sku}) списан со склада. Количество: -${quantity}, остаток: ${newQuantity}`,
+          metadata: {
+            storeId,
+            productId: product.id,
+            productName: product.name,
+            sku: product.sku,
+            action: 'REMOVE',
+            quantity: quantity,
+            oldQuantity: currentQuantity,
+            newQuantity: newQuantity
+          }
+        });
+      }
+    } catch (error) {
+      console.error('Ошибка при отправке уведомления об изменении на складе:', error);
     }
 
     res.json({
@@ -476,6 +627,36 @@ async function updateStock(req, res) {
       }
     }
 
+    // Проверяем товары с истекающим сроком годности и отправляем уведомления
+    try {
+      await checkExpiringProductsForStore(storeId);
+    } catch (error) {
+      console.error('Ошибка при проверке товаров с истекающим сроком годности:', error);
+    }
+
+    // Отправляем уведомление об изменении на складе, если количество изменилось
+    try {
+      if (product && oldQuantity !== quantity) {
+        await createNotificationForStoreUsers({
+          storeId,
+          type: 'WAREHOUSE_STOCK_CHANGED',
+          title: 'Изменение на складе',
+          message: `Количество товара "${product.name}" (SKU: ${product.sku}) изменено на складе. Старое количество: ${oldQuantity}, новое количество: ${quantity}`,
+          metadata: {
+            storeId,
+            productId: product.id,
+            productName: product.name,
+            sku: product.sku,
+            action: 'UPDATE',
+            oldQuantity: oldQuantity,
+            newQuantity: quantity
+          }
+        });
+      }
+    } catch (error) {
+      console.error('Ошибка при отправке уведомления об изменении на складе:', error);
+    }
+
     res.json({
       message: 'Количество товара успешно обновлено',
       product: product
@@ -545,8 +726,18 @@ async function getWarehouseAnalytics(req, res) {
       }
 
       // Проверка на истечение срока годности
+      let expiryDate = null;
       if (product.expirationDate) {
-        const expiryDate = new Date(product.expirationDate);
+        expiryDate = new Date(product.expirationDate);
+      } else if (product.productionDate && product.storageLife) {
+        const storageDays = parseStorageLifeDays(product.storageLife);
+        if (storageDays) {
+          expiryDate = new Date(product.productionDate);
+          expiryDate.setDate(expiryDate.getDate() + storageDays);
+        }
+      }
+
+      if (expiryDate) {
         const daysLeft = Math.ceil((expiryDate - now) / (24 * 60 * 60 * 1000));
         if (daysLeft >= 0 && daysLeft <= 7) {
           expiringItems.push({
@@ -560,6 +751,13 @@ async function getWarehouseAnalytics(req, res) {
           });
         }
       }
+    }
+
+    // Проверяем товары с истекающим сроком годности (3 дня) и отправляем уведомления
+    try {
+      await checkExpiringProductsForStore(storeId);
+    } catch (error) {
+      console.error('Ошибка при проверке товаров с истекающим сроком годности:', error);
     }
 
     res.json({
@@ -1119,6 +1317,43 @@ async function confirmInvoiceItems(req, res) {
           }))
         }
       );
+    }
+
+    // Проверяем товары с истекающим сроком годности и отправляем уведомления
+    try {
+      await checkExpiringProductsForStore(storeId);
+    } catch (error) {
+      console.error('Ошибка при проверке товаров с истекающим сроком годности:', error);
+    }
+
+    // Отправляем уведомление об изменении на складе через накладную
+    try {
+      if (results.processed.length > 0) {
+        const productsList = results.processed
+          .map(p => `${p.productName} (${p.quantity} шт.)`)
+          .join(', ');
+        await createNotificationForStoreUsers({
+          storeId,
+          type: 'WAREHOUSE_STOCK_CHANGED',
+          title: 'Изменение на складе через накладную',
+          message: `Через накладную добавлено товаров на склад: ${results.processed.length}. ${productsList}`,
+          metadata: {
+            storeId,
+            action: 'INVOICE',
+            totalItems: items.length,
+            processedCount: results.processed.length,
+            products: results.processed.map(p => ({
+              productId: p.productId,
+              productName: p.productName,
+              sku: p.sku,
+              quantity: p.quantity,
+              totalQuantity: p.totalQuantity
+            }))
+          }
+        });
+      }
+    } catch (error) {
+      console.error('Ошибка при отправке уведомления об изменении на складе:', error);
     }
 
     res.json({

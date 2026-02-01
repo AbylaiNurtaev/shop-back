@@ -111,7 +111,8 @@ async function createUser(req, res) {
       firstName: firstName || null,
       storeId: resolvedStoreId,
       distributorId: resolvedDistributorId,
-      isActive: isActive !== undefined ? isActive : true
+      isActive: isActive !== undefined ? isActive : true,
+      currency: req.body.currency || 'KZT'
     });
 
     await AuthCredential.create({
@@ -153,7 +154,7 @@ async function getUsers(req, res) {
   try {
     const users = await User.find(
       {},
-      'id role email firstName storeId distributorId'
+      'id role email firstName storeId distributorId currency'
     ).lean();
 
     res.json({
@@ -168,11 +169,18 @@ async function getUsers(req, res) {
 async function updateUser(req, res) {
   try {
     const { userId } = req.params;
-    const { firstName, isActive } = req.body;
+    const { firstName, isActive, currency } = req.body;
 
     const update = { updatedAt: new Date() };
     if (firstName !== undefined) update.firstName = firstName;
     if (isActive !== undefined) update.isActive = isActive;
+    if (currency !== undefined) {
+      const currencyCode = currency.trim().toUpperCase();
+      if (currencyCode.length !== 3) {
+        return res.status(400).json({ error: 'Код валюты должен состоять из 3 символов (например, KZT, USD, RUB)' });
+      }
+      update.currency = currencyCode;
+    }
 
     const user = await User.findOneAndUpdate({ id: userId }, update, { new: true }).lean();
     if (!user) {
@@ -199,10 +207,117 @@ async function deleteUser(req, res) {
   }
 }
 
+// Получение настроек текущего пользователя
+async function getMyUserSettings(req, res) {
+  try {
+    const userId = req.user && req.user.userId;
+    if (!userId) {
+      return res.status(401).json({ error: 'Токен доступа отсутствует' });
+    }
+
+    const user = await User.findOne({ id: userId }).lean();
+    if (!user) {
+      return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+
+    // Возвращаем настройки пользователя
+    const settings = {
+      id: user.id,
+      role: user.role,
+      email: user.email,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      storeId: user.storeId,
+      distributorId: user.distributorId,
+      isActive: user.isActive,
+      currency: user.currency || 'KZT',
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt
+    };
+
+    res.json(settings);
+  } catch (error) {
+    console.error('Ошибка при получении настроек пользователя:', error);
+    res.status(500).json({ error: 'Ошибка при получении настроек пользователя' });
+  }
+}
+
+// Обновление настроек текущего пользователя
+async function updateMyUserSettings(req, res) {
+  try {
+    const userId = req.user && req.user.userId;
+    if (!userId) {
+      return res.status(401).json({ error: 'Токен доступа отсутствует' });
+    }
+
+    const user = await User.findOne({ id: userId }).lean();
+    if (!user) {
+      return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+
+    const { firstName, lastName, currency } = req.body;
+
+    const update = { updatedAt: new Date() };
+
+    // Валидация и обновление полей
+    if (firstName !== undefined) {
+      if (typeof firstName !== 'string' || firstName.trim().length === 0) {
+        return res.status(400).json({ error: 'Имя должно быть непустой строкой' });
+      }
+      update.firstName = firstName.trim();
+    }
+
+    if (lastName !== undefined) {
+      if (typeof lastName !== 'string' || lastName.trim().length === 0) {
+        return res.status(400).json({ error: 'Фамилия должна быть непустой строкой' });
+      }
+      update.lastName = lastName.trim();
+    }
+
+    if (currency !== undefined) {
+      if (typeof currency !== 'string' || currency.trim().length === 0) {
+        return res.status(400).json({ error: 'Валюта должна быть непустой строкой' });
+      }
+      // Валидация кода валюты (3 символа, например KZT, USD, RUB)
+      const currencyCode = currency.trim().toUpperCase();
+      if (currencyCode.length !== 3) {
+        return res.status(400).json({ error: 'Код валюты должен состоять из 3 символов (например, KZT, USD, RUB)' });
+      }
+      update.currency = currencyCode;
+    }
+
+    const updatedUser = await User.findOneAndUpdate({ id: userId }, update, { new: true }).lean();
+    if (!updatedUser) {
+      return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+
+    const settings = {
+      id: updatedUser.id,
+      role: updatedUser.role,
+      email: updatedUser.email,
+      firstName: updatedUser.firstName,
+      lastName: updatedUser.lastName,
+      storeId: updatedUser.storeId,
+      distributorId: updatedUser.distributorId,
+      isActive: updatedUser.isActive,
+      currency: updatedUser.currency || 'KZT',
+      createdAt: updatedUser.createdAt,
+      updatedAt: updatedUser.updatedAt
+    };
+
+    res.json(settings);
+  } catch (error) {
+    console.error('Ошибка при обновлении настроек пользователя:', error);
+    res.status(500).json({ error: 'Ошибка при обновлении настроек пользователя' });
+  }
+}
+
 module.exports = {
   createUser,
   getUserById,
   getUsers,
   updateUser,
-  deleteUser
+  deleteUser,
+  getMyUserSettings,
+  updateMyUserSettings
 };

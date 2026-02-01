@@ -127,6 +127,78 @@ function extractJson(text) {
 }
 
 // ============================================================================
+// СЕМАНТИЧЕСКИЙ ПОИСК ТОВАРОВ ЧЕРЕЗ AI
+// ============================================================================
+
+async function findProductsBySemanticSearch({ searchQuery, allProducts, limit = 30 }) {
+  if (!searchQuery || !searchQuery.trim() || !allProducts || allProducts.length === 0) {
+    return [];
+  }
+
+  // Ограничиваем количество товаров для анализа AI
+  const productsForAI = allProducts.slice(0, 100).map(p => ({
+    id: p.id,
+    name: p.name || '',
+    brandName: p.brandName || '',
+    packageInfo: p.packageInfo || '',
+    description: p.description || '',
+    sku: p.sku || ''
+  }));
+
+  const prompt = `Ты эксперт по поиску товаров в универсальном каталоге. Пользователь ищет товар по запросу: "${searchQuery}"
+
+ДОСТУПНЫЕ ТОВАРЫ:
+${JSON.stringify(productsForAI, null, 2)}
+
+ЗАДАЧА:
+Найди товары, которые соответствуют запросу пользователя по СМЫСЛУ, а не только по точному совпадению слов.
+
+ОБЩИЕ ПРАВИЛА ПОИСКА:
+1. Учитывай синонимы и варианты написания (например: "банка" = "жестяная банка" = "металлическая банка" = "железная банка" = "ЖБ")
+2. Учитывай транслитерацию (например: "cola" = "кола", "coca" = "кока")
+3. Ищи по смыслу: если пользователь ищет "банка колы", найди товары где есть соответствующий бренд И тип упаковки "банка"
+4. Учитывай сокращения и аббревиатуры (например: "ЖБ" может означать "жестяная банка")
+5. Ищи по всем полям товара: название, бренд, описание, упаковка, SKU
+
+ВАЖНО:
+- Ищи по СМЫСЛУ запроса, а не только по точным словам
+- Анализируй структуру запроса: бренд + тип товара + характеристики + упаковка
+- Если запрос содержит несколько параметров (например, "банка колы"), ищи товары, соответствующие ВСЕМ параметрам
+- Будь гибким: если точного совпадения нет, ищи частичные совпадения по ключевым словам
+
+ФОРМАТ ОТВЕТА (ТОЛЬКО JSON):
+{
+  "matchedProductIds": ["id1", "id2", "id3"],
+  "reasoning": "краткое объяснение почему эти товары подходят"
+}
+
+ВЕРНИ ТОЛЬКО JSON!`;
+
+  try {
+    const response = await requestGemini(prompt, { maxOutputTokens: 500, timeout: 15000 });
+    const parsed = extractJson(response);
+
+    if (!parsed || !Array.isArray(parsed.matchedProductIds)) {
+      console.error('Некорректный ответ от AI для семантического поиска:', response);
+      return [];
+    }
+
+    const matchedIds = new Set(parsed.matchedProductIds);
+    const matchedProducts = allProducts.filter(p => matchedIds.has(p.id));
+
+    console.log(`Семантический поиск: найдено ${matchedProducts.length} товаров из ${allProducts.length} для запроса "${searchQuery}"`);
+    if (parsed.reasoning) {
+      console.log('Обоснование AI:', parsed.reasoning);
+    }
+
+    return matchedProducts.slice(0, limit);
+  } catch (error) {
+    console.error('Ошибка семантического поиска через AI:', error.message);
+    return [];
+  }
+}
+
+// ============================================================================
 // ИЗВЛЕЧЕНИЕ НАМЕРЕНИЙ
 // ============================================================================
 
@@ -140,7 +212,7 @@ async function getIntentFromGemini({ message, candidates, known }) {
     package: p.packageInfo
   }));
 
-  const prompt = `Ты эксперт по поиску товаров. Извлеки параметры из сообщения пользователя.
+  const prompt = `Ты эксперт по извлечению параметров поиска товаров из сообщений пользователей. Извлеки параметры из сообщения пользователя.
 
 ДОСТУПНЫЕ ТОВАРЫ (примеры):
 ${JSON.stringify(productsList.slice(0, 10), null, 2)}
@@ -157,38 +229,35 @@ ${JSON.stringify(known, null, 2)}
 НОВОЕ СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ:
 "${message}"
 
-ПРАВИЛА РАСПОЗНАВАНИЯ:
-1. "Кола", "колу", "cola", "coca" → brand: "Coca-Cola"
-2. "Пепси", "pepsi" → brand: "Pepsi"
-3. "Фанта", "fanta" → brand: "Fanta"
-4. "Спрайт", "sprite" → brand: "Sprite"
-5. "0.5", "поллитра" → ищи упаковку с "0.5"
-6. "1", "литр" → ищи упаковку с "1"
-7. "2", "два литра" → ищи упаковку с "2"
-8. "зеро", "zero", "без сахара" → type: "zero"
-9. "лайт", "light" → type: "light"
-10. "класси", "обычн", "classic" → type: "classic"
-11. "стекло", "стеклянн", "бутылка" → packageType: "glass"
-12. "банка", "железо", "жестян", "металл" → packageType: "can"
-13. "пласти", "pet" → packageType: "plastic"
+ОБЩИЕ ПРАВИЛА РАСПОЗНАВАНИЯ:
+1. БРЕНДЫ: Определяй бренды из доступных брендов. Учитывай синонимы и транслитерацию (например: "кола"/"cola"/"coca cola" → "Coca-Cola")
+2. ОБЪЕМ/РАЗМЕР: Распознавай объемы и размеры (например: "0.5"/"поллитра"/"500мл" → "0.5л", "1"/"литр"/"1л" → "1л")
+3. ТИП ТОВАРА: Распознавай варианты товара (например: "zero"/"ноль"/"без сахара" → "zero", "light"/"лайт" → "light", "classic"/"классическая" → "classic")
+4. ТИП УПАКОВКИ: 
+   - "стекло"/"стеклянн"/"бутылка" → packageType: "glass"
+   - "банка"/"железо"/"жестян"/"металл"/"ЖБ" → packageType: "can"
+   - "пласти"/"pet" → packageType: "plastic"
+5. Учитывай сокращения: "ЖБ" = "жестяная банка" = "can"
 
 ВАЖНО: 
 - ОБЪЕДИНИ уже известные данные (known) с новыми данными из сообщения
 - Если в known уже есть brand, но пользователь уточняет type - СОХРАНИ brand!
 - Возвращай ВСЕ накопленные данные, не теряй то, что уже известно
+- Анализируй сообщение целиком: может содержать несколько параметров одновременно
+- Сопоставляй упоминания брендов с доступными брендами из списка
 
 ФОРМАТ ОТВЕТА (ТОЛЬКО JSON):
 {
   "action": "READY_TO_SEARCH",
   "intent": {
-    "brand": "известный бренд ИЛИ новый из сообщения",
+    "brand": "известный бренд ИЛИ новый из сообщения (из доступных брендов)",
     "packageInfo": "известная упаковка ИЛИ новая из сообщения",
     "type": "известный тип ИЛИ новый из сообщения",
     "packageType": "известный packageType ИЛИ новый из сообщения"
   }
 }
 
-ПРИМЕРЫ С НАКОПЛЕНИЕМ:
+ПРИМЕРЫ:
 Known: {"brand":"Coca-Cola","packageInfo":null,"type":null}
 Сообщение: "0.5"
 Ответ: {"action":"READY_TO_SEARCH","intent":{"brand":"Coca-Cola","packageInfo":"0.5л","type":null,"packageType":null}}
@@ -196,6 +265,10 @@ Known: {"brand":"Coca-Cola","packageInfo":null,"type":null}
 Known: {"brand":"Coca-Cola","packageInfo":"0.5л","type":null}
 Сообщение: "classic"
 Ответ: {"action":"READY_TO_SEARCH","intent":{"brand":"Coca-Cola","packageInfo":"0.5л","type":"classic","packageType":null}}
+
+Known: {brand: null, packageInfo: null, type: null, packageType: null}
+Сообщение: "мне нужна банка колы"
+Ответ: {"action":"READY_TO_SEARCH","intent":{"brand":"Coca-Cola","packageInfo":null,"type":null,"packageType":"can"}}
 
 ВЕРНИ ТОЛЬКО JSON!`;
 
@@ -278,7 +351,7 @@ async function generateClarificationQuestions({ candidates, known, previousQuest
 
     // Определяем тип упаковки
     if (text.includes('стекл') || text.includes('glass')) packageTypes.add('Стекло');
-    if (text.includes('банка') || text.includes('can') || text.includes('жест') || text.includes('металл')) packageTypes.add('Металл');
+    if (text.includes('банка') || text.includes('can') || text.includes('жест') || text.includes('металл') || text.includes('жб')) packageTypes.add('Металл');
     if (text.includes('пласти') || text.includes('pet')) packageTypes.add('Пластик');
   });
 
@@ -291,15 +364,17 @@ async function generateClarificationQuestions({ candidates, known, previousQuest
   console.log('Тара (' + packageTypes.size + '):', [...packageTypes]);
   console.log('Предыдущие вопросы:', previousQuestions);
 
+  // Функция для проверки, был ли уже задан вопрос определенного типа
+  const wasQuestionAsked = (keywords) => {
+    return previousQuestions.some(q => {
+      const qLower = q.toLowerCase();
+      return keywords.some(keyword => qLower.includes(keyword));
+    });
+  };
+
   // ПРИОРИТЕТ 1: Если не известна упаковка (объем) и есть варианты
   if (!known.packageInfo && packages.length > 1) {
-    const questionAsked = previousQuestions.some(q =>
-      q.toLowerCase().includes('объем') ||
-      q.toLowerCase().includes('литр') ||
-      q.toLowerCase().includes('размер')
-    );
-
-    if (!questionAsked) {
+    if (!wasQuestionAsked(['объем', 'литр', 'размер', 'сколько'])) {
       console.log('→ Задаем вопрос про ОБЪЕМ');
       return {
         questions: ['Какой объем вам нужен?'],
@@ -310,13 +385,7 @@ async function generateClarificationQuestions({ candidates, known, previousQuest
 
   // ПРИОРИТЕТ 2: Если не известен тип напитка и есть варианты
   if (!known.type && types.size > 1) {
-    const questionAsked = previousQuestions.some(q =>
-      q.toLowerCase().includes('тип') ||
-      q.toLowerCase().includes('zero') ||
-      q.toLowerCase().includes('сахар')
-    );
-
-    if (!questionAsked) {
+    if (!wasQuestionAsked(['тип', 'zero', 'сахар', 'классическая', 'light', 'лайт'])) {
       console.log('→ Задаем вопрос про ТИП');
       return {
         questions: [`Какого типа ${known.brand || 'напиток'} вы хотите?`],
@@ -326,31 +395,28 @@ async function generateClarificationQuestions({ candidates, known, previousQuest
   }
 
   // ПРИОРИТЕТ 3: Если не известен тип упаковки (стекло/металл) и есть варианты
+  // ВАЖНО: Не задаем вопрос, если packageType уже известен (пользователь уже ответил)
   if (!known.packageType && packageTypes.size > 1) {
-    const questionAsked = previousQuestions.some(q =>
-      q.toLowerCase().includes('тара') ||
-      q.toLowerCase().includes('стекло') ||
-      q.toLowerCase().includes('банка') ||
-      q.toLowerCase().includes('металл')
-    );
+    // Проверяем, был ли уже задан вопрос о таре
+    const taraQuestionAsked = wasQuestionAsked(['тара', 'стекло', 'банка', 'металл', 'железная', 'упаковка']);
 
-    if (!questionAsked) {
+    if (!taraQuestionAsked) {
       console.log('→ Задаем вопрос про ТАРУ');
       return {
         questions: ['В какой таре вам нужен товар?'],
         quickReplies: [...packageTypes].slice(0, 6)
       };
+    } else {
+      // Если вопрос уже был задан, но packageType все еще не известен,
+      // значит пользователь еще не ответил или ответ не был распознан
+      // В этом случае не задаем вопрос повторно, чтобы избежать зацикливания
+      console.log('→ Вопрос про ТАРУ уже был задан, но packageType не известен. Пропускаем.');
     }
   }
 
   // ПРИОРИТЕТ 4: Если не известен бренд и есть варианты
   if (!known.brand && brands.length > 1) {
-    const questionAsked = previousQuestions.some(q =>
-      q.toLowerCase().includes('бренд') ||
-      q.toLowerCase().includes('марк')
-    );
-
-    if (!questionAsked) {
+    if (!wasQuestionAsked(['бренд', 'марк', 'какой', 'какая'])) {
       console.log('→ Задаем вопрос про БРЕНД');
       return {
         questions: ['Какой бренд вас интересует?'],
@@ -889,6 +955,7 @@ async function validateProductImage({ buffer, mimeType, productInfo }) {
 // Экспорт всех функций
 module.exports = {
   getIntentFromGemini,
+  findProductsBySemanticSearch,
   transcribeAudio,
   generateClarificationQuestions,
   analyzeProductImage,
@@ -900,6 +967,7 @@ module.exports = {
 
 // Для совместимости с разными способами импорта
 module.exports.getIntentFromGemini = getIntentFromGemini;
+module.exports.findProductsBySemanticSearch = findProductsBySemanticSearch;
 module.exports.transcribeAudio = transcribeAudio;
 module.exports.generateClarificationQuestions = generateClarificationQuestions;
 module.exports.analyzeProductImage = analyzeProductImage;

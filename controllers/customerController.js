@@ -2,7 +2,7 @@ const multer = require('multer');
 const { generateId } = require('../utils/uuid');
 const { uploadImage } = require('../utils/s3');
 const { calculateDistance, getCoordinatesFromLink } = require('../utils/distance');
-const { getIntentFromGemini, transcribeAudio, generateClarificationQuestions, analyzeProductImage } = require('../utils/gemini');
+const { getIntentFromGemini, findProductsBySemanticSearch, transcribeAudio, generateClarificationQuestions, analyzeProductImage } = require('../utils/gemini');
 const { models } = require('../models/database');
 
 const {
@@ -244,7 +244,8 @@ async function buildCandidatesByText(text) {
           { name: { $regex: searchRegex, $options: 'i' } },
           { description: { $regex: searchRegex, $options: 'i' } },
           { brandName: { $regex: searchRegex, $options: 'i' } },
-          { sku: { $regex: searchRegex, $options: 'i' } }
+          { sku: { $regex: searchRegex, $options: 'i' } },
+          { packageInfo: { $regex: searchRegex, $options: 'i' } }
         ]
       },
       { isPayed: true },
@@ -252,8 +253,51 @@ async function buildCandidatesByText(text) {
     ]
   };
 
-  // Ограничиваем количество результатов для ускорения
-  return Product.find(query).limit(30).lean();
+  // Сначала пробуем обычный поиск
+  let candidates = await Product.find(query).limit(50).lean();
+
+  // Если результатов мало (меньше 5) или нет результатов, используем AI для семантического поиска
+  if (candidates.length < 5) {
+    console.log(`Обычный поиск дал ${candidates.length} результатов, пробуем AI семантический поиск для "${text}"`);
+    
+    try {
+      // Получаем все оплаченные товары для AI поиска
+      const allProducts = await Product.find({
+        isPayed: true,
+        paymentExpiresAt: { $gt: new Date() }
+      }).limit(200).lean(); // Ограничиваем для производительности
+
+      if (allProducts.length > 0) {
+        const aiCandidates = await findProductsBySemanticSearch({
+          searchQuery: text,
+          allProducts: allProducts,
+          limit: 30
+        });
+
+        // Объединяем результаты: сначала AI результаты, потом обычные
+        const aiIds = new Set(aiCandidates.map(p => p.id));
+        const regularCandidates = candidates.filter(p => !aiIds.has(p.id));
+        candidates = [...aiCandidates, ...regularCandidates];
+
+        console.log(`AI семантический поиск добавил ${aiCandidates.length} товаров, итого: ${candidates.length}`);
+      }
+    } catch (error) {
+      console.error('Ошибка при AI семантическом поиске:', error);
+      // Продолжаем с обычными результатами
+    }
+  }
+
+  // Убираем дубликаты по ID
+  const uniqueCandidates = [];
+  const seenIds = new Set();
+  for (const candidate of candidates) {
+    if (!seenIds.has(candidate.id)) {
+      seenIds.add(candidate.id);
+      uniqueCandidates.push(candidate);
+    }
+  }
+
+  return uniqueCandidates.slice(0, 30);
 }
 
 function buildClarificationQuestions(products, currentIntent) {
@@ -358,13 +402,21 @@ function filterCandidatesByIntent(candidates, intent) {
       const nameLower = normalizeText(item.name || '');
       const descLower = normalizeText(item.description || '');
       const packageInfoLower = normalizeText(item.packageInfo || '');
-      const fullText = `${nameLower} ${descLower} ${packageInfoLower}`;
+      const skuLower = normalizeText(item.sku || '');
+      const fullText = `${nameLower} ${descLower} ${packageInfoLower} ${skuLower}`;
 
       if (packageTypeLower === 'glass' || packageTypeLower === 'стекло') {
         return fullText.includes('стекл') || fullText.includes('glass');
       }
       if (packageTypeLower === 'can' || packageTypeLower === 'металл' || packageTypeLower === 'банка') {
-        return fullText.includes('банка') || fullText.includes('can') || fullText.includes('жест') || fullText.includes('металл');
+        // Ищем различные варианты обозначения жестяной/металлической банки
+        return fullText.includes('банка') || 
+               fullText.includes('can') || 
+               fullText.includes('жест') || 
+               fullText.includes('металл') ||
+               fullText.includes('жб') || // ЖБ = жестяная банка
+               fullText.includes('железн') ||
+               fullText.includes('металлическ');
       }
       if (packageTypeLower === 'plastic' || packageTypeLower === 'пластик') {
         return fullText.includes('пласти') || fullText.includes('pet');
@@ -523,7 +575,7 @@ async function performSearch({ text, geo, radiusMeters, intent }) {
     : [];
   const categoryById = new Map(categories.map(category => [category.id, category]));
 
-  const radius = radiusMeters || 1000;
+  // ОТКЛЮЧАЕМ ОГРАНИЧЕНИЯ ПО РАДИУСУ - показываем все результаты
   const offersByProduct = new Map();
 
   // Функция для форматирования расстояния
@@ -540,22 +592,30 @@ async function performSearch({ text, geo, radiusMeters, intent }) {
     if (!store || !store.location) continue;
 
     let coords = null;
-    if (store.locationCoords && store.locationCoords.lat !== null && store.locationCoords.lng !== null) {
-      coords = { lat: store.locationCoords.lat, lon: store.locationCoords.lng };
-    } else {
-      coords = await getCoordinatesFromLink(store.location);
+    let distance = null;
+    let distanceFormatted = null;
+    
+    // Вычисляем расстояние только если есть геолокация
+    if (geo && geo.lat !== undefined && geo.lng !== undefined) {
+      if (store.locationCoords && store.locationCoords.lat !== null && store.locationCoords.lng !== null) {
+        coords = { lat: store.locationCoords.lat, lon: store.locationCoords.lng };
+      } else {
+        coords = await getCoordinatesFromLink(store.location);
+        if (coords) {
+          await Store.updateOne(
+            { id: store.id },
+            { locationCoords: { lat: coords.lat, lng: coords.lon } }
+          );
+        }
+      }
+      
       if (coords) {
-        await Store.updateOne(
-          { id: store.id },
-          { locationCoords: { lat: coords.lat, lng: coords.lon } }
-        );
+        distance = calculateDistance(geo.lat, geo.lng, coords.lat, coords.lon);
+        distanceFormatted = formatDistance(Math.round(distance));
       }
     }
-    if (!coords) continue;
 
-    const distance = calculateDistance(geo.lat, geo.lng, coords.lat, coords.lon);
-    const isWithinRadius = distance <= radius;
-
+    // ВСЕГДА добавляем предложение, даже если нет геолокации или оно вне радиуса
     const mappedOffer = {
       offerId: offer.id,
       price: offer.price,
@@ -568,9 +628,9 @@ async function performSearch({ text, geo, radiusMeters, intent }) {
         address: store.address,
         location: store.location,
         locationCoords: store.locationCoords || null,
-        distanceMeters: Math.round(distance),
-        distanceFormatted: formatDistance(Math.round(distance)),
-        isWithinRadius: isWithinRadius
+        distanceMeters: distance ? Math.round(distance) : null,
+        distanceFormatted: distanceFormatted,
+        isWithinRadius: null // Больше не используем ограничение по радиусу
       }
     };
 
@@ -584,16 +644,18 @@ async function performSearch({ text, geo, radiusMeters, intent }) {
     .map(product => {
       const offersWithStores = (offersByProduct.get(product.id) || [])
         .sort((a, b) => {
-          // Сначала показываем предложения в радиусе, потом вне радиуса
-          if (a.store.isWithinRadius !== b.store.isWithinRadius) {
-            return a.store.isWithinRadius ? -1 : 1;
+          // Сортируем по расстоянию (если есть), ближайшие первыми
+          if (a.store.distanceMeters !== null && b.store.distanceMeters !== null) {
+            return a.store.distanceMeters - b.store.distanceMeters;
           }
-          // Внутри каждой группы сортируем по расстоянию
-          return a.store.distanceMeters - b.store.distanceMeters;
+          // Если у одного есть расстояние, а у другого нет - сначала с расстоянием
+          if (a.store.distanceMeters !== null) return -1;
+          if (b.store.distanceMeters !== null) return 1;
+          // Если расстояний нет, сортируем по цене
+          return (a.price || 0) - (b.price || 0);
         });
 
       const category = categoryById.get(product.categoryId) || null;
-      const offersInRadius = offersWithStores.filter(o => o.store.isWithinRadius);
 
       return {
         product: {
@@ -614,14 +676,12 @@ async function performSearch({ text, geo, radiusMeters, intent }) {
         offers: offersWithStores,
         // Статистика для удобства
         totalOffers: offersWithStores.length,
-        offersInRadius: offersInRadius.length,
         nearestStore: offersWithStores.length > 0 ? {
           name: offersWithStores[0].store.name,
           distance: offersWithStores[0].store.distanceFormatted,
           distanceMeters: offersWithStores[0].store.distanceMeters,
           address: offersWithStores[0].store.address,
-          location: offersWithStores[0].store.location,
-          isWithinRadius: offersWithStores[0].store.isWithinRadius
+          location: offersWithStores[0].store.location
         } : null
       };
     });
@@ -698,23 +758,20 @@ async function postMessage(req, res) {
           let systemMessage = `Найден товар: ${productName}`;
 
           if (items.length === 0) {
-            systemMessage += '\nК сожалению, в ближайших магазинах нет предложений по этому товару. Попробуйте увеличить радиус поиска или уточнить запрос.';
+            systemMessage += '\nК сожалению, в базе нет предложений по этому товару.';
           } else {
             const item = items[0]; // Берем первый товар (должен быть один)
             const totalOffers = item.offers?.length || 0;
-            const offersInRadius = item.offersInRadius || 0;
 
             if (totalOffers === 0) {
               systemMessage += '\nК сожалению, в базе нет предложений по этому товару.';
-            } else if (offersInRadius === 0) {
-              const nearest = item.nearestStore;
-              if (nearest) {
-                systemMessage += `\nНайдено предложений: ${totalOffers}, но все они находятся вне радиуса поиска. Ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
-              } else {
-                systemMessage += `\nНайдено предложений: ${totalOffers}, но все они находятся вне радиуса поиска.`;
-              }
             } else {
-              systemMessage += `\nНайдено предложений: ${totalOffers} (${offersInRadius} в радиусе ${radiusMeters || 1000}м).`;
+              const nearest = item.nearestStore;
+              if (nearest && nearest.distance) {
+                systemMessage += `\nНайдено предложений: ${totalOffers}. Ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
+              } else {
+                systemMessage += `\nНайдено предложений: ${totalOffers}.`;
+              }
             }
           }
 
@@ -827,6 +884,54 @@ async function postMessage(req, res) {
         questions: ['Не нашел такой товар. Попробуйте написать название по-другому или укажите бренд.'],
         quickReplies: []
       });
+    }
+
+    // СНАЧАЛА обновляем intent на основе ответов пользователя (быстрые ответы)
+    // Это важно для предотвращения повторных вопросов
+    if (text && text.trim()) {
+      const currentAnswer = normalizeText(text);
+      
+      // Проверяем, является ли текущий ответ ответом на вопрос о таре
+      const isTaraAnswer = currentAnswer.includes('металл') || 
+                          currentAnswer.includes('стекло') || 
+                          currentAnswer.includes('банка') || 
+                          currentAnswer.includes('пластик') ||
+                          currentAnswer.includes('can') || 
+                          currentAnswer.includes('glass') ||
+                          currentAnswer.includes('plastic') ||
+                          currentAnswer.includes('жб');
+      
+      if (isTaraAnswer && !intent.packageType) {
+        // Обновляем intent на основе ответа пользователя
+        if (currentAnswer.includes('металл') || currentAnswer.includes('банка') || currentAnswer.includes('can') || currentAnswer.includes('жб')) {
+          intent.packageType = 'can';
+        } else if (currentAnswer.includes('стекло') || currentAnswer.includes('glass')) {
+          intent.packageType = 'glass';
+        } else if (currentAnswer.includes('пластик') || currentAnswer.includes('plastic')) {
+          intent.packageType = 'plastic';
+        }
+        await intent.save();
+        console.log('Обновлен intent.packageType на основе ответа пользователя:', intent.packageType);
+      }
+      
+      // Проверяем ответы на другие вопросы
+      const isTypeAnswer = currentAnswer.includes('classic') || 
+                          currentAnswer.includes('zero') || 
+                          currentAnswer.includes('light') ||
+                          currentAnswer.includes('классическая') ||
+                          currentAnswer.includes('ноль');
+      
+      if (isTypeAnswer && !intent.type) {
+        if (currentAnswer.includes('classic') || currentAnswer.includes('классическая')) {
+          intent.type = 'classic';
+        } else if (currentAnswer.includes('zero') || currentAnswer.includes('ноль')) {
+          intent.type = 'zero';
+        } else if (currentAnswer.includes('light') || currentAnswer.includes('лайт')) {
+          intent.type = 'light';
+        }
+        await intent.save();
+        console.log('Обновлен intent.type на основе ответа пользователя:', intent.type);
+      }
     }
 
     // Пытаемся извлечь информацию из сообщения через Gemini
@@ -1042,23 +1147,20 @@ async function postMessage(req, res) {
       let systemMessage = `Найден товар: ${productName}`;
 
       if (items.length === 0) {
-        systemMessage += '\nК сожалению, в ближайших магазинах нет предложений по этому товару. Попробуйте увеличить радиус поиска или уточнить запрос.';
+        systemMessage += '\nК сожалению, в базе нет предложений по этому товару.';
       } else {
         const item = items[0]; // Берем первый товар (должен быть один)
         const totalOffers = item.offers?.length || 0;
-        const offersInRadius = item.offersInRadius || 0;
 
         if (totalOffers === 0) {
           systemMessage += '\nК сожалению, в базе нет предложений по этому товару.';
-        } else if (offersInRadius === 0) {
-          const nearest = item.nearestStore;
-          if (nearest) {
-            systemMessage += `\nНайдено предложений: ${totalOffers}, но все они находятся вне радиуса поиска. Ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
-          } else {
-            systemMessage += `\nНайдено предложений: ${totalOffers}, но все они находятся вне радиуса поиска.`;
-          }
         } else {
-          systemMessage += `\nНайдено предложений: ${totalOffers} (${offersInRadius} в радиусе ${radiusMeters || 1000}м).`;
+          const nearest = item.nearestStore;
+          if (nearest && nearest.distance) {
+            systemMessage += `\nНайдено предложений: ${totalOffers}. Ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
+          } else {
+            systemMessage += `\nНайдено предложений: ${totalOffers}.`;
+          }
         }
       }
 
@@ -1117,9 +1219,24 @@ async function postMessage(req, res) {
       .limit(10)
       .lean();
 
+    // Получаем предыдущие ответы пользователя для анализа
+    const previousUserMessages = await SearchMessage.find({
+      conversationId,
+      sender: 'CUSTOMER'
+    })
+      .sort({ createdAt: -1 })
+      .limit(10)
+      .lean();
+
     const previousQuestions = previousSystemMessages
       .map(msg => msg.text)
       .filter(text => text && text.trim().length > 0);
+
+    // Анализируем ответы пользователя, чтобы понять, на какие вопросы он уже ответил
+    const userAnswers = previousUserMessages
+      .map(msg => normalizeText(msg.text || ''))
+      .filter(text => text.length > 0);
+
 
     let clarification = null;
     try {

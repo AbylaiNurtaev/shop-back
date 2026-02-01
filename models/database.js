@@ -60,7 +60,8 @@ const userSchema = new mongoose.Schema(
     lastName: { type: String, required: false },
     storeId: { type: String, default: null },
     distributorId: { type: String, default: null },
-    isActive: { type: Boolean, default: true }
+    isActive: { type: Boolean, default: true },
+    currency: { type: String, default: 'KZT' }
   },
   baseSchemaOptions
 );
@@ -80,7 +81,8 @@ const storeSchema = new mongoose.Schema(
     firstName: { type: String, default: null },
     lastName: { type: String, default: null },
     middleName: { type: String, default: null },
-    phoneNumber: { type: String, default: null }
+    phoneNumber: { type: String, default: null },
+    city: { type: String, default: null }
   },
   baseSchemaOptions
 );
@@ -690,7 +692,8 @@ async function seedDefaults() {
       lastName: 'Admin',
       storeId: null,
       distributorId: null,
-      isActive: true
+      isActive: true,
+      currency: 'KZT'
     });
   }
 }

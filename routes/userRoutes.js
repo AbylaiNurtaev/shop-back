@@ -6,12 +6,19 @@ const {
   getUserById,
   getUsers,
   updateUser,
-  deleteUser
+  deleteUser,
+  getMyUserSettings,
+  updateMyUserSettings
 } = require('../controllers/userController');
 
 router.post('/', createUser);
 
 router.use(authenticateToken);
+
+// Эндпоинты для настроек текущего пользователя
+router.get('/me/settings', getMyUserSettings);
+router.put('/me/settings', updateMyUserSettings);
+
 router.get('/', getUsers);
 router.get('/:userId', getUserById);
 router.put('/:userId', updateUser);

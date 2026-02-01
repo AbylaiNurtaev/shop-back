@@ -243,6 +243,38 @@ async function createNotificationForDistributorUsers({ distributorId, type, titl
   }
 }
 
+// Функция для создания уведомлений для всех пользователей магазина
+async function createNotificationForStoreUsers({ storeId, type, title, message, metadata = {} }) {
+  try {
+    // Находим всех пользователей магазина по storeId
+    const storeUsers = await User.find({
+      storeId,
+      role: { $in: ['STORE', 'STORE_USER'] },
+      isActive: true
+    }).lean();
+
+    // Создаем уведомления для каждого пользователя
+    const notifications = [];
+    for (const user of storeUsers) {
+      const notification = await createNotification({
+        userId: user.id,
+        type,
+        title,
+        message,
+        metadata
+      });
+      if (notification) {
+        notifications.push(notification);
+      }
+    }
+
+    return notifications;
+  } catch (error) {
+    console.error('Ошибка при создании уведомлений для пользователей магазина:', error);
+    return [];
+  }
+}
+
 module.exports = {
   getNotifications,
   getUnreadCount,
@@ -251,5 +283,6 @@ module.exports = {
   deleteNotification,
   createNotification,
   createNotificationForBrandUsers,
-  createNotificationForDistributorUsers
+  createNotificationForDistributorUsers,
+  createNotificationForStoreUsers
 };
