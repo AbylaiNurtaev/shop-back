@@ -245,6 +245,15 @@ const saleSchema = new mongoose.Schema(
     items: [saleItemSchema], // Массив позиций в чеке
     totalAmount: { type: Number, required: true, default: 0, min: 0 },
     currency: { type: String, required: true, default: 'RUB' },
+    // Способ оплаты (только для завершенных продаж)
+    paymentMethod: {
+      type: String,
+      enum: ['CASH', 'CARD', 'HYBRID'],
+      default: null
+    },
+    // Для гибридной оплаты: сумма наличными и картой
+    cashAmount: { type: Number, default: null, min: 0 },
+    cardAmount: { type: Number, default: null, min: 0 },
     completedAt: { type: Date, default: null }
   },
   baseSchemaOptions
@@ -601,6 +610,57 @@ const notificationSchema = new mongoose.Schema(
 notificationSchema.index({ userId: 1, isRead: 1 });
 notificationSchema.index({ userId: 1, createdAt: -1 });
 
+// Схема данных за один день в недельном отчете
+const posDailyDataSchema = new mongoose.Schema({
+  date: { type: Date, required: true }, // Дата дня
+  // Суммы по способам оплаты
+  cashAmount: { type: Number, default: 0, min: 0 }, // Наличные
+  cardAmount: { type: Number, default: 0, min: 0 }, // Карта
+  hybridAmount: { type: Number, default: 0, min: 0 }, // Гибрид (наличные + карта)
+  // Общая сумма за день
+  totalAmount: { type: Number, default: 0, min: 0 },
+  // Количество продаж за день
+  salesCount: { type: Number, default: 0, min: 0 },
+  // Детализация продаж (опционально, для детального просмотра)
+  sales: [{
+    saleId: { type: String, required: true },
+    totalAmount: { type: Number, required: true },
+    paymentMethod: { type: String, enum: ['CASH', 'CARD', 'HYBRID'], required: true },
+    cashAmount: { type: Number, default: null },
+    cardAmount: { type: Number, default: null },
+    completedAt: { type: Date, required: true }
+  }]
+}, { _id: false });
+
+// Схема недельного отчета кассы
+const posWeeklyReportSchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true, unique: true },
+    storeId: { type: String, required: true, index: true },
+    // Начало недели (понедельник)
+    weekStartDate: { type: Date, required: true, index: true },
+    // Конец недели (воскресенье)
+    weekEndDate: { type: Date, required: true },
+    // Данные по дням недели (7 дней)
+    days: [posDailyDataSchema],
+    // Итоговые суммы за неделю
+    weeklyTotal: {
+      cashAmount: { type: Number, default: 0, min: 0 },
+      cardAmount: { type: Number, default: 0, min: 0 },
+      hybridAmount: { type: Number, default: 0, min: 0 },
+      totalAmount: { type: Number, default: 0, min: 0 },
+      salesCount: { type: Number, default: 0, min: 0 }
+    },
+    currency: { type: String, required: true, default: 'RUB' }
+  },
+  baseSchemaOptions
+);
+
+// Уникальный индекс: один магазин - одна запись на неделю
+posWeeklyReportSchema.index({ storeId: 1, weekStartDate: 1 }, { unique: true });
+// Индекс для быстрого поиска по магазину
+posWeeklyReportSchema.index({ storeId: 1, weekStartDate: -1 });
+
 const User = mongoose.models.User || mongoose.model('User', userSchema);
 const Store = mongoose.models.Store || mongoose.model('Store', storeSchema);
 const Distributor =
@@ -658,6 +718,8 @@ const StoreActivityHistory =
   mongoose.models.StoreActivityHistory || mongoose.model('StoreActivityHistory', storeActivityHistorySchema);
 const Notification =
   mongoose.models.Notification || mongoose.model('Notification', notificationSchema);
+const POSWeeklyReport =
+  mongoose.models.POSWeeklyReport || mongoose.model('POSWeeklyReport', posWeeklyReportSchema);
 
 async function seedDefaults() {
   const categoryCount = await Category.countDocuments();
@@ -790,6 +852,7 @@ module.exports = {
     ProductSearchLog,
     InvoiceHistory,
     StoreActivityHistory,
-    Notification
+    Notification,
+    POSWeeklyReport
   }
 };

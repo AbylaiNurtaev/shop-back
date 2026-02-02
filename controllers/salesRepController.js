@@ -13,6 +13,8 @@ const {
   Plan
 } = models;
 
+const { logStoreActivity } = require('../utils/storeActivityLogger');
+
 function parseNumber(value, fallback) {
   if (value === undefined || value === null || value === '') return fallback;
   const parsed = Number(value);
@@ -1087,8 +1089,11 @@ async function getExpiringProducts(req, res) {
       if (expiryDate) {
         daysLeft = Math.ceil((expiryDate - now) / (24 * 60 * 60 * 1000));
         
-        // Добавляем товар, если срок годности истекает в ближайшие warningDays дней
-        if (daysLeft >= 0 && daysLeft <= warningDays) {
+        // Добавляем товар только если:
+        // 1. Срок годности истек (daysLeft < 0) или истекает в ближайшие warningDays дней
+        // 2. Количество товара больше 0 (не показываем товары с нулевым количеством)
+        const quantity = offer.quantity || 0;
+        if (daysLeft <= warningDays && quantity > 0) {
           expiringItems.push({
             offerId: offer.id,
             storeId: store.id,
@@ -1099,18 +1104,25 @@ async function getExpiringProducts(req, res) {
             sku: product.sku,
             brandId: product.brandId,
             brandName: product.brandName,
-            quantity: offer.quantity || 0,
+            quantity: quantity,
             price: offer.price || 0,
             currency: offer.currency || 'RUB',
             expiryDate: expiryDate.toISOString(),
-            daysLeft
+            daysLeft,
+            isExpired: daysLeft < 0 // Флаг истекшего срока
           });
         }
       }
     });
 
-    // Сортируем по количеству оставшихся дней (от меньшего к большему)
-    expiringItems.sort((a, b) => a.daysLeft - b.daysLeft);
+    // Сортируем: сначала товары с истекшим сроком (daysLeft < 0), затем по количеству оставшихся дней
+    expiringItems.sort((a, b) => {
+      // Если один истек, а другой нет - истекший идет первым
+      if (a.isExpired && !b.isExpired) return -1;
+      if (!a.isExpired && b.isExpired) return 1;
+      // Если оба истекли или оба не истекли - сортируем по daysLeft
+      return a.daysLeft - b.daysLeft;
+    });
 
     res.json({
       items: expiringItems,
@@ -1388,6 +1400,115 @@ async function getProductSalesByStores(req, res) {
   }
 }
 
+// Возврат товара (уменьшение количества на складе)
+async function returnProduct(req, res) {
+  try {
+    const context = await getSalesRepStoresContext(req);
+    if (!context.isFound) {
+      return res.status(404).json({ error: 'Торговый представитель не найден' });
+    }
+
+    const { offerId, quantity, reason } = req.body;
+
+    if (!offerId || quantity === undefined || quantity <= 0) {
+      return res.status(400).json({ error: 'Отсутствуют обязательные поля или неверное количество' });
+    }
+
+    // Находим offer
+    const offer = await Offer.findOne({ id: offerId }).lean();
+    if (!offer) {
+      return res.status(404).json({ error: 'Товар не найден на складе' });
+    }
+
+    // Проверяем, что магазин принадлежит торговому представителю
+    if (!context.storeIds.includes(offer.storeId)) {
+      return res.status(403).json({ error: 'Нет доступа к этому магазину' });
+    }
+
+    // Проверяем наличие товара
+    const currentQuantity = offer.quantity || 0;
+    if (quantity > currentQuantity) {
+      return res.status(400).json({ 
+        error: 'Недостаточно товара на складе для возврата',
+        available: currentQuantity,
+        requested: quantity
+      });
+    }
+
+    // Получаем информацию о товаре
+    const product = await Product.findOne({ id: offer.productId }).lean();
+    if (!product) {
+      return res.status(404).json({ error: 'Товар не найден' });
+    }
+
+    // Получаем информацию о магазине
+    const store = await Store.findOne({ id: offer.storeId }).lean();
+    if (!store) {
+      return res.status(404).json({ error: 'Магазин не найден' });
+    }
+
+    // Получаем владельца магазина для логирования
+    const storeOwner = await User.findOne({ storeId: offer.storeId, role: 'STORE' }).lean();
+    const storeOwnerId = storeOwner ? storeOwner.id : null;
+
+    // Получаем ID торгового представителя
+    const linkIds = await resolveSalesRepLinkIds(req);
+    const salesRepId = linkIds.length > 0 ? linkIds[0] : null;
+
+    // Уменьшаем количество товара
+    const newQuantity = currentQuantity - quantity;
+    const updatedOffer = await Offer.findOneAndUpdate(
+      { id: offer.id },
+      { quantity: newQuantity, updatedAt: new Date() },
+      { new: true }
+    ).lean();
+
+    // Логируем действие возврата
+    if (storeOwnerId) {
+      const description = reason 
+        ? `Возврат товара "${product.name}" (SKU: ${product.sku}). Количество: -${quantity}, остаток: ${newQuantity}. Причина: ${reason}`
+        : `Возврат товара "${product.name}" (SKU: ${product.sku}). Количество: -${quantity}, остаток: ${newQuantity}`;
+      
+      await logStoreActivity(
+        offer.storeId,
+        storeOwnerId,
+        'RETURN_PRODUCT',
+        description,
+        {
+          productId: product.id,
+          productName: product.name,
+          sku: product.sku,
+          brandName: product.brandName,
+          quantity: quantity,
+          oldQuantity: currentQuantity,
+          newQuantity: newQuantity,
+          offerId: offer.id,
+          reason: reason || null,
+          returnedBy: 'SALES_REPRESENTATIVE',
+          salesRepresentativeId: salesRepId
+        }
+      );
+    }
+
+    res.json({
+      message: 'Товар возвращен',
+      offer: {
+        id: updatedOffer.id,
+        productId: product.id,
+        productName: product.name,
+        sku: product.sku,
+        storeId: offer.storeId,
+        storeName: store.name,
+        quantity: newQuantity,
+        returnedQuantity: quantity
+      }
+    });
+  } catch (error) {
+    console.error('Ошибка при возврате товара:', error);
+    res.status(500).json({ error: 'Ошибка при возврате товара' });
+  }
+}
+
 module.exports = {
   getMyProductGroups,
   getMyStockControl,
@@ -1398,6 +1519,7 @@ module.exports = {
   getMySalesAnalytics,
   getExpiringProducts,
   getPoorlySellingProducts,
-  getProductSalesByStores
+  getProductSalesByStores,
+  returnProduct
 };
 

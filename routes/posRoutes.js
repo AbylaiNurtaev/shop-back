@@ -12,7 +12,10 @@ const {
   completeSale,
   cancelSale,
   getSalesHistory,
-  getSalesStatistics
+  getSalesStatistics,
+  getWeeklyReport,
+  getWeeklyReports,
+  getDailyReport
 } = require('../controllers/posController');
 
 // Все маршруты требуют авторизации и роль продавца магазина
@@ -49,5 +52,10 @@ router.get('/sales', getSalesHistory);
 
 // Статистика продаж
 router.get('/sales/statistics', getSalesStatistics);
+
+// Недельные отчеты кассы
+router.get('/reports/weekly', getWeeklyReport); // Получение недельного отчета по дате
+router.get('/reports/weekly/list', getWeeklyReports); // Список недельных отчетов
+router.get('/reports/daily', getDailyReport); // Получение данных за конкретный день
 
 module.exports = router;

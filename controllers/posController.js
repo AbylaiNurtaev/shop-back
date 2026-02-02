@@ -2,7 +2,7 @@ const { generateId } = require('../utils/uuid');
 const { models } = require('../models/database');
 const mongoose = require('mongoose');
 
-const { Sale, Offer, Product, Store, User } = models;
+const { Sale, Offer, Product, Store, User, POSWeeklyReport } = models;
 
 // -----------------------------------------------------------------------------
 // АККАУНТ ПРОДАВЦА МАГАЗИНА
@@ -417,17 +417,170 @@ async function updateItemQuantity(req, res) {
   }
 }
 
+// Вспомогательная функция для получения начала недели (понедельник)
+function getWeekStart(date) {
+  const d = new Date(date);
+  const day = d.getDay();
+  const diff = d.getDate() - day + (day === 0 ? -6 : 1); // Понедельник
+  const monday = new Date(d.setDate(diff));
+  monday.setHours(0, 0, 0, 0);
+  return monday;
+}
+
+// Вспомогательная функция для получения конца недели (воскресенье)
+function getWeekEnd(weekStart) {
+  const sunday = new Date(weekStart);
+  sunday.setDate(sunday.getDate() + 6);
+  sunday.setHours(23, 59, 59, 999);
+  return sunday;
+}
+
+// Вспомогательная функция для получения или создания недельного отчета
+async function getOrCreateWeeklyReport(storeId, date, currency, session) {
+  const weekStart = getWeekStart(date);
+  const weekEnd = getWeekEnd(weekStart);
+
+  let report = await POSWeeklyReport.findOne({
+    storeId,
+    weekStartDate: weekStart
+  }).session(session);
+
+  if (!report) {
+    // Создаем новый недельный отчет с пустыми днями
+    const days = [];
+    for (let i = 0; i < 7; i++) {
+      const dayDate = new Date(weekStart);
+      dayDate.setDate(dayDate.getDate() + i);
+      days.push({
+        date: dayDate,
+        cashAmount: 0,
+        cardAmount: 0,
+        hybridAmount: 0,
+        totalAmount: 0,
+        salesCount: 0,
+        sales: []
+      });
+    }
+
+    report = await POSWeeklyReport.create([{
+      id: generateId(),
+      storeId,
+      weekStartDate: weekStart,
+      weekEndDate: weekEnd,
+      days,
+      weeklyTotal: {
+        cashAmount: 0,
+        cardAmount: 0,
+        hybridAmount: 0,
+        totalAmount: 0,
+        salesCount: 0
+      },
+      currency
+    }], { session });
+
+    report = report[0];
+  }
+
+  return report;
+}
+
+// Вспомогательная функция для обновления недельного отчета
+async function updateWeeklyReport(storeId, sale, session) {
+  const completedAt = sale.completedAt || new Date();
+  const weekStart = getWeekStart(completedAt);
+  const report = await getOrCreateWeeklyReport(storeId, completedAt, sale.currency, session);
+
+  // Находим день недели (0 = понедельник, 6 = воскресенье)
+  const dayOfWeek = completedAt.getDay();
+  const dayIndex = dayOfWeek === 0 ? 6 : dayOfWeek - 1; // Воскресенье = 6, понедельник = 0
+
+  if (!report.days[dayIndex]) {
+    // Если дня нет, создаем его
+    report.days[dayIndex] = {
+      date: new Date(completedAt),
+      cashAmount: 0,
+      cardAmount: 0,
+      hybridAmount: 0,
+      totalAmount: 0,
+      salesCount: 0,
+      sales: []
+    };
+  }
+
+  const dayData = report.days[dayIndex];
+
+  // Обновляем данные дня
+  dayData.salesCount += 1;
+  dayData.totalAmount += sale.totalAmount;
+
+  // Обновляем суммы по способам оплаты
+  if (sale.paymentMethod === 'CASH') {
+    dayData.cashAmount += sale.totalAmount;
+  } else if (sale.paymentMethod === 'CARD') {
+    dayData.cardAmount += sale.totalAmount;
+  } else if (sale.paymentMethod === 'HYBRID') {
+    dayData.hybridAmount += sale.totalAmount;
+    if (sale.cashAmount) dayData.cashAmount += sale.cashAmount;
+    if (sale.cardAmount) dayData.cardAmount += sale.cardAmount;
+  }
+
+  // Добавляем детализацию продажи
+  dayData.sales.push({
+    saleId: sale.id,
+    totalAmount: sale.totalAmount,
+    paymentMethod: sale.paymentMethod,
+    cashAmount: sale.cashAmount || null,
+    cardAmount: sale.cardAmount || null,
+    completedAt: completedAt
+  });
+
+  // Обновляем итоговые суммы за неделю
+  report.weeklyTotal.salesCount += 1;
+  report.weeklyTotal.totalAmount += sale.totalAmount;
+
+  if (sale.paymentMethod === 'CASH') {
+    report.weeklyTotal.cashAmount += sale.totalAmount;
+  } else if (sale.paymentMethod === 'CARD') {
+    report.weeklyTotal.cardAmount += sale.totalAmount;
+  } else if (sale.paymentMethod === 'HYBRID') {
+    report.weeklyTotal.hybridAmount += sale.totalAmount;
+    if (sale.cashAmount) report.weeklyTotal.cashAmount += sale.cashAmount;
+    if (sale.cardAmount) report.weeklyTotal.cardAmount += sale.cardAmount;
+  }
+
+  await report.save({ session });
+  return report;
+}
+
 // Завершение продажи (пробитие чека) - списание товаров со склада
 async function completeSale(req, res) {
   const session = await mongoose.startSession();
   session.startTransaction();
 
   try {
-    const { saleId } = req.body;
+    const { saleId, paymentMethod, cashAmount, cardAmount } = req.body;
 
     if (!saleId) {
       await session.abortTransaction();
       return res.status(400).json({ error: 'ID чека не указан' });
+    }
+
+    // Валидация способа оплаты
+    if (!paymentMethod || !['CASH', 'CARD', 'HYBRID'].includes(paymentMethod)) {
+      await session.abortTransaction();
+      return res.status(400).json({ error: 'Способ оплаты обязателен и должен быть CASH, CARD или HYBRID' });
+    }
+
+    // Валидация для гибридной оплаты
+    if (paymentMethod === 'HYBRID') {
+      if (cashAmount === undefined || cardAmount === undefined || cashAmount === null || cardAmount === null) {
+        await session.abortTransaction();
+        return res.status(400).json({ error: 'Для гибридной оплаты необходимо указать cashAmount и cardAmount' });
+      }
+      if (cashAmount < 0 || cardAmount < 0) {
+        await session.abortTransaction();
+        return res.status(400).json({ error: 'Суммы оплаты не могут быть отрицательными' });
+      }
     }
 
     const storeId = await getStoreIdForStoreSeller(req.user);
@@ -479,10 +632,16 @@ async function completeSale(req, res) {
       await offer.save({ session });
     }
 
-    // Завершаем продажу
+    // Сохраняем способ оплаты
+    sale.paymentMethod = paymentMethod;
+    sale.cashAmount = paymentMethod === 'HYBRID' ? cashAmount : (paymentMethod === 'CASH' ? sale.totalAmount : null);
+    sale.cardAmount = paymentMethod === 'HYBRID' ? cardAmount : (paymentMethod === 'CARD' ? sale.totalAmount : null);
     sale.status = 'COMPLETED';
     sale.completedAt = new Date();
     await sale.save({ session });
+
+    // Обновляем недельный отчет
+    await updateWeeklyReport(storeId, sale, session);
 
     await session.commitTransaction();
 
@@ -646,6 +805,162 @@ async function getSalesStatistics(req, res) {
   }
 }
 
+// Получение недельного отчета
+async function getWeeklyReport(req, res) {
+  try {
+    const storeId = await getStoreIdForStoreSeller(req.user);
+    if (!storeId) {
+      return res.status(404).json({ error: 'Магазин не найден для текущего пользователя' });
+    }
+
+    // Получаем дату из query параметра или используем текущую дату
+    const dateParam = req.query.date;
+    const targetDate = dateParam ? new Date(dateParam) : new Date();
+    
+    if (isNaN(targetDate.getTime())) {
+      return res.status(400).json({ error: 'Неверный формат даты' });
+    }
+
+    const weekStart = getWeekStart(targetDate);
+    
+    const report = await POSWeeklyReport.findOne({
+      storeId,
+      weekStartDate: weekStart
+    }).lean();
+
+    if (!report) {
+      // Возвращаем пустой отчет, если данных нет
+      const weekEnd = getWeekEnd(weekStart);
+      const days = [];
+      for (let i = 0; i < 7; i++) {
+        const dayDate = new Date(weekStart);
+        dayDate.setDate(dayDate.getDate() + i);
+        days.push({
+          date: dayDate,
+          cashAmount: 0,
+          cardAmount: 0,
+          hybridAmount: 0,
+          totalAmount: 0,
+          salesCount: 0,
+          sales: []
+        });
+      }
+
+      return res.json({
+        id: null,
+        storeId,
+        weekStartDate: weekStart,
+        weekEndDate: weekEnd,
+        days,
+        weeklyTotal: {
+          cashAmount: 0,
+          cardAmount: 0,
+          hybridAmount: 0,
+          totalAmount: 0,
+          salesCount: 0
+        },
+        currency: 'RUB'
+      });
+    }
+
+    res.json(report);
+  } catch (error) {
+    console.error('Ошибка при получении недельного отчета:', error);
+    res.status(500).json({ error: 'Ошибка при получении недельного отчета' });
+  }
+}
+
+// Получение списка недельных отчетов
+async function getWeeklyReports(req, res) {
+  try {
+    const storeId = await getStoreIdForStoreSeller(req.user);
+    if (!storeId) {
+      return res.status(404).json({ error: 'Магазин не найден для текущего пользователя' });
+    }
+
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
+
+    const [reports, total] = await Promise.all([
+      POSWeeklyReport.find({ storeId })
+        .sort({ weekStartDate: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      POSWeeklyReport.countDocuments({ storeId })
+    ]);
+
+    res.json({
+      items: reports,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit)
+    });
+  } catch (error) {
+    console.error('Ошибка при получении списка недельных отчетов:', error);
+    res.status(500).json({ error: 'Ошибка при получении списка недельных отчетов' });
+  }
+}
+
+// Получение данных за конкретный день
+async function getDailyReport(req, res) {
+  try {
+    const storeId = await getStoreIdForStoreSeller(req.user);
+    if (!storeId) {
+      return res.status(404).json({ error: 'Магазин не найден для текущего пользователя' });
+    }
+
+    const dateParam = req.query.date;
+    if (!dateParam) {
+      return res.status(400).json({ error: 'Параметр date обязателен' });
+    }
+
+    const targetDate = new Date(dateParam);
+    if (isNaN(targetDate.getTime())) {
+      return res.status(400).json({ error: 'Неверный формат даты' });
+    }
+
+    const weekStart = getWeekStart(targetDate);
+    const report = await POSWeeklyReport.findOne({
+      storeId,
+      weekStartDate: weekStart
+    }).lean();
+
+    if (!report) {
+      return res.json({
+        date: targetDate,
+        cashAmount: 0,
+        cardAmount: 0,
+        hybridAmount: 0,
+        totalAmount: 0,
+        salesCount: 0,
+        sales: []
+      });
+    }
+
+    // Находим день недели
+    const dayOfWeek = targetDate.getDay();
+    const dayIndex = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+
+    const dayData = report.days[dayIndex] || {
+      date: targetDate,
+      cashAmount: 0,
+      cardAmount: 0,
+      hybridAmount: 0,
+      totalAmount: 0,
+      salesCount: 0,
+      sales: []
+    };
+
+    res.json(dayData);
+  } catch (error) {
+    console.error('Ошибка при получении данных за день:', error);
+    res.status(500).json({ error: 'Ошибка при получении данных за день' });
+  }
+}
+
 module.exports = {
   getStoreSellerAccount,
   updateStoreSellerAccount,
@@ -657,5 +972,8 @@ module.exports = {
   completeSale,
   cancelSale,
   getSalesHistory,
-  getSalesStatistics
+  getSalesStatistics,
+  getWeeklyReport,
+  getWeeklyReports,
+  getDailyReport
 };
