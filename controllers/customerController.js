@@ -229,75 +229,40 @@ function extractBrandFromText(text, brands) {
 async function buildCandidatesByText(text) {
   if (!text || !text.trim()) return [];
 
-  const searchVariants = createSearchVariants(text);
-  if (searchVariants.length === 0) return [];
+  console.log(`🔍 AI семантический поиск для запроса: "${text}"`);
 
-  // Создаем запрос с учетом всех вариантов транслитерации
-  // Используем $or для поиска по любому из вариантов
-  const searchRegex = searchVariants.map(v => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  try {
+    // Получаем все оплаченные товары для AI поиска
+    const allProducts = await Product.find({
+      isPayed: true,
+      paymentExpiresAt: { $gt: new Date() }
+    }).limit(500).lean();
 
-  // Оптимизированный запрос - ищем по всем полям одновременно
-  const query = {
-    $and: [
-      {
-        $or: [
-          { name: { $regex: searchRegex, $options: 'i' } },
-          { description: { $regex: searchRegex, $options: 'i' } },
-          { brandName: { $regex: searchRegex, $options: 'i' } },
-          { sku: { $regex: searchRegex, $options: 'i' } },
-          { packageInfo: { $regex: searchRegex, $options: 'i' } }
-        ]
-      },
-      { isPayed: true },
-      { paymentExpiresAt: { $gt: new Date() } }
-    ]
-  };
-
-  // Сначала пробуем обычный поиск
-  let candidates = await Product.find(query).limit(50).lean();
-
-  // Если результатов мало (меньше 5) или нет результатов, используем AI для семантического поиска
-  if (candidates.length < 5) {
-    console.log(`Обычный поиск дал ${candidates.length} результатов, пробуем AI семантический поиск для "${text}"`);
-    
-    try {
-      // Получаем все оплаченные товары для AI поиска
-      const allProducts = await Product.find({
-        isPayed: true,
-        paymentExpiresAt: { $gt: new Date() }
-      }).limit(200).lean(); // Ограничиваем для производительности
-
-      if (allProducts.length > 0) {
-        const aiCandidates = await findProductsBySemanticSearch({
-          searchQuery: text,
-          allProducts: allProducts,
-          limit: 30
-        });
-
-        // Объединяем результаты: сначала AI результаты, потом обычные
-        const aiIds = new Set(aiCandidates.map(p => p.id));
-        const regularCandidates = candidates.filter(p => !aiIds.has(p.id));
-        candidates = [...aiCandidates, ...regularCandidates];
-
-        console.log(`AI семантический поиск добавил ${aiCandidates.length} товаров, итого: ${candidates.length}`);
-      }
-    } catch (error) {
-      console.error('Ошибка при AI семантическом поиске:', error);
-      // Продолжаем с обычными результатами
+    if (allProducts.length === 0) {
+      console.log('Нет доступных товаров для поиска');
+      return [];
     }
-  }
 
-  // Убираем дубликаты по ID
-  const uniqueCandidates = [];
-  const seenIds = new Set();
-  for (const candidate of candidates) {
-    if (!seenIds.has(candidate.id)) {
-      seenIds.add(candidate.id);
-      uniqueCandidates.push(candidate);
+    // Используем только AI семантический поиск
+    const candidates = await findProductsBySemanticSearch({
+      searchQuery: text,
+      allProducts: allProducts,
+      limit: 30
+    });
+
+    console.log(`✅ AI семантический поиск нашел ${candidates.length} товаров`);
+    if (candidates.length > 0) {
+      console.log('Найденные товары:');
+      candidates.forEach((product, index) => {
+        console.log(`  ${index + 1}. "${product.name || 'без названия'}" (бренд: ${product.brandName || 'нет'}, ID: ${product.id})`);
+      });
     }
-  }
 
-  return uniqueCandidates.slice(0, 30);
+    return candidates;
+  } catch (error) {
+    console.error('Ошибка при AI семантическом поиске:', error);
+    return [];
+  }
 }
 
 function buildClarificationQuestions(products, currentIntent) {
@@ -410,13 +375,13 @@ function filterCandidatesByIntent(candidates, intent) {
       }
       if (packageTypeLower === 'can' || packageTypeLower === 'металл' || packageTypeLower === 'банка') {
         // Ищем различные варианты обозначения жестяной/металлической банки
-        return fullText.includes('банка') || 
-               fullText.includes('can') || 
-               fullText.includes('жест') || 
-               fullText.includes('металл') ||
-               fullText.includes('жб') || // ЖБ = жестяная банка
-               fullText.includes('железн') ||
-               fullText.includes('металлическ');
+        return fullText.includes('банка') ||
+          fullText.includes('can') ||
+          fullText.includes('жест') ||
+          fullText.includes('металл') ||
+          fullText.includes('жб') || // ЖБ = жестяная банка
+          fullText.includes('железн') ||
+          fullText.includes('металлическ');
       }
       if (packageTypeLower === 'plastic' || packageTypeLower === 'пластик') {
         return fullText.includes('пласти') || fullText.includes('pet');
@@ -594,7 +559,7 @@ async function performSearch({ text, geo, radiusMeters, intent }) {
     let coords = null;
     let distance = null;
     let distanceFormatted = null;
-    
+
     // Вычисляем расстояние только если есть геолокация
     if (geo && geo.lat !== undefined && geo.lng !== undefined) {
       if (store.locationCoords && store.locationCoords.lat !== null && store.locationCoords.lng !== null) {
@@ -608,7 +573,7 @@ async function performSearch({ text, geo, radiusMeters, intent }) {
           );
         }
       }
-      
+
       if (coords) {
         distance = calculateDistance(geo.lat, geo.lng, coords.lat, coords.lon);
         distanceFormatted = formatDistance(Math.round(distance));
@@ -890,17 +855,17 @@ async function postMessage(req, res) {
     // Это важно для предотвращения повторных вопросов
     if (text && text.trim()) {
       const currentAnswer = normalizeText(text);
-      
+
       // Проверяем, является ли текущий ответ ответом на вопрос о таре
-      const isTaraAnswer = currentAnswer.includes('металл') || 
-                          currentAnswer.includes('стекло') || 
-                          currentAnswer.includes('банка') || 
-                          currentAnswer.includes('пластик') ||
-                          currentAnswer.includes('can') || 
-                          currentAnswer.includes('glass') ||
-                          currentAnswer.includes('plastic') ||
-                          currentAnswer.includes('жб');
-      
+      const isTaraAnswer = currentAnswer.includes('металл') ||
+        currentAnswer.includes('стекло') ||
+        currentAnswer.includes('банка') ||
+        currentAnswer.includes('пластик') ||
+        currentAnswer.includes('can') ||
+        currentAnswer.includes('glass') ||
+        currentAnswer.includes('plastic') ||
+        currentAnswer.includes('жб');
+
       if (isTaraAnswer && !intent.packageType) {
         // Обновляем intent на основе ответа пользователя
         if (currentAnswer.includes('металл') || currentAnswer.includes('банка') || currentAnswer.includes('can') || currentAnswer.includes('жб')) {
@@ -913,14 +878,14 @@ async function postMessage(req, res) {
         await intent.save();
         console.log('Обновлен intent.packageType на основе ответа пользователя:', intent.packageType);
       }
-      
+
       // Проверяем ответы на другие вопросы
-      const isTypeAnswer = currentAnswer.includes('classic') || 
-                          currentAnswer.includes('zero') || 
-                          currentAnswer.includes('light') ||
-                          currentAnswer.includes('классическая') ||
-                          currentAnswer.includes('ноль');
-      
+      const isTypeAnswer = currentAnswer.includes('classic') ||
+        currentAnswer.includes('zero') ||
+        currentAnswer.includes('light') ||
+        currentAnswer.includes('классическая') ||
+        currentAnswer.includes('ноль');
+
       if (isTypeAnswer && !intent.type) {
         if (currentAnswer.includes('classic') || currentAnswer.includes('классическая')) {
           intent.type = 'classic';

@@ -1,8 +1,8 @@
 const https = require('https');
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = 'gemini-2.0-flash-exp';
-const GEMINI_MODEL_FLASH = 'gemini-2.5-flash';
+const GEMINI_MODEL = 'gemini-2.0-flash';
+const GEMINI_MODEL_FLASH = 'gemini-2.0-flash';
 const GEMINI_API_VERSION = 'v1beta';
 
 // ============================================================================
@@ -135,8 +135,8 @@ async function findProductsBySemanticSearch({ searchQuery, allProducts, limit = 
     return [];
   }
 
-  // Ограничиваем количество товаров для анализа AI
-  const productsForAI = allProducts.slice(0, 100).map(p => ({
+  // Ограничиваем количество товаров для анализа AI (увеличено до 500 для лучшего покрытия)
+  const productsForAI = allProducts.slice(0, 500).map(p => ({
     id: p.id,
     name: p.name || '',
     brandName: p.brandName || '',
@@ -155,16 +155,25 @@ ${JSON.stringify(productsForAI, null, 2)}
 
 ОБЩИЕ ПРАВИЛА ПОИСКА:
 1. Учитывай синонимы и варианты написания (например: "банка" = "жестяная банка" = "металлическая банка" = "железная банка" = "ЖБ")
-2. Учитывай транслитерацию (например: "cola" = "кола", "coca" = "кока")
-3. Ищи по смыслу: если пользователь ищет "банка колы", найди товары где есть соответствующий бренд И тип упаковки "банка"
-4. Учитывай сокращения и аббревиатуры (например: "ЖБ" может означать "жестяная банка")
-5. Ищи по всем полям товара: название, бренд, описание, упаковка, SKU
+2. Учитывай транслитерацию (например: "cola" = "кола" = "колу" = "колы", "coca" = "кока" = "коки")
+3. Учитывай СКЛОНЕНИЯ русских слов: "кола" = "колу" = "колы" = "колой", "пепси" = "пепси" = "пепси-колы"
+4. Ищи по смыслу: если пользователь ищет "банка колы", найди товары где есть соответствующий бренд И тип упаковки "банка"
+5. Учитывай сокращения и аббревиатуры (например: "ЖБ" может означать "жестяная банка")
+6. Ищи по всем полям товара: название, бренд, описание, упаковка, SKU
+7. Если запрос короткий (1-2 слова), ищи частичные совпадения в любом поле товара
+
+ВАЖНО ДЛЯ ЗАПРОСОВ ТИПА "КОЛУ", "КОЛЫ":
+- "колу" = это склонение слова "кола" (винительный падеж)
+- Ищи товары с "Coca Cola", "Coca-Cola", "Кока-Кола", "Кола" в названии или бренде
+- Ищи товары с "Pepsi", "Пепси" если это может быть связано с запросом
+- Будь максимально гибким: даже частичное совпадение в бренде или названии - это результат
 
 ВАЖНО:
 - Ищи по СМЫСЛУ запроса, а не только по точным словам
 - Анализируй структуру запроса: бренд + тип товара + характеристики + упаковка
 - Если запрос содержит несколько параметров (например, "банка колы"), ищи товары, соответствующие ВСЕМ параметрам
 - Будь гибким: если точного совпадения нет, ищи частичные совпадения по ключевым словам
+- ВАЖНО: верни ВСЕ подходящие товары, даже если их много
 
 ФОРМАТ ОТВЕТА (ТОЛЬКО JSON):
 {
@@ -175,7 +184,7 @@ ${JSON.stringify(productsForAI, null, 2)}
 ВЕРНИ ТОЛЬКО JSON!`;
 
   try {
-    const response = await requestGemini(prompt, { maxOutputTokens: 500, timeout: 15000 });
+    const response = await requestGemini(prompt, { maxOutputTokens: 2000, timeout: 15000 });
     const parsed = extractJson(response);
 
     if (!parsed || !Array.isArray(parsed.matchedProductIds)) {
@@ -184,7 +193,25 @@ ${JSON.stringify(productsForAI, null, 2)}
     }
 
     const matchedIds = new Set(parsed.matchedProductIds);
+
+    // Логируем для отладки
+    console.log(`AI вернул ${matchedIds.size} ID товаров для запроса "${searchQuery}"`);
+    if (matchedIds.size > 0) {
+      const sampleIds = Array.from(matchedIds).slice(0, 3);
+      console.log(`Примеры ID от AI:`, sampleIds);
+    }
+
     const matchedProducts = allProducts.filter(p => matchedIds.has(p.id));
+
+    // Дополнительная проверка: если товары не найдены, проверяем формат ID
+    if (matchedProducts.length === 0 && matchedIds.size > 0) {
+      console.warn(`ВНИМАНИЕ: AI вернул ${matchedIds.size} ID, но товары не найдены в allProducts (${allProducts.length} товаров)`);
+      const firstAiId = Array.from(matchedIds)[0];
+      const firstProductId = allProducts[0]?.id;
+      console.log(`Пример ID от AI: "${firstAiId}" (тип: ${typeof firstAiId})`);
+      console.log(`Пример ID из БД: "${firstProductId}" (тип: ${typeof firstProductId})`);
+      console.log(`Совпадение: ${firstAiId === firstProductId}`);
+    }
 
     console.log(`Семантический поиск: найдено ${matchedProducts.length} товаров из ${allProducts.length} для запроса "${searchQuery}"`);
     if (parsed.reasoning) {
@@ -196,6 +223,95 @@ ${JSON.stringify(productsForAI, null, 2)}
     console.error('Ошибка семантического поиска через AI:', error.message);
     return [];
   }
+}
+
+// ============================================================================
+// УНИВЕРСАЛЬНОЕ ОПРЕДЕЛЕНИЕ ТИПОВ ТОВАРОВ ЧЕРЕЗ AI
+// ============================================================================
+
+async function extractProductTypesWithAI(candidates) {
+  if (!candidates || candidates.length === 0) {
+    return { types: new Set(), packageTypes: new Set() };
+  }
+
+  // Ограничиваем количество товаров для анализа
+  const productsForAnalysis = candidates.slice(0, 50).map(p => ({
+    name: p.name || '',
+    brandName: p.brandName || '',
+    description: p.description || '',
+    packageInfo: p.packageInfo || ''
+  }));
+
+  const prompt = `Ты эксперт по анализу товаров. Проанализируй список товаров и определи их варианты/типы.
+
+ДОСТУПНЫЕ ТОВАРЫ:
+${JSON.stringify(productsForAnalysis, null, 2)}
+
+ЗАДАЧА:
+1. Определи ВСЕ варианты/типы товаров (например: Classic, Zero, Light, Vanilla, Cherry для напитков; или другие варианты для других категорий товаров)
+2. Определи типы упаковки/тары (Стекло, Металл, Пластик и т.д.)
+
+ПРАВИЛА:
+- Анализируй названия, описания и другие поля товаров
+- Ищи различия между товарами одного бренда
+- Определяй варианты по вкусам, типам, характеристикам
+- Для упаковки определяй материал (стекло, металл, пластик)
+- Будь универсальным - это может быть любая категория товаров, не только напитки
+
+ФОРМАТ ОТВЕТА (ТОЛЬКО JSON):
+{
+  "types": ["Type1", "Type2", "Type3"],
+  "packageTypes": ["Стекло", "Металл", "Пластик"]
+}
+
+ВЕРНИ ТОЛЬКО JSON!`;
+
+  try {
+    const response = await requestGemini(prompt, { maxOutputTokens: 1000, timeout: 10000 });
+    const parsed = extractJson(response);
+
+    if (!parsed || !parsed.types || !parsed.packageTypes) {
+      console.warn('AI не смог определить типы товаров, используем fallback');
+      // Fallback на простой анализ
+      return extractProductTypesFallback(candidates);
+    }
+
+    const types = new Set(parsed.types || []);
+    const packageTypes = new Set(parsed.packageTypes || []);
+
+    console.log(`AI определил типы товаров: ${[...types].join(', ')}`);
+    console.log(`AI определил типы упаковки: ${[...packageTypes].join(', ')}`);
+
+    return { types, packageTypes };
+  } catch (error) {
+    console.error('Ошибка при определении типов через AI:', error.message);
+    // Fallback на простой анализ
+    return extractProductTypesFallback(candidates);
+  }
+}
+
+// Fallback функция для определения типов (простой анализ по ключевым словам)
+function extractProductTypesFallback(candidates) {
+  const types = new Set();
+  const packageTypes = new Set();
+
+  candidates.forEach(p => {
+    const text = `${p.name || ''} ${p.description || ''}`.toLowerCase();
+
+    // Определяем типы (универсальные ключевые слова)
+    if (text.includes('zero') || text.includes('ноль')) types.add('Zero');
+    if (text.includes('light') || text.includes('лайт')) types.add('Light');
+    if (text.includes('vanilla') || text.includes('ванил')) types.add('Vanilla');
+    if (text.includes('cherry') || text.includes('вишн')) types.add('Cherry');
+    if (text.includes('classic') || text.includes('классическая')) types.add('Classic');
+
+    // Определяем тип упаковки
+    if (text.includes('стекл') || text.includes('glass')) packageTypes.add('Стекло');
+    if (text.includes('банка') || text.includes('can') || text.includes('жест') || text.includes('металл') || text.includes('жб')) packageTypes.add('Металл');
+    if (text.includes('пласти') || text.includes('pet')) packageTypes.add('Пластик');
+  });
+
+  return { types, packageTypes };
 }
 
 // ============================================================================
@@ -337,26 +453,17 @@ async function generateClarificationQuestions({ candidates, known, previousQuest
   const brands = [...new Set(candidates.map(c => c.brandName).filter(Boolean))];
   const packages = [...new Set(candidates.map(c => c.packageInfo).filter(Boolean))];
 
-  const types = new Set();
-  const packageTypes = new Set();
-
-  candidates.forEach(p => {
-    const text = `${p.name || ''} ${p.description || ''}`.toLowerCase();
-
-    // Определяем тип напитка
-    if (text.includes('zero') || text.includes('ноль')) types.add('Zero');
-    if (text.includes('light') || text.includes('лайт')) types.add('Light');
-    if (text.includes('classic') || text.includes('классическая') ||
-      (!text.includes('zero') && !text.includes('light'))) types.add('Classic');
-
-    // Определяем тип упаковки
-    if (text.includes('стекл') || text.includes('glass')) packageTypes.add('Стекло');
-    if (text.includes('банка') || text.includes('can') || text.includes('жест') || text.includes('металл') || text.includes('жб')) packageTypes.add('Металл');
-    if (text.includes('пласти') || text.includes('pet')) packageTypes.add('Пластик');
-  });
+  // Используем AI для универсального определения типов/вариантов товаров
+  const { types, packageTypes } = await extractProductTypesWithAI(candidates);
 
   console.log('=== ГЕНЕРАЦИЯ ВОПРОСОВ ===');
   console.log('Всего товаров:', candidates.length);
+  if (candidates.length > 0) {
+    console.log('Найденные товары:');
+    candidates.forEach((product, index) => {
+      console.log(`  ${index + 1}. "${product.name || 'без названия'}" (бренд: ${product.brandName || 'нет'}, ID: ${product.id})`);
+    });
+  }
   console.log('Известно:', known);
   console.log('Бренды (' + brands.length + '):', brands);
   console.log('Упаковки (' + packages.length + '):', packages);
