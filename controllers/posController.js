@@ -28,7 +28,10 @@ async function getStoreSellerAccount(req, res) {
     return res.json({
       id: user.id,
       role: user.role,
-      name: user.firstName || null,
+      firstName: user.firstName || null,
+      lastName: user.lastName || null,
+      middleName: user.middleName || null,
+      phoneNumber: user.phoneNumber || null,
       email: user.email,
       storeId: user.storeId || null,
       storeName: store ? store.name : null
@@ -39,22 +42,43 @@ async function getStoreSellerAccount(req, res) {
   }
 }
 
-// Обновление настроек аккаунта продавца магазина (сейчас только имя)
+// Обновление настроек аккаунта продавца магазина
 async function updateStoreSellerAccount(req, res) {
   try {
     if (!req.user || !req.user.userId) {
       return res.status(401).json({ error: 'Требуется авторизация' });
     }
 
-    const { name } = req.body;
+    const { firstName, lastName, middleName, phoneNumber } = req.body;
 
-    if (!name || typeof name !== 'string' || !name.trim()) {
-      return res.status(400).json({ error: 'Поле name обязательно' });
+    // Валидация обязательных полей
+    if (firstName !== undefined && (!firstName || typeof firstName !== 'string' || !firstName.trim())) {
+      return res.status(400).json({ error: 'Поле firstName должно быть непустой строкой' });
+    }
+
+    if (lastName !== undefined && (!lastName || typeof lastName !== 'string' || !lastName.trim())) {
+      return res.status(400).json({ error: 'Поле lastName должно быть непустой строкой' });
+    }
+
+    // Проверяем, есть ли что обновлять
+    const update = { updatedAt: new Date() };
+    if (firstName !== undefined) update.firstName = firstName.trim();
+    if (lastName !== undefined) update.lastName = lastName.trim();
+    if (middleName !== undefined) {
+      update.middleName = middleName === null || middleName === '' ? null : middleName.trim();
+    }
+    if (phoneNumber !== undefined) {
+      update.phoneNumber = phoneNumber === null || phoneNumber === '' ? null : phoneNumber.trim();
+    }
+
+    // Если только updatedAt, значит нет полей для обновления
+    if (Object.keys(update).length === 1) {
+      return res.status(400).json({ error: 'Нет полей для обновления' });
     }
 
     const updatedUser = await User.findOneAndUpdate(
       { id: req.user.userId, role: 'STORE_SELLER' },
-      { firstName: name.trim(), updatedAt: new Date() },
+      update,
       { new: true }
     ).lean();
 
@@ -62,12 +86,21 @@ async function updateStoreSellerAccount(req, res) {
       return res.status(404).json({ error: 'Пользователь не найден' });
     }
 
+    let store = null;
+    if (updatedUser.storeId) {
+      store = await Store.findOne({ id: updatedUser.storeId }).lean();
+    }
+
     return res.json({
       id: updatedUser.id,
       role: updatedUser.role,
-      name: updatedUser.firstName || null,
+      firstName: updatedUser.firstName || null,
+      lastName: updatedUser.lastName || null,
+      middleName: updatedUser.middleName || null,
+      phoneNumber: updatedUser.phoneNumber || null,
       email: updatedUser.email,
-      storeId: updatedUser.storeId || null
+      storeId: updatedUser.storeId || null,
+      storeName: store ? store.name : null
     });
   } catch (error) {
     console.error('Ошибка при обновлении аккаунта продавца магазина:', error);

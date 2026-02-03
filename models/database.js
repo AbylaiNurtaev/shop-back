@@ -58,6 +58,8 @@ const userSchema = new mongoose.Schema(
     email: { type: String, required: true },
     firstName: { type: String, required: false },
     lastName: { type: String, required: false },
+    middleName: { type: String, required: false },
+    phoneNumber: { type: String, required: false },
     storeId: { type: String, default: null },
     distributorId: { type: String, default: null },
     isActive: { type: Boolean, default: true },
@@ -97,7 +99,8 @@ const distributorSchema = new mongoose.Schema(
     address: { type: String, required: true },
     location: { type: String, default: null },
     description: { type: String, default: null },
-    photos: { type: [String], default: [] }
+    photos: { type: [String], default: [] },
+    categoryIds: { type: [String], default: [] }
   },
   baseSchemaOptions
 );

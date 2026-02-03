@@ -3,7 +3,7 @@ const { models } = require('../models/database');
 const { logDistributorActivity } = require('../utils/distributorActivityLogger');
 const { createNotificationForDistributorUsers, createNotificationForBrandUsers } = require('./notificationController');
 
-const { Distributor, User, Store, Brand, BrandDistributorRequest, SalesRepresentative, SalesRepresentativeStore, SalesRepresentativeProduct, Product, Offer, Sale, Plan, DistributorProductPrice, DistributorActivityHistory } = models;
+const { Distributor, User, Store, Brand, BrandDistributorRequest, SalesRepresentative, SalesRepresentativeStore, SalesRepresentativeProduct, Product, Offer, Sale, Plan, DistributorProductPrice, DistributorActivityHistory, Category } = models;
 
 const STORE_ROLES = ['STORE', 'STORE_USER'];
 
@@ -147,8 +147,9 @@ async function getDistributors(req, res) {
       // Пока оставим это для будущей реализации
     }
 
-    // Добавляем информацию о количестве активных магазинов для каждого дистрибьютора
     const distributorIds = distributors.map(d => d.id);
+
+    // Получаем количество активных магазинов
     const storeCounts = await User.aggregate([
       {
         $match: {
@@ -170,11 +171,129 @@ async function getDistributors(req, res) {
       storeCountMap[item._id] = item.count;
     });
 
-    // Добавляем количество магазинов к каждому дистрибьютору
-    const distributorsWithStores = distributors.map(distributor => ({
-      ...distributor,
-      activeStoresCount: storeCountMap[distributor.id] || 0
-    }));
+    // Получаем торговых представителей для всех дистрибьюторов
+    const salesReps = await SalesRepresentative.find({
+      distributorId: { $in: distributorIds }
+    }).lean();
+
+    const salesRepsByDistributor = {};
+    salesReps.forEach(rep => {
+      if (!salesRepsByDistributor[rep.distributorId]) {
+        salesRepsByDistributor[rep.distributorId] = [];
+      }
+      salesRepsByDistributor[rep.distributorId].push({
+        id: rep.id,
+        name: rep.name,
+        firstName: rep.firstName,
+        lastName: rep.lastName,
+        middleName: rep.middleName,
+        email: rep.email,
+        phoneNumber: rep.phoneNumber,
+        createdAt: rep.createdAt,
+        updatedAt: rep.updatedAt
+      });
+    });
+
+    // Получаем пользователей дистрибьюторов (для контактной информации)
+    const distributorUsers = await User.find({
+      distributorId: { $in: distributorIds },
+      role: 'DISTRIBUTOR',
+      isActive: true
+    }).lean();
+
+    const usersByDistributor = {};
+    distributorUsers.forEach(user => {
+      if (!usersByDistributor[user.distributorId]) {
+        usersByDistributor[user.distributorId] = [];
+      }
+      usersByDistributor[user.distributorId].push({
+        id: user.id,
+        email: user.email,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        isActive: user.isActive,
+        currency: user.currency
+      });
+    });
+
+    // Получаем магазины дистрибьюторов
+    const storeUsers = await User.find({
+      distributorId: { $in: distributorIds },
+      role: { $in: STORE_ROLES },
+      isActive: true
+    }).lean();
+
+    const storeIds = [...new Set(storeUsers.map(u => u.storeId).filter(Boolean))];
+    const stores = storeIds.length > 0 
+      ? await Store.find({ id: { $in: storeIds } }).lean()
+      : [];
+
+    const storesMap = new Map(stores.map(s => [s.id, s]));
+    const storesByDistributor = {};
+    
+    storeUsers.forEach(user => {
+      if (user.distributorId && user.storeId) {
+        if (!storesByDistributor[user.distributorId]) {
+          storesByDistributor[user.distributorId] = [];
+        }
+        const store = storesMap.get(user.storeId);
+        if (store) {
+          storesByDistributor[user.distributorId].push({
+            id: store.id,
+            name: store.name,
+            address: store.address,
+            location: store.location,
+            locationCoords: store.locationCoords,
+            city: store.city,
+            phoneNumber: store.phoneNumber,
+            firstName: store.firstName,
+            lastName: store.lastName,
+            middleName: store.middleName,
+            description: store.description,
+            photos: store.photos,
+            createdAt: store.createdAt,
+            updatedAt: store.updatedAt
+          });
+        }
+      }
+    });
+
+    // Получаем информацию о подключении к брендам (если передан brandId)
+    let brandConnectionMap = {};
+    if (brandId) {
+      const brandRequests = await BrandDistributorRequest.find({
+        distributorId: { $in: distributorIds },
+        brandId: brandId
+      }).lean();
+
+      brandRequests.forEach(req => {
+        brandConnectionMap[req.distributorId] = {
+          status: req.status,
+          requestedAt: req.createdAt,
+          respondedAt: req.updatedAt
+        };
+      });
+    }
+
+    // Формируем полную информацию о дистрибьюторах
+    const distributorsWithFullInfo = distributors.map(distributor => {
+      const distributorInfo = {
+        ...distributor,
+        activeStoresCount: storeCountMap[distributor.id] || 0,
+        salesRepresentatives: salesRepsByDistributor[distributor.id] || [],
+        salesRepresentativesCount: (salesRepsByDistributor[distributor.id] || []).length,
+        users: usersByDistributor[distributor.id] || [],
+        stores: storesByDistributor[distributor.id] || [],
+        storesCount: (storesByDistributor[distributor.id] || []).length
+      };
+
+      // Добавляем информацию о подключении к бренду, если передан brandId
+      if (brandId && brandConnectionMap[distributor.id]) {
+        distributorInfo.brandConnection = brandConnectionMap[distributor.id];
+      }
+
+      return distributorInfo;
+    });
 
     // Если передан brandId, группируем дистрибьюторов на прикрепленные и неприкрепленные
     if (brandId) {
@@ -189,10 +308,10 @@ async function getDistributors(req, res) {
       );
 
       // Разделяем дистрибьюторов на две группы
-      const attached = distributorsWithStores.filter(d =>
+      const attached = distributorsWithFullInfo.filter(d =>
         attachedDistributorIds.has(d.id)
       );
-      const notAttached = distributorsWithStores.filter(d =>
+      const notAttached = distributorsWithFullInfo.filter(d =>
         !attachedDistributorIds.has(d.id)
       );
 
@@ -208,10 +327,10 @@ async function getDistributors(req, res) {
       });
     }
 
-    // Если brandId не передан, возвращаем результат в старом формате
+    // Если brandId не передан, возвращаем результат с полной информацией
     res.json({
-      items: distributorsWithStores,
-      total: distributorsWithStores.length
+      items: distributorsWithFullInfo,
+      total: distributorsWithFullInfo.length
     });
   } catch (error) {
     console.error('Ошибка при получении списка дистрибьюторов:', error);
@@ -327,9 +446,11 @@ async function updateMyDistributorName(req, res) {
       return res.status(401).json({ error: 'Токен доступа отсутствует' });
     }
 
-    const { name } = req.body;
-    if (!name || typeof name !== 'string' || name.trim().length === 0) {
-      return res.status(400).json({ error: 'Имя обязательно и не должно быть пустым' });
+    const { name, country, city, categoryIds } = req.body;
+    
+    // Проверяем, что хотя бы одно поле передано для обновления
+    if (name === undefined && country === undefined && city === undefined && categoryIds === undefined) {
+      return res.status(400).json({ error: 'Необходимо передать хотя бы одно поле для обновления (name, country, city, categoryIds)' });
     }
 
     const user = await models.User.findOne({ id: userId }).lean();
@@ -338,9 +459,77 @@ async function updateMyDistributorName(req, res) {
     }
 
     const oldDistributor = await Distributor.findOne({ id: user.distributorId }).lean();
+    if (!oldDistributor) {
+      return res.status(404).json({ error: 'Дистрибьютор не найден' });
+    }
+
+    const update = { updatedAt: new Date() };
+    const changes = [];
+
+    // Обновление имени
+    if (name !== undefined) {
+      if (typeof name !== 'string' || name.trim().length === 0) {
+        return res.status(400).json({ error: 'Имя обязательно и не должно быть пустым' });
+      }
+      update.name = name.trim();
+      if (oldDistributor.name !== name.trim()) {
+        changes.push(`имя: "${oldDistributor.name}" → "${name.trim()}"`);
+      }
+    }
+
+    // Обновление страны
+    if (country !== undefined) {
+      if (typeof country !== 'string' || country.trim().length === 0) {
+        return res.status(400).json({ error: 'Страна должна быть непустой строкой' });
+      }
+      update.country = country.trim();
+      if (oldDistributor.country !== country.trim()) {
+        changes.push(`страна: "${oldDistributor.country}" → "${country.trim()}"`);
+      }
+    }
+
+    // Обновление города
+    if (city !== undefined) {
+      if (typeof city !== 'string' || city.trim().length === 0) {
+        return res.status(400).json({ error: 'Город должен быть непустой строкой' });
+      }
+      update.city = city.trim();
+      if (oldDistributor.city !== city.trim()) {
+        changes.push(`город: "${oldDistributor.city}" → "${city.trim()}"`);
+      }
+    }
+
+    // Обновление категорий
+    if (categoryIds !== undefined) {
+      if (!Array.isArray(categoryIds)) {
+        return res.status(400).json({ error: 'categoryIds должен быть массивом' });
+      }
+      
+      // Проверяем, что все категории существуют
+      if (categoryIds.length > 0) {
+        const validCategories = await Category.find({ id: { $in: categoryIds } }).lean();
+        const validCategoryIds = validCategories.map(cat => cat.id);
+        const invalidCategoryIds = categoryIds.filter(id => !validCategoryIds.includes(id));
+        
+        if (invalidCategoryIds.length > 0) {
+          return res.status(400).json({ 
+            error: `Следующие категории не найдены: ${invalidCategoryIds.join(', ')}` 
+          });
+        }
+      }
+      
+      update.categoryIds = categoryIds;
+      const oldCategoryIds = oldDistributor.categoryIds || [];
+      const oldIdsStr = oldCategoryIds.join(', ');
+      const newIdsStr = categoryIds.join(', ');
+      if (oldIdsStr !== newIdsStr) {
+        changes.push(`категории: [${oldIdsStr || 'нет'}] → [${newIdsStr || 'нет'}]`);
+      }
+    }
+
     const distributor = await Distributor.findOneAndUpdate(
       { id: user.distributorId },
-      { name: name.trim(), updatedAt: new Date() },
+      update,
       { new: true }
     ).lean();
 
@@ -348,18 +537,29 @@ async function updateMyDistributorName(req, res) {
       return res.status(404).json({ error: 'Дистрибьютор не найден' });
     }
 
-    // Логируем действие
-    await logDistributorActivity(
-      user.distributorId,
-      'UPDATE_NAME',
-      `Обновлено имя дистрибьютора с "${oldDistributor?.name || 'неизвестно'}" на "${name.trim()}"`,
-      { oldName: oldDistributor?.name, newName: name.trim() }
-    );
+    // Логируем действие, если были изменения
+    if (changes.length > 0) {
+      await logDistributorActivity(
+        user.distributorId,
+        'UPDATE_SETTINGS',
+        `Обновлены настройки дистрибьютора: ${changes.join(', ')}`,
+        { 
+          oldName: oldDistributor.name, 
+          newName: distributor.name,
+          oldCountry: oldDistributor.country,
+          newCountry: distributor.country,
+          oldCity: oldDistributor.city,
+          newCity: distributor.city,
+          oldCategoryIds: oldDistributor.categoryIds || [],
+          newCategoryIds: distributor.categoryIds || []
+        }
+      );
+    }
 
     res.json(distributor);
   } catch (error) {
-    console.error('Ошибка при обновлении имени дистрибьютора:', error);
-    res.status(500).json({ error: 'Ошибка при обновлении имени дистрибьютора' });
+    console.error('Ошибка при обновлении настроек дистрибьютора:', error);
+    res.status(500).json({ error: 'Ошибка при обновлении настроек дистрибьютора' });
   }
 }
 

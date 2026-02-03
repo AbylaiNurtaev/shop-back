@@ -4,7 +4,7 @@ const { models } = require('../models/database');
 const { generateId } = require('../utils/uuid');
 const { sendEmail } = require('../utils/email');
 
-const { AuthCredential, User, VerificationCode, Brand, Distributor, SalesRepresentative, Store } = models;
+const { AuthCredential, User, VerificationCode, Brand, Distributor, SalesRepresentative, Store, Category } = models;
 
 async function login(req, res) {
   try {
@@ -297,7 +297,7 @@ async function registerDistributor(req, res) {
   let email = null;
 
   try {
-    const { companyName, country, city, email: emailParam, password, demo } = req.body;
+    const { companyName, country, city, email: emailParam, password, demo, categoryIds } = req.body;
     email = emailParam;
 
     // Валидация обязательных полей
@@ -352,6 +352,29 @@ async function registerDistributor(req, res) {
     const existingCredential = await AuthCredential.findOne({ login: email }).lean();
     if (existingCredential) {
       await AuthCredential.deleteOne({ login: email });
+    }
+
+    // Валидация категорий, если они переданы
+    let validatedCategoryIds = [];
+    if (categoryIds !== undefined) {
+      if (!Array.isArray(categoryIds)) {
+        return res.status(400).json({ error: 'categoryIds должен быть массивом' });
+      }
+      
+      // Проверяем, что все категории существуют
+      if (categoryIds.length > 0) {
+        const validCategories = await Category.find({ id: { $in: categoryIds } }).lean();
+        const validCategoryIds = validCategories.map(cat => cat.id);
+        const invalidCategoryIds = categoryIds.filter(id => !validCategoryIds.includes(id));
+        
+        if (invalidCategoryIds.length > 0) {
+          return res.status(400).json({ 
+            error: `Следующие категории не найдены: ${invalidCategoryIds.join(', ')}` 
+          });
+        }
+        
+        validatedCategoryIds = categoryIds;
+      }
     }
 
     const userId = generateId();
@@ -410,7 +433,8 @@ async function registerDistributor(req, res) {
         city,
         address: `${city}, ${country}`, // Временный адрес, можно будет обновить позже
         description: null,
-        photos: []
+        photos: [],
+        categoryIds: validatedCategoryIds
       });
 
       // Обновляем пользователя с distributorId
@@ -633,13 +657,13 @@ async function registerStoreSeller(req, res) {
   let email = null;
 
   try {
-    const { email: emailParam, password, name, storeId } = req.body;
+    const { email: emailParam, password, firstName, lastName, middleName, phoneNumber, storeId } = req.body;
     email = emailParam;
 
     // Валидация обязательных полей
-    if (!name || !email || !password || !storeId) {
+    if (!firstName || !lastName || !email || !password || !storeId) {
       return res.status(400).json({
-        error: 'Отсутствуют обязательные поля: name, email, password, storeId'
+        error: 'Отсутствуют обязательные поля: firstName, lastName, email, password, storeId'
       });
     }
 
@@ -679,7 +703,10 @@ async function registerStoreSeller(req, res) {
         id: userId,
         role: 'STORE_SELLER',
         email,
-        firstName: name,
+        firstName,
+        lastName,
+        middleName: middleName || null,
+        phoneNumber: phoneNumber || null,
         storeId: storeId,
         distributorId: null,
         isActive: true
@@ -727,7 +754,10 @@ async function registerStoreSeller(req, res) {
         id: userId,
         role: 'STORE_SELLER',
         email,
-        firstName: name,
+        firstName,
+        lastName,
+        middleName: middleName || null,
+        phoneNumber: phoneNumber || null,
         storeId: storeId,
         storeName: store.name
       },
