@@ -297,7 +297,7 @@ async function registerDistributor(req, res) {
   let email = null;
 
   try {
-    const { companyName, country, city, email: emailParam, password } = req.body;
+    const { companyName, country, city, email: emailParam, password, demo } = req.body;
     email = emailParam;
 
     // Валидация обязательных полей
@@ -313,23 +313,26 @@ async function registerDistributor(req, res) {
       return res.status(400).json({ error: 'Некорректный формат email' });
     }
 
-    // Проверяем, что для этого email был отправлен код верификации
-    // (подтверждает, что email был проверен через /auth/verification/send)
-    const verification = await VerificationCode.findOne({
-      email
-    }).sort({ expiresAt: -1 }).lean();
+    // Проверяем код верификации только если не демо-режим
+    if (!demo) {
+      // Проверяем, что для этого email был отправлен код верификации
+      // (подтверждает, что email был проверен через /auth/verification/send)
+      const verification = await VerificationCode.findOne({
+        email
+      }).sort({ expiresAt: -1 }).lean();
 
-    if (!verification) {
-      return res.status(400).json({ 
-        error: 'Email не подтвержден. Сначала отправьте код верификации на email' 
-      });
-    }
+      if (!verification) {
+        return res.status(400).json({ 
+          error: 'Email не подтвержден. Сначала отправьте код верификации на email' 
+        });
+      }
 
-    // Проверяем, что код еще не истек (подтверждает, что email был проверен недавно)
-    if (new Date() > verification.expiresAt) {
-      return res.status(400).json({ 
-        error: 'Срок действия подтверждения email истек. Пожалуйста, отправьте код верификации заново' 
-      });
+      // Проверяем, что код еще не истек (подтверждает, что email был проверен недавно)
+      if (new Date() > verification.expiresAt) {
+        return res.status(400).json({ 
+          error: 'Срок действия подтверждения email истек. Пожалуйста, отправьте код верификации заново' 
+        });
+      }
     }
 
     // Проверяем, что email ещё не занят

@@ -34,7 +34,8 @@ function requireStoreOwner(req, res, next) {
     return res.status(401).json({ error: 'Требуется авторизация' });
   }
 
-  if (req.user.role !== 'STORE') {
+  const normalizedRole = String(req.user.role || '').toUpperCase();
+  if (normalizedRole !== 'STORE' && normalizedRole !== 'STORE_USER') {
     return res.status(403).json({ error: 'Доступ запрещен. Требуются права владельца магазина' });
   }
 

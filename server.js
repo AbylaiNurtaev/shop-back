@@ -4,6 +4,7 @@ const cors = require('cors');
 const authRoutes = require('./routes/authRoutes');
 const userRoutes = require('./routes/userRoutes');
 const storeRoutes = require('./routes/storeRoutes');
+const storeExpenseRoutes = require('./routes/storeExpenseRoutes');
 const distributorRoutes = require('./routes/distributorRoutes');
 const salesRepRoutes = require('./routes/salesRepRoutes');
 const brandRoutes = require('./routes/brandRoutes');
@@ -32,6 +33,7 @@ app.use(express.urlencoded({ extended: true }));
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/stores', storeRoutes);
+app.use('/api/store-expenses', storeExpenseRoutes);
 app.use('/api/distributors', distributorRoutes);
 app.use('/api/sales-reps', salesRepRoutes);
 app.use('/api/sales-representatives', salesRepRoutes); // Алиас для совместимости

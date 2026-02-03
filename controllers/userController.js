@@ -20,12 +20,15 @@ async function createUser(req, res) {
       role,
       email,
       firstName,
+      lastName,
+      middleName,
       storeId,
       distributorId,
       isActive,
       store,
       distributor,
-      password
+      password,
+      demo
     } = req.body;
 
     if (!role || !email) {
@@ -54,12 +57,17 @@ async function createUser(req, res) {
     let resolvedDistributorId = distributorId || null;
 
     if (store) {
-      const { name, address, location, description, photos, images, firstName, lastName, middleName, phoneNumber } = store;
+      // Берем firstName, lastName, middleName сначала с верхнего уровня, потом из store
+      const storeFirstName = firstName || store.firstName;
+      const storeLastName = lastName || store.lastName;
+      const storeMiddleName = middleName || store.middleName;
+      
+      const { name, address, location, description, photos, images, phoneNumber } = store;
       const normalizedLocation = normalizeLocation(location);
       if (!name || !address || !normalizedLocation) {
         return res.status(400).json({ error: 'Отсутствуют обязательные поля магазина' });
       }
-      if (!firstName || !lastName) {
+      if (!storeFirstName || !storeLastName) {
         return res.status(400).json({ error: 'Фамилия и Имя обязательны для заполнения при создании магазина' });
       }
       const coords = await getCoordinatesFromLink(normalizedLocation);
@@ -71,9 +79,9 @@ async function createUser(req, res) {
         locationCoords: coords ? { lat: coords.lat, lng: coords.lon } : null,
         description: description || null,
         photos: photos || images || [],
-        firstName: firstName || null,
-        lastName: lastName || null,
-        middleName: middleName || null,
+        firstName: storeFirstName,
+        lastName: storeLastName,
+        middleName: storeMiddleName || null,
         phoneNumber: phoneNumber || null
       });
       resolvedStoreId = createdStore.id;
@@ -106,9 +114,10 @@ async function createUser(req, res) {
 
     const user = await User.create({
       id: generateId(),
-      role,
+      role: normalizedRole,
       email,
       firstName: firstName || null,
+      lastName: lastName || null,
       storeId: resolvedStoreId,
       distributorId: resolvedDistributorId,
       isActive: isActive !== undefined ? isActive : true,
@@ -120,7 +129,13 @@ async function createUser(req, res) {
       password: hashPassword(password)
     });
 
-    const payload = { login: email, userId: user.id };
+    const payload = { 
+      login: email, 
+      userId: user.id, 
+      role: normalizedRole,
+      ...(resolvedStoreId ? { storeId: resolvedStoreId } : {}),
+      ...(resolvedDistributorId ? { distributorId: resolvedDistributorId } : {})
+    };
     const accessToken = generateAccessToken(payload);
     const refreshToken = generateRefreshToken(payload);
 

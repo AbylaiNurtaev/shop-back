@@ -610,6 +610,23 @@ const notificationSchema = new mongoose.Schema(
 notificationSchema.index({ userId: 1, isRead: 1 });
 notificationSchema.index({ userId: 1, createdAt: -1 });
 
+// Схема расходов магазина
+const storeExpenseSchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true, unique: true },
+    storeId: { type: String, required: true, index: true },
+    storeOwnerId: { type: String, required: true, index: true }, // ID владельца магазина (userId)
+    name: { type: String, required: true }, // Название расхода (например, "Аренда", "Интернет")
+    amount: { type: Number, required: true, min: 0 }, // Сумма расхода
+    currency: { type: String, required: true, default: 'KZT' } // Валюта
+  },
+  baseSchemaOptions
+);
+
+// Индексы для оптимизации запросов
+storeExpenseSchema.index({ storeId: 1, createdAt: -1 });
+storeExpenseSchema.index({ storeOwnerId: 1, createdAt: -1 });
+
 // Схема данных за один день в недельном отчете
 const posDailyDataSchema = new mongoose.Schema({
   date: { type: Date, required: true }, // Дата дня
@@ -718,6 +735,8 @@ const StoreActivityHistory =
   mongoose.models.StoreActivityHistory || mongoose.model('StoreActivityHistory', storeActivityHistorySchema);
 const Notification =
   mongoose.models.Notification || mongoose.model('Notification', notificationSchema);
+const StoreExpense =
+  mongoose.models.StoreExpense || mongoose.model('StoreExpense', storeExpenseSchema);
 const POSWeeklyReport =
   mongoose.models.POSWeeklyReport || mongoose.model('POSWeeklyReport', posWeeklyReportSchema);
 
@@ -853,6 +872,7 @@ module.exports = {
     InvoiceHistory,
     StoreActivityHistory,
     Notification,
+    StoreExpense,
     POSWeeklyReport
   }
 };

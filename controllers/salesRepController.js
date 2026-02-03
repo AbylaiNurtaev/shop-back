@@ -449,9 +449,10 @@ async function getMySalesRepresentative(req, res) {
       return res.status(404).json({ error: 'Торговый представитель не найден' });
     }
 
-    // Возвращаем email, firstName, lastName, middleName, phoneNumber
+    // Возвращаем id, email, firstName, lastName, middleName, phoneNumber
     // Приоритет: данные из SalesRepresentative (более полные), если нет - из User
     const result = {
+      id: salesRep?.id || user?.id || null,
       email: user ? user.email : salesRep.email,
       firstName: salesRep?.firstName || user?.firstName || null,
       lastName: salesRep?.lastName || user?.lastName || null,
