@@ -394,6 +394,17 @@ const verificationCodeSchema = new mongoose.Schema(
   baseSchemaOptions
 );
 
+const phoneVerificationCodeSchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true, unique: true },
+    phoneNumber: { type: String, required: true, index: true },
+    code: { type: String, required: true },
+    expiresAt: { type: Date, required: true, index: { expires: 0 } },
+    used: { type: Boolean, default: false }
+  },
+  baseSchemaOptions
+);
+
 const brandDistributorRequestSchema = new mongoose.Schema(
   {
     id: { type: String, required: true, unique: true },
@@ -718,6 +729,8 @@ const AuthCredential =
   mongoose.models.AuthCredential || mongoose.model('AuthCredential', authCredentialSchema);
 const VerificationCode =
   mongoose.models.VerificationCode || mongoose.model('VerificationCode', verificationCodeSchema);
+const PhoneVerificationCode =
+  mongoose.models.PhoneVerificationCode || mongoose.model('PhoneVerificationCode', phoneVerificationCodeSchema);
 const BrandDistributorRequest =
   mongoose.models.BrandDistributorRequest || mongoose.model('BrandDistributorRequest', brandDistributorRequestSchema);
 const CategoryRequest =
@@ -865,6 +878,7 @@ module.exports = {
     AuditEvent,
     AuthCredential,
     VerificationCode,
+    PhoneVerificationCode,
     BrandDistributorRequest,
     CategoryRequest,
     Plan,

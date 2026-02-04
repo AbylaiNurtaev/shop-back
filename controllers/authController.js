@@ -3,8 +3,115 @@ const { hashPassword, verifyPassword, isHashed } = require('../utils/password');
 const { models } = require('../models/database');
 const { generateId } = require('../utils/uuid');
 const { sendEmail } = require('../utils/email');
+const axios = require('axios');
 
-const { AuthCredential, User, VerificationCode, Brand, Distributor, SalesRepresentative, Store, Category } = models;
+const { AuthCredential, User, VerificationCode, PhoneVerificationCode, Brand, Distributor, SalesRepresentative, Store, Category } = models;
+
+// Константы конфигурации WAPPI
+const WAPPI_API_URL = process.env.WAPPI_API_URL || 'https://wappi.pro/api/sync/message/send';
+const PROFILE_ID = process.env.PROFILE_ID;
+const API_KEY = process.env.API_KEY;
+
+// Настройка Axios с таймаутами
+const axiosInstance = axios.create({
+  timeout: 30000, // 30 секунд таймаут
+  headers: {
+    'Content-Type': 'application/json'
+  }
+});
+
+// Массив вариаций сообщений для избежания банов в WhatsApp
+const messageVariations = [
+  "Ваш код подтверждения:",
+  "Код верификации:",
+  "Код для подтверждения:",
+  "Ваш проверочный код:",
+  "Код авторизации:",
+  "Подтвердите кодом:",
+  "Ваш секретный код:",
+  "Код активации:",
+  "Введите код:",
+  "Ваш персональный код:",
+  "Код доступа:",
+  "Используйте код:",
+  "Проверочный код:",
+  "Код безопасности:",
+  "Ваш идентификационный код:",
+  "Код аутентификации:",
+  "Секретный код подтверждения:",
+  "Ваш временный код:",
+  "Код для входа:",
+  "Подтверждающий код:",
+  "Верификационный код:",
+  "Ваш код входа:",
+  "Код для идентификации:",
+  "Временный код доступа:",
+  "Ваш уникальный код:",
+  "Код для верификации:",
+  "Используйте этот код:",
+  "Ваш защитный код:",
+  "Код для подтверждения аккаунта:",
+  "Персональный код доступа:",
+  "Код проверки:",
+  "Ваш код регистрации:",
+  "Идентификационный код:",
+  "Код для завершения:",
+  "Ваш проверочный номер:",
+  "Код активации аккаунта:",
+  "Введите проверочный код:",
+  "Ваш код аутентификации:",
+  "Секретный код:",
+  "Код для завершения регистрации:"
+];
+
+// Функция для получения случайного сообщения
+function getRandomMessage() {
+  const randomIndex = Math.floor(Math.random() * messageVariations.length);
+  return messageVariations[randomIndex];
+}
+
+// Функция для генерации 6-значного кода
+function generateVerificationCode() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+// Функция для валидации номера телефона по коду страны
+function validatePhoneNumber(phone) {
+  // Оставляем только цифры (на случай, если передадут пробелы или +)
+  const digitsOnly = phone.replace(/\D/g, '');
+
+  // Казахстан / Россия
+  if (digitsOnly.startsWith('7')) {
+    const ruKzRegex = /^7\d{10}$/;
+    return ruKzRegex.test(digitsOnly);
+  }
+
+  // США (упрощенный вариант: 1 + ещё 10 цифр)
+  if (digitsOnly.startsWith('1')) {
+    const usRegex = /^1\d{10}$/;
+    return usRegex.test(digitsOnly);
+  }
+
+  // Все остальные коды стран не поддерживаем (на данный момент)
+  return false;
+}
+
+// Retry функция для запросов к внешнему API (Wappi)
+async function sendWithRetry(url, payload, headers, maxRetries = 3) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await axiosInstance.post(url, payload, { headers });
+      return response;
+    } catch (error) {
+      if (attempt === maxRetries) {
+        throw error;
+      }
+      // Ждем перед повторной попыткой (экспоненциальная задержка)
+      const delay = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+}
 
 async function login(req, res) {
   try {
@@ -322,15 +429,15 @@ async function registerDistributor(req, res) {
       }).sort({ expiresAt: -1 }).lean();
 
       if (!verification) {
-        return res.status(400).json({ 
-          error: 'Email не подтвержден. Сначала отправьте код верификации на email' 
+        return res.status(400).json({
+          error: 'Email не подтвержден. Сначала отправьте код верификации на email'
         });
       }
 
       // Проверяем, что код еще не истек (подтверждает, что email был проверен недавно)
       if (new Date() > verification.expiresAt) {
-        return res.status(400).json({ 
-          error: 'Срок действия подтверждения email истек. Пожалуйста, отправьте код верификации заново' 
+        return res.status(400).json({
+          error: 'Срок действия подтверждения email истек. Пожалуйста, отправьте код верификации заново'
         });
       }
     }
@@ -360,19 +467,19 @@ async function registerDistributor(req, res) {
       if (!Array.isArray(categoryIds)) {
         return res.status(400).json({ error: 'categoryIds должен быть массивом' });
       }
-      
+
       // Проверяем, что все категории существуют
       if (categoryIds.length > 0) {
         const validCategories = await Category.find({ id: { $in: categoryIds } }).lean();
         const validCategoryIds = validCategories.map(cat => cat.id);
         const invalidCategoryIds = categoryIds.filter(id => !validCategoryIds.includes(id));
-        
+
         if (invalidCategoryIds.length > 0) {
-          return res.status(400).json({ 
-            error: `Следующие категории не найдены: ${invalidCategoryIds.join(', ')}` 
+          return res.status(400).json({
+            error: `Следующие категории не найдены: ${invalidCategoryIds.join(', ')}`
           });
         }
-        
+
         validatedCategoryIds = categoryIds;
       }
     }
@@ -780,4 +887,163 @@ async function registerStoreSeller(req, res) {
   }
 }
 
-module.exports = { login, registerAdmin, sendVerificationCode, verifyCode, registerDistributor, registerSalesRepresentative, registerStoreSeller };
+// Отправка кода верификации на телефон через WhatsApp (WAPPI)
+async function sendPhoneVerificationCode(req, res) {
+  try {
+    const { phoneNumber } = req.body;
+
+    if (!phoneNumber) {
+      return res.status(400).json({ error: 'Номер телефона обязателен' });
+    }
+
+    // Валидация номера телефона
+    if (!validatePhoneNumber(phoneNumber)) {
+      return res.status(400).json({
+        error: 'Некорректный формат номера телефона. Поддерживаются: RU/KZ 7XXXXXXXXXX или US 1XXXXXXXXXX (11 цифр)'
+      });
+    }
+
+    // Проверяем наличие PROFILE_ID и API_KEY
+    if (!PROFILE_ID || !API_KEY) {
+      console.error('WAPPI credentials not configured');
+      return res.status(500).json({ error: 'Сервис верификации не настроен' });
+    }
+
+    // Нормализуем номер телефона (оставляем только цифры)
+    const normalizedPhone = phoneNumber.replace(/\D/g, '');
+
+    // Генерируем 6-значный код
+    const code = generateVerificationCode();
+
+    // Удаляем старые коды для этого номера
+    await PhoneVerificationCode.deleteMany({ phoneNumber: normalizedPhone });
+
+    // Создаем новый код (действителен 10 минут)
+    const expiresAt = new Date();
+    expiresAt.setMinutes(expiresAt.getMinutes() + 10);
+
+    await PhoneVerificationCode.create({
+      id: generateId(),
+      phoneNumber: normalizedPhone,
+      code,
+      expiresAt,
+      used: false
+    });
+
+    // Формируем текст сообщения (случайная вариация для избежания банов)
+    const randomMessage = getRandomMessage();
+    const messageText = `${randomMessage} ${code}`;
+
+    // Формируем URL для Wappi API (как в примере - profile_id в query параметре)
+    const wappiUrl = `${WAPPI_API_URL}?profile_id=${encodeURIComponent(PROFILE_ID)}`;
+
+    // Тело запроса к Wappi
+    const payload = {
+      recipient: normalizedPhone,
+      body: messageText
+    };
+
+    // Заголовки для Wappi
+    const headers = {
+      accept: 'application/json',
+      Authorization: API_KEY,
+      'Content-Type': 'application/json'
+    };
+
+    // Логирование для отладки (без чувствительных данных)
+    console.log('WAPPI Request:', {
+      url: wappiUrl,
+      profile_id: PROFILE_ID ? `${PROFILE_ID.substring(0, 5)}...` : 'missing',
+      recipient: normalizedPhone.substring(0, 3) + '****',
+      hasApiKey: !!API_KEY
+    });
+
+    try {
+      const wappiResponse = await sendWithRetry(wappiUrl, payload, headers);
+
+      // Проверка успешности отправки
+      if (wappiResponse.status === 200 || wappiResponse.status === 201) {
+        return res.json({
+          message: 'Код верификации отправлен на WhatsApp',
+          expiresIn: 600 // 10 минут в секундах
+        });
+      } else {
+        console.error('Unexpected response status from Wappi API:', wappiResponse.status);
+        return res.status(500).json({
+          error: 'Не удалось отправить код верификации',
+          details: wappiResponse.data
+        });
+      }
+    } catch (wappiError) {
+      const errorMessage = wappiError.response?.data || wappiError.message;
+      const errorStatus = wappiError.response?.status || 500;
+
+      console.error('Failed to send message via Wappi API:', errorMessage);
+
+      return res.status(errorStatus).json({
+        error: 'Не удалось отправить код верификации через WhatsApp',
+        details: errorMessage
+      });
+    }
+  } catch (error) {
+    console.error('Ошибка при отправке кода верификации на телефон:', error);
+    res.status(500).json({ error: 'Ошибка при отправке кода верификации' });
+  }
+}
+
+// Проверка кода верификации по телефону
+async function verifyPhoneCode(req, res) {
+  try {
+    const { phoneNumber, code } = req.body;
+
+    if (!phoneNumber || !code) {
+      return res.status(400).json({ error: 'Номер телефона и код обязательны' });
+    }
+
+    // Нормализуем номер телефона
+    const normalizedPhone = phoneNumber.replace(/\D/g, '');
+
+    // Ищем код верификации
+    const verification = await PhoneVerificationCode.findOne({
+      phoneNumber: normalizedPhone,
+      code,
+      used: false
+    }).lean();
+
+    if (!verification) {
+      return res.status(400).json({ error: 'Неверный код верификации' });
+    }
+
+    // Проверяем, не истек ли срок действия
+    if (new Date() > verification.expiresAt) {
+      await PhoneVerificationCode.deleteOne({ id: verification.id });
+      return res.status(400).json({ error: 'Код верификации истек' });
+    }
+
+    // Помечаем код как использованный
+    await PhoneVerificationCode.updateOne(
+      { id: verification.id },
+      { used: true }
+    );
+
+    res.json({
+      message: 'Код верификации подтвержден',
+      verified: true
+    });
+  } catch (error) {
+    console.error('Ошибка при проверке кода верификации по телефону:', error);
+    res.status(500).json({ error: 'Ошибка при проверке кода верификации' });
+  }
+}
+
+module.exports = {
+  login,
+  registerAdmin,
+  sendVerificationCode,
+  verifyCode,
+  registerDistributor,
+  registerSalesRepresentative,
+  registerStoreSeller,
+  sendPhoneVerificationCode,
+  verifyPhoneCode
+};
