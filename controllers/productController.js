@@ -614,7 +614,8 @@ async function generateUniqueSku(req, res) {
   }
 }
 
-// Оплата товара брендом (показ товара в каталоге на 30 дней)
+// Оплата одного товара брендом (активация на 30 дней)
+// Оплата происходит на фронтенде, здесь только активация
 async function payProduct(req, res) {
   try {
     const { productId } = req.params;
@@ -656,7 +657,73 @@ async function payProduct(req, res) {
     });
   } catch (error) {
     console.error('Ошибка при оплате товара:', error);
-    res.status(500).json({ error: 'Ошибка при оплате товара' });
+    res.status(500).json({ 
+      error: 'Ошибка при оплате товара',
+      details: error.message 
+    });
+  }
+}
+
+// Оплата нескольких товаров брендом (активация на 30 дней)
+// Оплата происходит на фронтенде, здесь только активация
+async function payMultipleProducts(req, res) {
+  try {
+    const { productIds } = req.body;
+
+    // Проверяем, что пользователь является брендом
+    if (!req.user || req.user.role !== 'BRAND' || !req.user.brandId) {
+      return res.status(403).json({ error: 'Только бренды могут оплачивать товары' });
+    }
+
+    // Валидация
+    if (!productIds || !Array.isArray(productIds) || productIds.length === 0) {
+      return res.status(400).json({ error: 'Список товаров не указан или пустой' });
+    }
+
+    // Проверяем все товары
+    const products = await Product.find({ id: { $in: productIds } }).lean();
+    
+    if (products.length !== productIds.length) {
+      return res.status(404).json({ error: 'Некоторые товары не найдены' });
+    }
+
+    // Проверяем, что все товары принадлежат этому бренду
+    const notOwnedProducts = products.filter(p => p.brandId !== req.user.brandId);
+    if (notOwnedProducts.length > 0) {
+      return res.status(403).json({ 
+        error: 'Вы можете оплачивать только свои товары',
+        notOwnedProducts: notOwnedProducts.map(p => ({ id: p.id, name: p.name }))
+      });
+    }
+
+    // Устанавливаем оплату на 30 дней для всех товаров
+    const paymentDate = new Date();
+    const paymentExpiresAt = new Date();
+    paymentExpiresAt.setDate(paymentExpiresAt.getDate() + 30);
+
+    await Product.updateMany(
+      { id: { $in: productIds } },
+      {
+        isPayed: true,
+        paymentDate,
+        paymentExpiresAt,
+        updatedAt: new Date()
+      }
+    );
+
+    // Получаем обновленные товары
+    const updatedProducts = await Product.find({ id: { $in: productIds } }).lean();
+
+    res.json({
+      message: `${updatedProducts.length} товаров успешно оплачено. Показ товаров активен на 30 дней.`,
+      products: updatedProducts
+    });
+  } catch (error) {
+    console.error('Ошибка при оплате товаров:', error);
+    res.status(500).json({ 
+      error: 'Ошибка при оплате товаров',
+      details: error.message 
+    });
   }
 }
 
@@ -669,5 +736,6 @@ module.exports = {
   deleteProduct,
   searchProducts,
   generateUniqueSku,
-  payProduct
+  payProduct,
+  payMultipleProducts
 };

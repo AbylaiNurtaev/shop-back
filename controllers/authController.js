@@ -343,11 +343,15 @@ async function sendVerificationCode(req, res) {
     } catch (emailError) {
       console.error('Ошибка при отправке email:', emailError);
 
-      // Проверяем, является ли это ошибкой лимита MailerSend
-      if (emailError.message && emailError.message.includes('trial account unique recipients limit')) {
+      // Проверяем различные типы ошибок email-сервиса
+      if (emailError.message && (
+        emailError.message.includes('trial account unique recipients limit') ||
+        emailError.message.includes('RESEND_API_KEY') ||
+        emailError.message.includes('Email sending failed')
+      )) {
         return res.status(503).json({
-          error: 'Достигнут лимит отправки email на бесплатном тарифе MailerSend. Пожалуйста, используйте верификацию по телефону через WhatsApp.',
-          code: 'EMAIL_LIMIT_REACHED',
+          error: 'Не удалось отправить код верификации на email. Пожалуйста, используйте верификацию по телефону через WhatsApp.',
+          code: 'EMAIL_SERVICE_ERROR',
           alternative: 'phone_verification',
           message: 'Используйте эндпоинт /api/auth/verification/phone/send для отправки кода на WhatsApp'
         });

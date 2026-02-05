@@ -75,6 +75,13 @@ SMTP_FROM_EMAIL=your-smtp-user
 - `DELETE /api/products/:productId` - Удаление товара
 - `POST /api/products/search` - Поиск товаров с геолокацией
 
+**Оплата товаров брендами:**
+- `POST /api/products/:productId/pay` - Оплата (активация) одного товара на 30 дней
+- `POST /api/products/pay/multiple` - Оплата (активация) нескольких товаров на 30 дней
+
+> 📖 Подробная документация: [PRODUCT_PAYMENT_SIMPLE.md](./PRODUCT_PAYMENT_SIMPLE.md)  
+> **Примечание:** Оплата происходит на фронтенде, backend только активирует товары
+
 ### Офферы
 
 - `POST /api/offers` - Создание оффера

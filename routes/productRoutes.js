@@ -10,14 +10,19 @@ const {
   deleteProduct,
   searchProducts,
   generateUniqueSku,
-  payProduct
+  payProduct,
+  payMultipleProducts
 } = require('../controllers/productController');
 
 router.use(authenticateToken);
 
 router.post('/', createProduct);
 router.post('/search', searchProducts);
-router.post('/:productId/pay', payProduct);
+
+// Оплата товаров (активация на 30 дней после оплаты на фронтенде)
+router.post('/:productId/pay', payProduct); // Оплата одного товара
+router.post('/pay/multiple', payMultipleProducts); // Оплата нескольких товаров
+
 router.get('/', getProducts);
 router.get('/sku', generateUniqueSku);
 router.get('/brand/:brandId', getBrandProducts);

@@ -1,18 +1,30 @@
-// MailerSend API для отправки email
+// Resend API для отправки email
+const { Resend } = require('resend');
+
+// Ленивая инициализация Resend (только когда нужен)
+let resendInstance = null;
+
+function getResend() {
+  if (!resendInstance) {
+    const apiKey = process.env.RESEND_API_KEY;
+    if (!apiKey) {
+      throw new Error('RESEND_API_KEY не задан в переменных окружения');
+    }
+    resendInstance = new Resend(apiKey);
+  }
+  return resendInstance;
+}
+
+// Основная функция отправки email (сохраняем обратную совместимость)
 async function sendEmail({ to, subject, text, html }) {
-  const MAILERSEND_API_KEY = process.env.MAILERSEND;
+  // Получаем экземпляр Resend (проверка API ключа происходит внутри getResend)
+  const resend = getResend();
 
-  if (!MAILERSEND_API_KEY) {
-    throw new Error('MAILERSEND API ключ не задан в переменных окружения');
-  }
-
+  // Определяем адрес отправителя
+  const fromEmail = process.env.SMTP_FROM_EMAIL || process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
   const fromName = process.env.SMTP_FROM_NAME || 'Inventory Admin';
-  const fromEmail = process.env.SMTP_FROM_EMAIL || process.env.SMTP_USER;
-
-  if (!fromEmail) {
-    throw new Error('SMTP_FROM_EMAIL или SMTP_USER должен быть задан для отправки email через MailerSend');
-  }
-
+  // const from = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
+  const from = 'info@omiai.kz';
   // Если HTML не предоставлен, создаем простой HTML из текста
   let htmlContent = html;
   if (!htmlContent && text) {
@@ -20,63 +32,47 @@ async function sendEmail({ to, subject, text, html }) {
     htmlContent = text.replace(/\n/g, '<br>');
   }
 
-  // Формируем тело запроса для MailerSend API
-  const emailData = {
-    from: {
-      email: fromEmail,
-      name: fromName
-    },
-    to: [
-      {
-        email: to
-      }
-    ],
-    subject: subject,
-    text: text || '',
-    html: htmlContent || text || ''
-  };
+  // Если нет ни HTML, ни текста, создаем минимальный HTML
+  if (!htmlContent) {
+    htmlContent = '<p>No content</p>';
+  }
 
   try {
-    const response = await fetch('https://api.mailersend.com/v1/email', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${MAILERSEND_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(emailData)
+    const { data, error } = await resend.emails.send({
+      from: from,
+      to: to,
+      subject: subject,
+      html: htmlContent,
     });
 
-    if (!response.ok) {
-      let errorMessage = `MailerSend API ошибка: ${response.status} ${response.statusText}`;
-      try {
-        const errorData = await response.json();
-        if (errorData.message) {
-          errorMessage += `. ${errorData.message}`;
-        }
-        if (errorData.errors) {
-          errorMessage += `. Ошибки: ${JSON.stringify(errorData.errors)}`;
-        }
-      } catch (parseError) {
-        const errorText = await response.text().catch(() => '');
-        if (errorText) {
-          errorMessage += `. Ответ: ${errorText}`;
-        }
-      }
-      throw new Error(errorMessage);
+    if (error) {
+      throw new Error(`Resend API ошибка: ${error.message}`);
     }
 
-    // MailerSend может вернуть пустой ответ при успехе (204) или JSON
-    const contentType = response.headers.get('content-type');
-    if (contentType && contentType.includes('application/json')) {
-      const result = await response.json();
-      return result;
-    }
-    
-    return { success: true, status: response.status };
+    console.log('Email sent successfully:', data);
+    return { success: true, data };
   } catch (error) {
-    console.error('Ошибка при отправке email через MailerSend:', error);
-    throw error;
+    console.error('Ошибка при отправке email через Resend:', error);
+    throw new Error(`Email sending failed: ${error.message}`);
   }
 }
 
-module.exports = { sendEmail };
+// Функция для отправки кода верификации (дополнительная функция)
+async function sendVerificationCode(email, code) {
+  const subject = 'Код верификации';
+  const html = `
+    <div style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px; margin: 0 auto;">
+      <h2 style="color: #333;">Подтверждение email</h2>
+      <p style="color: #666; font-size: 16px;">Ваш код верификации:</p>
+      <div style="background-color: #f4f4f4; padding: 20px; font-size: 32px; font-weight: bold; letter-spacing: 8px; text-align: center; margin: 20px 0; border-radius: 8px; color: #333;">
+        ${code}
+      </div>
+      <p style="color: #666; font-size: 14px;">Этот код действителен в течение 10 минут.</p>
+      <p style="color: #999; font-size: 12px; margin-top: 30px;">Если вы не запрашивали этот код, пожалуйста, проигнорируйте это письмо.</p>
+    </div>
+  `;
+
+  return await sendEmail({ to: email, subject, html });
+}
+
+module.exports = { sendEmail, sendVerificationCode };
