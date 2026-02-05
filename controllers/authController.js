@@ -342,7 +342,21 @@ async function sendVerificationCode(req, res) {
       });
     } catch (emailError) {
       console.error('Ошибка при отправке email:', emailError);
-      return res.status(500).json({ error: 'Не удалось отправить код верификации' });
+
+      // Проверяем, является ли это ошибкой лимита MailerSend
+      if (emailError.message && emailError.message.includes('trial account unique recipients limit')) {
+        return res.status(503).json({
+          error: 'Достигнут лимит отправки email на бесплатном тарифе MailerSend. Пожалуйста, используйте верификацию по телефону через WhatsApp.',
+          code: 'EMAIL_LIMIT_REACHED',
+          alternative: 'phone_verification',
+          message: 'Используйте эндпоинт /api/auth/verification/phone/send для отправки кода на WhatsApp'
+        });
+      }
+
+      return res.status(500).json({
+        error: 'Не удалось отправить код верификации на email',
+        details: emailError.message
+      });
     }
 
     res.json({
