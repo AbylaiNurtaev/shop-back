@@ -374,13 +374,19 @@ async function sendWappiMessage(phoneNumber, messageText) {
     throw new Error('WAPPI credentials not configured');
   }
 
+  // Проверяем, что сообщение не пустое
+  if (!messageText || !messageText.trim()) {
+    console.error('[WAPPI API] ❌ Попытка отправить пустое сообщение');
+    throw new Error('Message text is empty');
+  }
+
   let normalizedPhone = phoneNumber.replace('@c.us', '').replace(/\D/g, '');
 
   const wappiUrl = `${WAPPI_API_URL}?profile_id=${encodeURIComponent(PROFILE_ID_WAPPI)}`;
 
   const payload = {
     recipient: normalizedPhone,
-    body: messageText
+    body: messageText.trim()
   };
 
   const headers = {
@@ -676,18 +682,43 @@ async function processWappiMessage(chatId, text, requestId) {
     { state: 'NEEDS_CLARIFICATION', updatedAt: new Date() }
   );
 
+  // Формируем сообщение с вопросом и списком товаров
+  let responseText = '';
+  
+  // Добавляем вопрос
   const question = clarification.questions.length > 0
     ? clarification.questions[0]
     : 'Уточните, какой именно товар вас интересует?';
+  
+  responseText = question;
+  
+  // Добавляем список найденных товаров (если их не слишком много)
+  if (candidates.length > 1 && candidates.length <= 10) {
+    responseText += '\n\nНайдено товаров:\n';
+    candidates.forEach((product, index) => {
+      const productName = product.name || 'Без названия';
+      const brandName = product.brandName ? ` (${product.brandName})` : '';
+      const packageInfo = product.packageInfo ? ` - ${product.packageInfo}` : '';
+      responseText += `${index + 1}. ${productName}${brandName}${packageInfo}\n`;
+    });
+    responseText += '\nОтветьте на вопрос выше, чтобы уточнить выбор.';
+  } else if (candidates.length > 10) {
+    responseText += `\n\nНайдено товаров: ${candidates.length}. Уточните запрос для более точного поиска.`;
+  }
+  
+  // Убеждаемся, что responseText не пустой
+  if (!responseText || !responseText.trim()) {
+    responseText = 'Уточните, какой именно товар вас интересует?';
+  }
 
   await SearchMessage.create({
     id: generateId(),
     conversationId,
     sender: 'SYSTEM',
-    text: question
+    text: responseText
   });
 
-  return question;
+  return responseText;
 }
 
 // Основная функция обработки webhook от Wappi
@@ -785,9 +816,16 @@ async function handleWappiWebhook(req, res) {
       try {
         console.log(`[WAPPI WEBHOOK] [${requestId}] 🔍 Начинаем обработку запроса...`);
 
-        const responseText = await processWappiMessage(chatId, body, requestId);
+        let responseText = await processWappiMessage(chatId, body, requestId);
+
+        // Проверяем, что ответ не пустой
+        if (!responseText || !responseText.trim()) {
+          console.warn(`[WAPPI WEBHOOK] [${requestId}] ⚠️  Получен пустой ответ, используем дефолтное сообщение`);
+          responseText = 'Обрабатываю ваш запрос. Пожалуйста, подождите...';
+        }
 
         console.log(`[WAPPI WEBHOOK] [${requestId}] 📤 Отправка ответа пользователю через Wappi API...`);
+        console.log(`[WAPPI WEBHOOK] [${requestId}] 📝 Текст ответа (${responseText.length} символов):`, responseText.substring(0, 200));
         await sendWappiMessage(chatId, responseText);
 
         const totalProcessingTime = Date.now() - processingStartTime;
