@@ -1,7 +1,6 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const authRoutes = require('./routes/authRoutes');
 const userRoutes = require('./routes/userRoutes');
@@ -20,6 +19,8 @@ const posRoutes = require('./routes/posRoutes');
 const planRoutes = require('./routes/planRoutes');
 const aiAssistantRoutes = require('./routes/aiAssistantRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
+const faqRoutes = require('./routes/faqRoutes');
+const wappiRoutes = require('./routes/wappiRoutes');
 const { connectToDatabase } = require('./models/database');
 const { checkAndDisableExpiredPayments } = require('./utils/paymentExpiration');
 
@@ -38,21 +39,9 @@ const corsOptions = {
 app.use(cors(corsOptions));
 
 // Ограничение размера тела запроса
-app.use(express.json({ limit: '10kb' }));
-app.use(express.urlencoded({ extended: true, limit: '10kb' }));
-
-// Rate limiting для всех запросов
-const limiter = rateLimit({
-  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000, // 15 минут
-  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 100, // лимит запросов
-  message: {
-    error: 'Слишком много запросов с этого IP, пожалуйста, попробуйте позже.'
-  },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-app.use(limiter);
+// Для webhook от Wappi может потребоваться больший лимит
+app.use(express.json({ limit: '50kb' }));
+app.use(express.urlencoded({ extended: true, limit: '50kb' }));
 
 // Роуты
 app.use('/api/auth', authRoutes);
@@ -73,6 +62,8 @@ app.use('/api/pos', posRoutes);
 app.use('/api/plans', planRoutes);
 app.use('/api/ai-assistant', aiAssistantRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/faq', faqRoutes);
+app.use('/api/wappi', wappiRoutes);
 
 // Обработка ошибок
 app.use((err, req, res, next) => {

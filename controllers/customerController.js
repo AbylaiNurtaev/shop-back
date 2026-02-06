@@ -2,7 +2,7 @@ const multer = require('multer');
 const { generateId } = require('../utils/uuid');
 const { uploadImage } = require('../utils/s3');
 const { calculateDistance, getCoordinatesFromLink } = require('../utils/distance');
-const { getIntentFromGemini, findProductsBySemanticSearch, transcribeAudio, generateClarificationQuestions, analyzeProductImage } = require('../utils/gemini');
+const { getIntentFromGemini, findProductsBySemanticSearch, transcribeAudio, generateClarificationQuestions, analyzeProductImage, getCustomerFAQResponse } = require('../utils/gemini');
 const { models } = require('../models/database');
 
 const {
@@ -1987,6 +1987,41 @@ async function searchByImage(req, res) {
   }
 }
 
+/**
+ * Обработка FAQ запроса от пользователя
+ * POST /api/customers/faq
+ */
+async function handleCustomerFAQ(req, res) {
+  try {
+    const { message } = req.body;
+
+    if (!message || typeof message !== 'string' || message.trim().length === 0) {
+      return res.status(400).json({ error: 'Сообщение не может быть пустым' });
+    }
+
+    // Получаем роль пользователя из токена (если есть)
+    const userRole = req.user && req.user.role ? req.user.role : null;
+
+    // Получаем ответ от FAQ чата
+    const response = await getCustomerFAQResponse({
+      message: message.trim(),
+      userRole: userRole
+    });
+
+    res.json({
+      success: true,
+      response,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Ошибка при обработке FAQ запроса:', error);
+    res.status(500).json({
+      error: 'Ошибка при обработке запроса',
+      message: error.message
+    });
+  }
+}
+
 module.exports = {
   upload,
   createSession,
@@ -2001,6 +2036,7 @@ module.exports = {
   searchByImage,
   getHistory,
   exportHistory,
-  deleteHistory
+  deleteHistory,
+  handleCustomerFAQ
 };
 

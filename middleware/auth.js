@@ -66,4 +66,22 @@ function requireStoreSeller(req, res, next) {
   next();
 }
 
-module.exports = { authenticateToken, requireAdmin, requireStoreOwner, requireSalesRep, requireStoreSeller };
+// Опциональная аутентификация - не блокирует запрос, если токена нет
+function optionalAuthenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
+
+  if (!token) {
+    // Если токена нет, просто продолжаем без req.user
+    return next();
+  }
+
+  const decoded = verifyToken(token);
+  if (decoded) {
+    req.user = decoded;
+  }
+  // Даже если токен невалиден, продолжаем без req.user
+  next();
+}
+
+module.exports = { authenticateToken, requireAdmin, requireStoreOwner, requireSalesRep, requireStoreSeller, optionalAuthenticateToken };

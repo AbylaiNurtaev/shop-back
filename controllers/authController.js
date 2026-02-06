@@ -9,8 +9,8 @@ const { AuthCredential, User, VerificationCode, PhoneVerificationCode, Brand, Di
 
 // Константы конфигурации WAPPI
 const WAPPI_API_URL = process.env.WAPPI_API_URL || 'https://wappi.pro/api/sync/message/send';
-const PROFILE_ID = process.env.PROFILE_ID;
-const API_KEY = process.env.API_KEY;
+const PROFILE_ID_WAPPI = process.env.PROFILE_ID_WAPPI;
+const API_KEY_WAPPI = process.env.API_KEY_WAPPI;
 
 // Настройка Axios с таймаутами
 const axiosInstance = axios.create({
@@ -921,8 +921,8 @@ async function sendPhoneVerificationCode(req, res) {
       });
     }
 
-    // Проверяем наличие PROFILE_ID и API_KEY
-    if (!PROFILE_ID || !API_KEY) {
+    // Проверяем наличие PROFILE_ID_WAPPI и API_KEY_WAPPI
+    if (!PROFILE_ID_WAPPI || !API_KEY_WAPPI) {
       console.error('WAPPI credentials not configured');
       return res.status(500).json({ error: 'Сервис верификации не настроен' });
     }
@@ -953,7 +953,7 @@ async function sendPhoneVerificationCode(req, res) {
     const messageText = `${randomMessage} ${code}`;
 
     // Формируем URL для Wappi API (как в примере - profile_id в query параметре)
-    const wappiUrl = `${WAPPI_API_URL}?profile_id=${encodeURIComponent(PROFILE_ID)}`;
+    const wappiUrl = `${WAPPI_API_URL}?profile_id=${encodeURIComponent(PROFILE_ID_WAPPI)}`;
 
     // Тело запроса к Wappi
     const payload = {
@@ -964,16 +964,16 @@ async function sendPhoneVerificationCode(req, res) {
     // Заголовки для Wappi
     const headers = {
       accept: 'application/json',
-      Authorization: API_KEY,
+      Authorization: API_KEY_WAPPI,
       'Content-Type': 'application/json'
     };
 
     // Логирование для отладки (без чувствительных данных)
     console.log('WAPPI Request:', {
       url: wappiUrl,
-      profile_id: PROFILE_ID ? `${PROFILE_ID.substring(0, 5)}...` : 'missing',
+      profile_id: PROFILE_ID_WAPPI ? `${PROFILE_ID_WAPPI.substring(0, 5)}...` : 'missing',
       recipient: normalizedPhone.substring(0, 3) + '****',
-      hasApiKey: !!API_KEY
+      hasApiKey: !!API_KEY_WAPPI
     });
 
     try {
