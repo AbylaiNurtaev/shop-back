@@ -126,10 +126,10 @@ function formatSearchResults(candidates, maxResults = 5) {
     const productName = product.name || 'Без названия';
     const brandName = product.brandName ? ` (${product.brandName})` : '';
     const packageInfo = product.packageInfo ? ` - ${product.packageInfo}` : '';
-    
+
     // Добавляем описание, если оно короткое
-    const description = product.description && product.description.length < 50 
-      ? `\n   ${product.description}` 
+    const description = product.description && product.description.length < 50
+      ? `\n   ${product.description}`
       : '';
 
     message += `${i + 1}. ${productName}${brandName}${packageInfo}${description}\n\n`;
@@ -154,7 +154,7 @@ async function sendWappiMessage(phoneNumber, messageText) {
   // Нормализуем номер телефона (убираем @c.us если есть и оставляем только цифры)
   // Формат chatId: "79001234567@c.us" или просто "79001234567"
   let normalizedPhone = phoneNumber.replace('@c.us', '').replace(/\D/g, '');
-  
+
   // Если номер начинается не с цифры (например, если есть префикс), оставляем как есть
   // Wappi ожидает номер в формате только цифр
 
@@ -178,11 +178,11 @@ async function sendWappiMessage(phoneNumber, messageText) {
     const sendStartTime = Date.now();
     const wappiResponse = await sendWithRetry(wappiUrl, payload, headers);
     const sendDuration = Date.now() - sendStartTime;
-    
-    const maskedPhone = normalizedPhone.length > 7 
-      ? `${normalizedPhone.substring(0, 3)}****${normalizedPhone.substring(normalizedPhone.length - 2)}` 
+
+    const maskedPhone = normalizedPhone.length > 7
+      ? `${normalizedPhone.substring(0, 3)}****${normalizedPhone.substring(normalizedPhone.length - 2)}`
       : '****';
-    
+
     console.log(`[WAPPI API] ✅ Сообщение успешно отправлено:`, {
       phone: maskedPhone,
       status: wappiResponse.status,
@@ -193,10 +193,10 @@ async function sendWappiMessage(phoneNumber, messageText) {
   } catch (error) {
     const errorMessage = error.response?.data || error.message;
     const errorStatus = error.response?.status || 'unknown';
-    const maskedPhone = normalizedPhone.length > 7 
-      ? `${normalizedPhone.substring(0, 3)}****${normalizedPhone.substring(normalizedPhone.length - 2)}` 
+    const maskedPhone = normalizedPhone.length > 7
+      ? `${normalizedPhone.substring(0, 3)}****${normalizedPhone.substring(normalizedPhone.length - 2)}`
       : '****';
-    
+
     console.error(`[WAPPI API] ❌ Ошибка при отправке сообщения:`, {
       phone: maskedPhone,
       status: errorStatus,
@@ -224,19 +224,42 @@ async function handleWappiWebhook(req, res) {
   });
 
   try {
+    // Логируем полное тело запроса для отладки (маскируем чувствительные данные)
+    const rawBody = req.body || {};
+    const maskedBody = JSON.parse(JSON.stringify(rawBody));
+
+    // Маскируем чувствительные данные в теле запроса
+    if (maskedBody.message && maskedBody.message.chatId) {
+      const chatId = maskedBody.message.chatId;
+      if (chatId.length > 7) {
+        maskedBody.message.chatId = `${chatId.substring(0, 3)}****${chatId.substring(chatId.length - 2)}`;
+      } else {
+        maskedBody.message.chatId = '****';
+      }
+    }
+
+    console.log(`[WAPPI WEBHOOK] [${requestId}] 📋 Полное тело запроса (маскированное):`, JSON.stringify(maskedBody, null, 2));
+    console.log(`[WAPPI WEBHOOK] [${requestId}] 📋 Ключи в req.body:`, Object.keys(rawBody));
+
     // Извлекаем данные из запроса
-    const { instance_id, message } = req.body || {};
+    // Пробуем разные варианты структуры данных от Wappi
+    let instance_id = rawBody.instance_id || rawBody.instanceId || rawBody.instance;
+    let message = rawBody.message || rawBody.data || rawBody.event || rawBody.payload;
 
     // Логируем полученные данные (без чувствительной информации)
-    console.log(`[WAPPI WEBHOOK] [${requestId}] 📋 Данные запроса:`, {
+    console.log(`[WAPPI WEBHOOK] [${requestId}] 📋 Извлеченные данные:`, {
       instance_id: instance_id || 'не указан',
       hasMessage: !!message,
-      messageKeys: message ? Object.keys(message) : []
+      messageType: message ? typeof message : 'undefined',
+      messageKeys: message && typeof message === 'object' ? Object.keys(message) : 'не объект',
+      allBodyKeys: Object.keys(rawBody)
     });
 
     if (!message) {
       console.error(`[WAPPI WEBHOOK] [${requestId}] ❌ Отсутствует поле message в запросе от Wappi`);
-      res.status(200).json({ received: true, error: 'Missing message field' });
+      console.error(`[WAPPI WEBHOOK] [${requestId}] ❌ Доступные ключи в req.body:`, Object.keys(rawBody));
+      console.error(`[WAPPI WEBHOOK] [${requestId}] ❌ Полное тело запроса:`, JSON.stringify(rawBody, null, 2));
+      res.status(200).json({ received: true, error: 'Missing message field', availableKeys: Object.keys(rawBody) });
       return;
     }
 
@@ -262,11 +285,11 @@ async function handleWappiWebhook(req, res) {
     }
 
     // Маскируем чувствительные данные для логов
-    const maskedChatId = chatId.length > 7 
-      ? `${chatId.substring(0, 3)}****${chatId.substring(chatId.length - 2)}` 
+    const maskedChatId = chatId.length > 7
+      ? `${chatId.substring(0, 3)}****${chatId.substring(chatId.length - 2)}`
       : '****';
-    const bodyPreview = body.length > 100 
-      ? `${body.substring(0, 100)}...` 
+    const bodyPreview = body.length > 100
+      ? `${body.substring(0, 100)}...`
       : body;
 
     console.log(`[WAPPI WEBHOOK] [${requestId}] ✅ Валидный запрос:`, {
@@ -304,7 +327,7 @@ async function handleWappiWebhook(req, res) {
         console.log(`[WAPPI WEBHOOK] [${requestId}] 📤 Отправка ответа пользователю через Wappi API...`);
         await sendWappiMessage(chatId, responseText);
         const sendDuration = Date.now() - sendStartTime;
-        
+
         const totalProcessingTime = Date.now() - processingStartTime;
         const totalRequestTime = Date.now() - startTime;
 
@@ -328,7 +351,7 @@ async function handleWappiWebhook(req, res) {
           totalProcessingTime: `${totalProcessingTime}ms`,
           totalRequestTime: `${totalRequestTime}ms`
         });
-        
+
         // Пытаемся отправить сообщение об ошибке
         try {
           console.log(`[WAPPI WEBHOOK] [${requestId}] 📤 Попытка отправить сообщение об ошибке пользователю...`);
@@ -350,7 +373,7 @@ async function handleWappiWebhook(req, res) {
       stack: error.stack,
       totalRequestTime: `${totalRequestTime}ms`
     });
-    
+
     // Все равно отвечаем 200, чтобы Wappi не повторял запрос
     if (!res.headersSent) {
       res.status(200).json({ received: true, error: 'Internal error', requestId });
