@@ -1,13 +1,29 @@
 const axios = require('axios');
-const { findProductsBySemanticSearch } = require('../utils/gemini');
+const { generateId } = require('../utils/uuid');
+const { getIntentFromGemini, findProductsBySemanticSearch, generateClarificationQuestions } = require('../utils/gemini');
 const { models } = require('../models/database');
 
-const { Product, Offer, Store } = models;
+const {
+  CustomerSession,
+  SearchConversation,
+  SearchMessage,
+  SearchIntent,
+  SearchRequest,
+  SearchResult,
+  Product,
+  Offer,
+  Store,
+  Category
+} = models;
 
 // Константы конфигурации WAPPI
 const WAPPI_API_URL = process.env.WAPPI_API_URL || 'https://wappi.pro/api/sync/message/send';
 const PROFILE_ID_WAPPI = process.env.PROFILE_ID_WAPPI;
 const API_KEY_WAPPI = process.env.API_KEY_WAPPI;
+
+// Константы для работы с conversations
+const CONVERSATION_TTL_MS = 24 * 60 * 60 * 1000;
+const RESULT_TTL_MS = 24 * 60 * 60 * 1000;
 
 // Настройка Axios с таймаутами
 const axiosInstance = axios.create({
@@ -16,6 +32,14 @@ const axiosInstance = axios.create({
     'Content-Type': 'application/json'
   }
 });
+
+function nowPlus(ms) {
+  return new Date(Date.now() + ms);
+}
+
+function normalizeText(value) {
+  return String(value || '').trim().toLowerCase();
+}
 
 // Retry функция для запросов к внешнему API (Wappi)
 async function sendWithRetry(url, payload, headers, maxRetries = 3) {
@@ -74,71 +98,270 @@ async function buildCandidatesByText(text) {
   }
 }
 
-// Функция для получения предложений по товару
-async function getProductOffers(productId) {
-  try {
-    const offers = await Offer.find({
-      productId: productId,
-      isAvailable: true
-    }).lean();
+// Функция фильтрации кандидатов (из customerController)
+function filterCandidatesByIntent(candidates, intent) {
+  let filtered = [...candidates];
 
-    if (offers.length === 0) {
-      return [];
-    }
-
-    const storeIds = [...new Set(offers.map(offer => offer.storeId))];
-    const stores = storeIds.length > 0
-      ? await Store.find({ id: { $in: storeIds } }).lean()
-      : [];
-    const storeById = new Map(stores.map(store => [store.id, store]));
-
-    return offers.map(offer => {
-      const store = storeById.get(offer.storeId);
-      return {
-        price: offer.price,
-        currency: offer.currency || 'RUB',
-        quantity: offer.quantity,
-        store: store ? {
-          name: store.name,
-          address: store.address
-        } : null
-      };
-    }).filter(offer => offer.store !== null);
-  } catch (error) {
-    console.error('Ошибка при получении предложений:', error);
-    return [];
+  // Фильтрация по бренду
+  if (intent.brand) {
+    const brandNormalized = normalizeText(intent.brand);
+    filtered = filtered.filter(item => {
+      if (!item.brandName) return false;
+      const itemBrand = normalizeText(item.brandName);
+      return itemBrand === brandNormalized || itemBrand.includes(brandNormalized) || brandNormalized.includes(itemBrand);
+    });
   }
+
+  // Фильтрация по упаковке
+  if (intent.packageInfo !== null && intent.packageInfo !== undefined) {
+    const packageNormalized = normalizeText(intent.packageInfo);
+    filtered = filtered.filter(item => {
+      if (!item.packageInfo) return false;
+      const itemPackage = normalizeText(item.packageInfo);
+      const extractNumbers = (str) => str.replace(/[^\d.,]/g, '').replace(',', '.');
+      const itemNums = extractNumbers(itemPackage);
+      const intentNums = extractNumbers(packageNormalized);
+
+      if (itemNums && intentNums && itemNums === intentNums) {
+        return true;
+      }
+      return itemPackage === packageNormalized ||
+        itemPackage.includes(packageNormalized) ||
+        packageNormalized.includes(itemPackage);
+    });
+  }
+
+  // Фильтрация по типу товара
+  if (intent.type) {
+    const typeLower = normalizeText(intent.type);
+    const typeKeywords = {
+      'zero': ['zero', 'ноль', '0', 'без сахара', 'безсахар'],
+      'light': ['light', 'лайт', 'легкий'],
+      'diet': ['diet', 'диет', 'диетический'],
+      'classic': ['classic', 'классическая', 'классик', 'обычная', 'original', 'оригинал', '1'],
+      'обычная': ['обычная', 'классическая', 'classic', 'original', 'оригинал']
+    };
+
+    const keywords = typeKeywords[typeLower] || [typeLower];
+
+    filtered = filtered.filter(item => {
+      const nameLower = normalizeText(item.name);
+      const descLower = normalizeText(item.description || '');
+      const brandLower = normalizeText(item.brandName || '');
+      const fullText = `${nameLower} ${descLower} ${brandLower}`;
+
+      if (typeLower === 'classic' || typeLower === 'обычная') {
+        const hasZero = ['zero', 'ноль', '0', 'без сахара', 'безсахар'].some(k => fullText.includes(k));
+        const hasLight = ['light', 'лайт', 'легкий'].some(k => fullText.includes(k));
+        const hasDiet = ['diet', 'диет', 'диетический'].some(k => fullText.includes(k));
+
+        if (!hasZero && !hasLight && !hasDiet) {
+          return true;
+        }
+      }
+
+      return keywords.some(keyword => fullText.includes(keyword));
+    });
+  }
+
+  // Фильтрация по типу упаковки
+  if (intent.packageType) {
+    const packageTypeLower = normalizeText(intent.packageType);
+    filtered = filtered.filter(item => {
+      const nameLower = normalizeText(item.name || '');
+      const descLower = normalizeText(item.description || '');
+      const packageInfoLower = normalizeText(item.packageInfo || '');
+      const skuLower = normalizeText(item.sku || '');
+      const fullText = `${nameLower} ${descLower} ${packageInfoLower} ${skuLower}`;
+
+      if (packageTypeLower === 'glass' || packageTypeLower === 'стекло') {
+        return fullText.includes('стекл') || fullText.includes('glass');
+      }
+      if (packageTypeLower === 'can' || packageTypeLower === 'металл' || packageTypeLower === 'банка') {
+        return fullText.includes('банка') ||
+          fullText.includes('can') ||
+          fullText.includes('жест') ||
+          fullText.includes('металл') ||
+          fullText.includes('жб') ||
+          fullText.includes('железн') ||
+          fullText.includes('металлическ');
+      }
+      if (packageTypeLower === 'plastic' || packageTypeLower === 'пластик') {
+        return fullText.includes('пласти') || fullText.includes('pet');
+      }
+      return false;
+    });
+  }
+
+  return filtered;
 }
 
-// Функция для форматирования результатов поиска в текст для WhatsApp
-function formatSearchResults(candidates, maxResults = 5) {
-  if (candidates.length === 0) {
-    return 'К сожалению, я не нашел товары по вашему запросу. Попробуйте изменить формулировку или укажите бренд.';
-  }
-
-  let message = `🔍 Найдено товаров: ${candidates.length}\n\n`;
-
-  // Показываем только первые maxResults товаров
-  const productsToShow = candidates.slice(0, maxResults);
-
-  for (let i = 0; i < productsToShow.length; i++) {
-    const product = productsToShow[i];
-    const productName = product.name || 'Без названия';
-    const brandName = product.brandName ? ` (${product.brandName})` : '';
-    const packageInfo = product.packageInfo ? ` - ${product.packageInfo}` : '';
-
-    // Добавляем описание, если оно короткое
-    const description = product.description && product.description.length < 50
-      ? `\n   ${product.description}`
-      : '';
-
-    message += `${i + 1}. ${productName}${brandName}${packageInfo}${description}\n\n`;
-  }
-
-  if (candidates.length > maxResults) {
-    message += `... и еще ${candidates.length - maxResults} товаров.\n\nУточните запрос для более точного поиска (например, укажите бренд или размер).`;
+// Функция performSearch (из customerController)
+async function performSearch({ text, geo, radiusMeters, intent }) {
+  let products = [];
+  const candidateIds = intent && intent.filters ? intent.filters.candidateProductIds : null;
+  if (Array.isArray(candidateIds) && candidateIds.length > 0) {
+    products = await Product.find({ id: { $in: candidateIds } }).lean();
   } else {
-    message += 'Уточните запрос, если нужен конкретный товар.';
+    const searchTerm = normalizeText(text);
+    const query = {};
+    if (searchTerm) {
+      query.$or = [
+        { name: { $regex: searchTerm, $options: 'i' } },
+        { description: { $regex: searchTerm, $options: 'i' } },
+        { brandName: { $regex: searchTerm, $options: 'i' } },
+        { sku: { $regex: searchTerm, $options: 'i' } }
+      ];
+    }
+    if (intent && intent.brand) {
+      query.brandName = { $regex: normalizeText(intent.brand), $options: 'i' };
+    }
+    products = await Product.find(query).lean();
+  }
+
+  if (intent && intent.packageInfo !== null && intent.packageInfo !== undefined) {
+    products = products.filter(product =>
+      normalizeText(product.packageInfo) === normalizeText(intent.packageInfo)
+    );
+  }
+
+  if (products.length === 0) {
+    return [];
+  }
+
+  const productIds = products.map(product => product.id);
+  const offers = await Offer.find({
+    productId: { $in: productIds },
+    isAvailable: true
+  }).lean();
+
+  const storeIds = [...new Set(offers.map(offer => offer.storeId))];
+  const stores = storeIds.length > 0
+    ? await Store.find({ id: { $in: storeIds } }).lean()
+    : [];
+  const storeById = new Map(stores.map(store => [store.id, store]));
+
+  const categoryIds = [...new Set(products.map(product => product.categoryId))];
+  const categories = categoryIds.length > 0
+    ? await Category.find({ id: { $in: categoryIds } }).lean()
+    : [];
+  const categoryById = new Map(categories.map(category => [category.id, category]));
+
+  const offersByProduct = new Map();
+
+  for (const offer of offers) {
+    const store = storeById.get(offer.storeId);
+    if (!store) continue;
+
+    const mappedOffer = {
+      offerId: offer.id,
+      price: offer.price,
+      currency: offer.currency,
+      isAvailable: offer.isAvailable,
+      quantity: offer.quantity,
+      store: {
+        id: store.id,
+        name: store.name,
+        address: store.address,
+        location: store.location,
+        locationCoords: store.locationCoords || null
+      }
+    };
+
+    if (!offersByProduct.has(offer.productId)) {
+      offersByProduct.set(offer.productId, []);
+    }
+    offersByProduct.get(offer.productId).push(mappedOffer);
+  }
+
+  return products
+    .map(product => {
+      const offersWithStores = (offersByProduct.get(product.id) || [])
+        .sort((a, b) => (a.price || 0) - (b.price || 0));
+
+      const category = categoryById.get(product.categoryId) || null;
+
+      return {
+        product: {
+          id: product.id,
+          name: product.name,
+          description: product.description,
+          images: product.images,
+          category: category ? { id: category.id, name: category.name } : null,
+          sku: product.sku,
+          brandName: product.brandName,
+          packageInfo: product.packageInfo,
+          brandId: product.brandId
+        },
+        offers: offersWithStores,
+        totalOffers: offersWithStores.length,
+        nearestStore: offersWithStores.length > 0 ? {
+          name: offersWithStores[0].store.name,
+          address: offersWithStores[0].store.address,
+          location: offersWithStores[0].store.location
+        } : null
+      };
+    });
+}
+
+// Получение или создание conversation для chatId
+async function getOrCreateConversation(chatId) {
+  // Используем chatId как sessionId для Wappi
+  let conversation = await SearchConversation.findOne({ sessionId: chatId })
+    .sort({ createdAt: -1 })
+    .lean();
+
+  if (!conversation || new Date(conversation.expiresAt) < new Date()) {
+    // Создаем новую conversation
+    const newConversation = await SearchConversation.create({
+      id: generateId(),
+      sessionId: chatId,
+      state: 'NEW',
+      intentId: null,
+      requestId: null,
+      resultId: null,
+      expiresAt: nowPlus(CONVERSATION_TTL_MS)
+    });
+    conversation = newConversation.toObject();
+  } else {
+    // Обновляем expiresAt
+    await SearchConversation.updateOne(
+      { id: conversation.id },
+      { expiresAt: nowPlus(CONVERSATION_TTL_MS) }
+    );
+  }
+
+  return conversation;
+}
+
+// Форматирование результатов поиска для WhatsApp
+function formatSearchResultsWithStores(item) {
+  if (!item || item.offers.length === 0) {
+    return 'К сожалению, в базе нет предложений по этому товару.';
+  }
+
+  const product = item.product;
+  const productName = `${product.name}${product.brandName ? ' (' + product.brandName + ')' : ''}${product.packageInfo ? ' - ' + product.packageInfo : ''}`;
+
+  let message = `✅ Найден товар: ${productName}\n\n`;
+  message += `Найдено предложений: ${item.totalOffers}\n\n`;
+
+  // Показываем первые 5 магазинов
+  const storesToShow = item.offers.slice(0, 5);
+  storesToShow.forEach((offer, index) => {
+    message += `${index + 1}. ${offer.store.name}\n`;
+    if (offer.store.address) {
+      message += `   Адрес: ${offer.store.address}\n`;
+    }
+    message += `   Цена: ${offer.price} ${offer.currency || 'RUB'}\n`;
+    if (offer.store.location) {
+      message += `   ${offer.store.location}\n`;
+    }
+    message += '\n';
+  });
+
+  if (item.offers.length > 5) {
+    message += `... и еще ${item.offers.length - 5} предложений.`;
   }
 
   return message;
@@ -151,23 +374,15 @@ async function sendWappiMessage(phoneNumber, messageText) {
     throw new Error('WAPPI credentials not configured');
   }
 
-  // Нормализуем номер телефона (убираем @c.us если есть и оставляем только цифры)
-  // Формат chatId: "79001234567@c.us" или просто "79001234567"
   let normalizedPhone = phoneNumber.replace('@c.us', '').replace(/\D/g, '');
 
-  // Если номер начинается не с цифры (например, если есть префикс), оставляем как есть
-  // Wappi ожидает номер в формате только цифр
-
-  // Формируем URL для Wappi API
   const wappiUrl = `${WAPPI_API_URL}?profile_id=${encodeURIComponent(PROFILE_ID_WAPPI)}`;
 
-  // Тело запроса к Wappi
   const payload = {
     recipient: normalizedPhone,
     body: messageText
   };
 
-  // Заголовки для Wappi
   const headers = {
     accept: 'application/json',
     Authorization: API_KEY_WAPPI,
@@ -207,13 +422,280 @@ async function sendWappiMessage(phoneNumber, messageText) {
   }
 }
 
+// Основная функция обработки сообщения (адаптированная из customerController)
+async function processWappiMessage(chatId, text, requestId) {
+  const conversation = await getOrCreateConversation(chatId);
+  const conversationId = conversation.id;
+
+  // Создаем сообщение пользователя
+  await SearchMessage.create({
+    id: generateId(),
+    conversationId,
+    sender: 'CUSTOMER',
+    text: text || '',
+    attachmentIds: []
+  });
+
+  // Получаем или создаем intent
+  let intent = conversation.intentId
+    ? await SearchIntent.findOne({ id: conversation.intentId })
+    : null;
+  if (!intent) {
+    intent = await SearchIntent.create({
+      id: generateId(),
+      conversationId,
+      rawText: text || '',
+      filters: {}
+    });
+    await SearchConversation.updateOne(
+      { id: conversationId },
+      { intentId: intent.id, updatedAt: new Date() }
+    );
+  } else if (text) {
+    intent.rawText = (intent.rawText ? intent.rawText + ' ' : '') + text;
+  }
+
+  // Обновляем intent на основе ответов пользователя
+  if (text && text.trim()) {
+    const currentAnswer = normalizeText(text);
+
+    // Проверяем ответы на вопросы о типе
+    const isTypeAnswer = currentAnswer.includes('classic') ||
+      currentAnswer.includes('zero') ||
+      currentAnswer.includes('light') ||
+      currentAnswer.includes('классическая') ||
+      currentAnswer.includes('классик') ||
+      currentAnswer === '1' ||
+      currentAnswer.includes('ноль');
+
+    if (isTypeAnswer && !intent.type) {
+      if (currentAnswer.includes('classic') || currentAnswer.includes('классическая') || currentAnswer.includes('классик') || currentAnswer === '1') {
+        intent.type = 'classic';
+      } else if (currentAnswer.includes('zero') || currentAnswer.includes('ноль')) {
+        intent.type = 'zero';
+      } else if (currentAnswer.includes('light') || currentAnswer.includes('лайт')) {
+        intent.type = 'light';
+      }
+      await intent.save();
+    }
+
+    // Проверяем ответы о таре
+    const isTaraAnswer = currentAnswer.includes('металл') ||
+      currentAnswer.includes('стекло') ||
+      currentAnswer.includes('банка') ||
+      currentAnswer.includes('пластик') ||
+      currentAnswer.includes('can') ||
+      currentAnswer.includes('glass') ||
+      currentAnswer.includes('plastic') ||
+      currentAnswer.includes('жб');
+
+    if (isTaraAnswer && !intent.packageType) {
+      if (currentAnswer.includes('металл') || currentAnswer.includes('банка') || currentAnswer.includes('can') || currentAnswer.includes('жб')) {
+        intent.packageType = 'can';
+      } else if (currentAnswer.includes('стекло') || currentAnswer.includes('glass')) {
+        intent.packageType = 'glass';
+      } else if (currentAnswer.includes('пластик') || currentAnswer.includes('plastic')) {
+        intent.packageType = 'plastic';
+      }
+      await intent.save();
+    }
+  }
+
+  // Получаем кандидатов товаров
+  let candidates = [];
+  if (intent.filters && Array.isArray(intent.filters.candidateProductIds) && intent.filters.candidateProductIds.length > 0) {
+    candidates = await Product.find({
+      id: { $in: intent.filters.candidateProductIds },
+      isPayed: true,
+      paymentExpiresAt: { $gt: new Date() }
+    }).lean();
+  } else {
+    candidates = await buildCandidatesByText(text);
+    candidates = candidates.filter(p => p.isPayed && p.paymentExpiresAt && new Date(p.paymentExpiresAt) > new Date());
+  }
+
+  if (candidates.length === 0) {
+    await SearchConversation.updateOne(
+      { id: conversationId },
+      { state: 'NEEDS_CLARIFICATION', updatedAt: new Date() }
+    );
+    intent.filters = {};
+    intent.brand = null;
+    intent.packageInfo = null;
+    intent.type = null;
+    intent.packageType = null;
+    await intent.save();
+
+    return 'Не нашел такой товар. Попробуйте написать название по-другому или укажите бренд.';
+  }
+
+  // Используем Gemini для извлечения intent
+  let geminiResult = null;
+  if (text && text.trim() && candidates.length > 0) {
+    try {
+      const candidatesForGemini = candidates.slice(0, 15).map(item => ({
+        id: item.id,
+        name: item.name,
+        brandName: item.brandName,
+        packageInfo: item.packageInfo,
+        description: item.description,
+        sku: item.sku
+      }));
+
+      geminiResult = await getIntentFromGemini({
+        message: text.trim(),
+        candidates: candidatesForGemini,
+        known: {
+          brand: intent.brand || null,
+          packageInfo: intent.packageInfo !== undefined ? intent.packageInfo : null,
+          type: intent.type || null,
+          packageType: intent.packageType || null
+        }
+      });
+
+      if (geminiResult && geminiResult.action === 'READY_TO_SEARCH') {
+        const aiIntent = geminiResult.intent || {};
+        if (aiIntent.brand !== undefined && aiIntent.brand !== null) {
+          intent.brand = aiIntent.brand;
+        }
+        if (aiIntent.type !== undefined && aiIntent.type !== null) {
+          intent.type = aiIntent.type;
+        }
+        if (aiIntent.packageInfo !== undefined && aiIntent.packageInfo !== null) {
+          intent.packageInfo = aiIntent.packageInfo;
+        }
+        if (aiIntent.packageType !== undefined && aiIntent.packageType !== null) {
+          intent.packageType = aiIntent.packageType;
+        }
+        await intent.save();
+      }
+    } catch (error) {
+      console.error('Ошибка при получении intent от Gemini:', error);
+    }
+  }
+
+  // Фильтруем кандидатов
+  const previousCandidateIds = intent.filters && Array.isArray(intent.filters.candidateProductIds)
+    ? intent.filters.candidateProductIds
+    : candidates.map(c => c.id);
+
+  candidates = filterCandidatesByIntent(candidates, {
+    brand: intent.brand || null,
+    packageInfo: intent.packageInfo !== undefined ? intent.packageInfo : null,
+    type: intent.type || null,
+    packageType: intent.packageType || null
+  });
+
+  intent.filters = {
+    ...(intent.filters || {}),
+    candidateProductIds: candidates.map(item => item.id)
+  };
+  await intent.save();
+
+  // Если остался один товар - показываем магазины
+  if (candidates.length === 1) {
+    intent.filters = {
+      ...(intent.filters || {}),
+      candidateProductIds: [candidates[0].id]
+    };
+    await intent.save();
+
+    // Выполняем поиск магазинов (без геолокации для Wappi)
+    const items = await performSearch({ text, geo: null, radiusMeters: null, intent });
+
+    if (items.length > 0 && items[0].offers.length > 0) {
+      const responseText = formatSearchResultsWithStores(items[0]);
+
+      await SearchMessage.create({
+        id: generateId(),
+        conversationId,
+        sender: 'SYSTEM',
+        text: responseText
+      });
+
+      await SearchConversation.updateOne(
+        { id: conversationId },
+        { state: 'DONE', updatedAt: new Date() }
+      );
+
+      return responseText;
+    } else {
+      const productName = `${candidates[0].name}${candidates[0].brandName ? ' (' + candidates[0].brandName + ')' : ''}${candidates[0].packageInfo ? ' - ' + candidates[0].packageInfo : ''}`;
+      const responseText = `Найден товар: ${productName}\n\nК сожалению, в базе нет предложений по этому товару.`;
+
+      await SearchMessage.create({
+        id: generateId(),
+        conversationId,
+        sender: 'SYSTEM',
+        text: responseText
+      });
+
+      return responseText;
+    }
+  }
+
+  // Если товаров больше одного - задаем уточняющие вопросы
+  const previousSystemMessages = await SearchMessage.find({
+    conversationId,
+    sender: 'SYSTEM'
+  })
+    .sort({ createdAt: -1 })
+    .limit(10)
+    .lean();
+
+  const previousQuestions = previousSystemMessages
+    .map(msg => msg.text)
+    .filter(text => text && text.trim().length > 0);
+
+  let clarification = null;
+  try {
+    clarification = await generateClarificationQuestions({
+      candidates: candidates.map(item => ({
+        id: item.id,
+        name: item.name,
+        brandName: item.brandName,
+        packageInfo: item.packageInfo,
+        description: item.description,
+        sku: item.sku
+      })),
+      known: {
+        brand: intent.brand || null,
+        packageInfo: intent.packageInfo !== undefined ? intent.packageInfo : null,
+        type: intent.type || null,
+        packageType: intent.packageType || null
+      },
+      previousQuestions: previousQuestions
+    });
+  } catch (error) {
+    console.error('Ошибка при генерации вопросов:', error);
+    clarification = { questions: ['Уточните, какой именно товар вас интересует?'], quickReplies: [] };
+  }
+
+  await SearchConversation.updateOne(
+    { id: conversationId },
+    { state: 'NEEDS_CLARIFICATION', updatedAt: new Date() }
+  );
+
+  const question = clarification.questions.length > 0
+    ? clarification.questions[0]
+    : 'Уточните, какой именно товар вас интересует?';
+
+  await SearchMessage.create({
+    id: generateId(),
+    conversationId,
+    sender: 'SYSTEM',
+    text: question
+  });
+
+  return question;
+}
+
 // Основная функция обработки webhook от Wappi
 async function handleWappiWebhook(req, res) {
   const startTime = Date.now();
   const requestId = `wappi-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
   const clientIp = req.ip || req.connection.remoteAddress || req.headers['x-forwarded-for'] || 'unknown';
 
-  // Логируем входящий запрос
   console.log(`[WAPPI WEBHOOK] [${requestId}] 📥 Входящий запрос:`, {
     method: req.method,
     path: req.path,
@@ -224,12 +706,9 @@ async function handleWappiWebhook(req, res) {
   });
 
   try {
-    // Логируем полное тело запроса для отладки (маскируем чувствительные данные)
     const rawBody = req.body || {};
     const maskedBody = JSON.parse(JSON.stringify(rawBody));
 
-    // Маскируем чувствительные данные в теле запроса
-    // Обрабатываем структуру { messages: [...] }
     if (maskedBody.messages && Array.isArray(maskedBody.messages)) {
       maskedBody.messages = maskedBody.messages.map(msg => {
         const maskedMsg = { ...msg };
@@ -245,78 +724,44 @@ async function handleWappiWebhook(req, res) {
             ? `${from.substring(0, 3)}****${from.substring(from.length - 2)}`
             : '****';
         }
-        if (maskedMsg.to) {
-          const to = maskedMsg.to;
-          maskedMsg.to = to.length > 7
-            ? `${to.substring(0, 3)}****${to.substring(to.length - 2)}`
-            : '****';
-        }
         return maskedMsg;
       });
     }
-    // Обрабатываем старую структуру { message: {...} }
-    else if (maskedBody.message && maskedBody.message.chatId) {
-      const chatId = maskedBody.message.chatId;
-      if (chatId.length > 7) {
-        maskedBody.message.chatId = `${chatId.substring(0, 3)}****${chatId.substring(chatId.length - 2)}`;
-      } else {
-        maskedBody.message.chatId = '****';
-      }
-    }
 
     console.log(`[WAPPI WEBHOOK] [${requestId}] 📋 Полное тело запроса (маскированное):`, JSON.stringify(maskedBody, null, 2));
-    console.log(`[WAPPI WEBHOOK] [${requestId}] 📋 Ключи в req.body:`, Object.keys(rawBody));
 
-    // Извлекаем данные из запроса
-    // Wappi отправляет данные в формате { messages: [...] }
     const messages = rawBody.messages || rawBody.message || (Array.isArray(rawBody) ? rawBody : []);
-
-    // Если это массив сообщений, берем первое
     const message = Array.isArray(messages) && messages.length > 0 ? messages[0] : messages;
 
-    // Логируем полученные данные (без чувствительной информации)
-    console.log(`[WAPPI WEBHOOK] [${requestId}] 📋 Извлеченные данные:`, {
-      hasMessages: !!messages,
-      messagesCount: Array.isArray(messages) ? messages.length : 0,
-      hasMessage: !!message,
-      messageType: message ? typeof message : 'undefined',
-      messageKeys: message && typeof message === 'object' ? Object.keys(message) : 'не объект',
-      allBodyKeys: Object.keys(rawBody)
-    });
-
     if (!message || typeof message !== 'object') {
-      console.error(`[WAPPI WEBHOOK] [${requestId}] ❌ Отсутствует или некорректное поле messages/message в запросе от Wappi`);
-      console.error(`[WAPPI WEBHOOK] [${requestId}] ❌ Доступные ключи в req.body:`, Object.keys(rawBody));
-      res.status(200).json({ received: true, error: 'Missing or invalid messages field', availableKeys: Object.keys(rawBody) });
+      console.error(`[WAPPI WEBHOOK] [${requestId}] ❌ Отсутствует или некорректное поле messages/message`);
+      res.status(200).json({ received: true, error: 'Missing or invalid messages field' });
       return;
     }
 
-    // Извлекаем данные из сообщения (структура Wappi)
     const chatId = message.chatId || message.from;
     const body = message.body;
     const fromMe = message.is_me || message.fromMe || false;
     const profile_id = message.profile_id;
 
-    // Игнорируем сообщения, отправленные нами самими
     if (fromMe === true || message.is_me === true) {
-      console.log(`[WAPPI WEBHOOK] [${requestId}] ⏭️  Игнорируем сообщение, отправленное нами самими (is_me/fromMe: true)`);
+      console.log(`[WAPPI WEBHOOK] [${requestId}] ⏭️  Игнорируем сообщение, отправленное нами самими`);
       res.status(200).json({ received: true, ignored: true, reason: 'fromMe' });
       return;
     }
 
     if (!body || !body.trim()) {
-      console.log(`[WAPPI WEBHOOK] [${requestId}] ⚠️  Получено пустое сообщение от Wappi`);
+      console.log(`[WAPPI WEBHOOK] [${requestId}] ⚠️  Получено пустое сообщение`);
       res.status(200).json({ received: true, ignored: true, reason: 'empty body' });
       return;
     }
 
     if (!chatId) {
-      console.error(`[WAPPI WEBHOOK] [${requestId}] ❌ Отсутствует chatId в сообщении от Wappi`);
+      console.error(`[WAPPI WEBHOOK] [${requestId}] ❌ Отсутствует chatId`);
       res.status(200).json({ received: true, error: 'Missing chatId' });
       return;
     }
 
-    // Маскируем чувствительные данные для логов
     const maskedChatId = chatId.length > 7
       ? `${chatId.substring(0, 3)}****${chatId.substring(chatId.length - 2)}`
       : '****';
@@ -329,48 +774,28 @@ async function handleWappiWebhook(req, res) {
       chatId: maskedChatId,
       bodyLength: body.length,
       bodyPreview: bodyPreview,
-      fromMe: fromMe || false,
-      wh_type: message.wh_type || 'не указан'
+      fromMe: fromMe || false
     });
 
-    // Сразу отвечаем 200 OK, чтобы Wappi не ждал
     res.status(200).json({ received: true, requestId });
 
-    // Выполняем поиск товаров асинхронно
+    // Обрабатываем сообщение асинхронно
     (async () => {
       const processingStartTime = Date.now();
       try {
         console.log(`[WAPPI WEBHOOK] [${requestId}] 🔍 Начинаем обработку запроса...`);
 
-        // Шаг Б: Поиск товаров по тексту
-        const searchStartTime = Date.now();
-        console.log(`[WAPPI WEBHOOK] [${requestId}] 🔎 Запуск поиска товаров по запросу: "${bodyPreview}"`);
-        const candidates = await buildCandidatesByText(body);
-        const searchDuration = Date.now() - searchStartTime;
-        console.log(`[WAPPI WEBHOOK] [${requestId}] ✅ Поиск завершен за ${searchDuration}ms, найдено товаров: ${candidates.length}`);
+        const responseText = await processWappiMessage(chatId, body, requestId);
 
-        // Шаг В: Форматируем результат
-        const formatStartTime = Date.now();
-        const responseText = formatSearchResults(candidates);
-        const formatDuration = Date.now() - formatStartTime;
-        console.log(`[WAPPI WEBHOOK] [${requestId}] 📝 Результат отформатирован за ${formatDuration}ms, длина сообщения: ${responseText.length} символов`);
-
-        // Шаг Г: Отправляем результат через Wappi API
-        const sendStartTime = Date.now();
         console.log(`[WAPPI WEBHOOK] [${requestId}] 📤 Отправка ответа пользователю через Wappi API...`);
         await sendWappiMessage(chatId, responseText);
-        const sendDuration = Date.now() - sendStartTime;
 
         const totalProcessingTime = Date.now() - processingStartTime;
         const totalRequestTime = Date.now() - startTime;
 
         console.log(`[WAPPI WEBHOOK] [${requestId}] ✅ Успешно обработан запрос:`, {
-          searchDuration: `${searchDuration}ms`,
-          formatDuration: `${formatDuration}ms`,
-          sendDuration: `${sendDuration}ms`,
           totalProcessingTime: `${totalProcessingTime}ms`,
           totalRequestTime: `${totalRequestTime}ms`,
-          candidatesFound: candidates.length,
           responseLength: responseText.length
         });
 
@@ -385,29 +810,22 @@ async function handleWappiWebhook(req, res) {
           totalRequestTime: `${totalRequestTime}ms`
         });
 
-        // Пытаемся отправить сообщение об ошибке
         try {
-          console.log(`[WAPPI WEBHOOK] [${requestId}] 📤 Попытка отправить сообщение об ошибке пользователю...`);
           await sendWappiMessage(chatId, 'Произошла ошибка при поиске товаров. Попробуйте позже.');
-          console.log(`[WAPPI WEBHOOK] [${requestId}] ✅ Сообщение об ошибке отправлено`);
         } catch (sendError) {
-          console.error(`[WAPPI WEBHOOK] [${requestId}] ❌ Не удалось отправить сообщение об ошибке:`, {
-            error: sendError.message,
-            stack: sendError.stack
-          });
+          console.error(`[WAPPI WEBHOOK] [${requestId}] ❌ Не удалось отправить сообщение об ошибке:`, sendError);
         }
       }
     })();
 
   } catch (error) {
     const totalRequestTime = Date.now() - startTime;
-    console.error(`[WAPPI WEBHOOK] [${requestId}] 💥 Критическая ошибка при обработке webhook от Wappi:`, {
+    console.error(`[WAPPI WEBHOOK] [${requestId}] 💥 Критическая ошибка:`, {
       error: error.message,
       stack: error.stack,
       totalRequestTime: `${totalRequestTime}ms`
     });
 
-    // Все равно отвечаем 200, чтобы Wappi не повторял запрос
     if (!res.headersSent) {
       res.status(200).json({ received: true, error: 'Internal error', requestId });
     }
