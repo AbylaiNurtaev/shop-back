@@ -428,10 +428,110 @@ async function sendWappiMessage(phoneNumber, messageText) {
   }
 }
 
+// Проверка, является ли сообщение поисковым запросом
+function isSearchQuery(text) {
+  if (!text || !text.trim()) return false;
+  
+  const normalized = normalizeText(text);
+  const trimmed = normalized.trim();
+  
+  // Слишком короткие сообщения (меньше 2 символов) - не поисковые запросы
+  if (trimmed.length < 2) return false;
+  
+  // Простые приветствия и короткие фразы - не поисковые запросы
+  const greetings = ['привет', 'здравствуй', 'здравствуйте', 'hi', 'hello', 'да', 'нет', 'ок', 'окей', 'спасибо', 'благодарю'];
+  if (greetings.includes(trimmed)) return false;
+  
+  // Если сообщение содержит только цифры или один символ - не поисковый запрос
+  if (/^[\d\s\?\!\.\,]+$/.test(trimmed) && trimmed.length < 3) return false;
+  
+  // Если сообщение слишком длинное (больше 100 символов) - возможно, не поисковый запрос
+  if (trimmed.length > 100) return false;
+  
+  return true;
+}
+
 // Основная функция обработки сообщения (адаптированная из customerController)
 async function processWappiMessage(chatId, text, requestId) {
   const conversation = await getOrCreateConversation(chatId);
   const conversationId = conversation.id;
+
+  // Проверяем, является ли сообщение поисковым запросом
+  if (!isSearchQuery(text)) {
+    // Если это не поисковый запрос, отвечаем нейтрально
+    const neutralResponses = [
+      'Напишите, какой товар вы ищете? Например: "Кола", "Найди кроссовки Nike"',
+      'Я могу помочь найти товар. Опишите, что вы ищете?',
+      'Для поиска товара напишите название или описание. Например: "Coca-Cola" или "Найди кроссовки"'
+    ];
+    const randomResponse = neutralResponses[Math.floor(Math.random() * neutralResponses.length)];
+    
+    await SearchMessage.create({
+      id: generateId(),
+      conversationId,
+      sender: 'CUSTOMER',
+      text: text || '',
+      attachmentIds: []
+    });
+    
+    await SearchMessage.create({
+      id: generateId(),
+      conversationId,
+      sender: 'SYSTEM',
+      text: randomResponse
+    });
+    
+    return randomResponse;
+  }
+
+  // Если предыдущий поиск завершен (DONE), сбрасываем состояние для нового поиска
+  if (conversation.state === 'DONE') {
+    console.log(`[WAPPI] Сбрасываем состояние conversation для нового поиска`);
+    
+    // Удаляем старый intent
+    if (conversation.intentId) {
+      await SearchIntent.deleteOne({ id: conversation.intentId });
+    }
+    
+    // Создаем новую conversation
+    const newConversation = await SearchConversation.create({
+      id: generateId(),
+      sessionId: chatId,
+      state: 'NEW',
+      intentId: null,
+      requestId: null,
+      resultId: null,
+      expiresAt: nowPlus(CONVERSATION_TTL_MS)
+    });
+    
+    // Обновляем conversationId для дальнейшей работы
+    const conversationId = newConversation.id;
+    
+    // Создаем новый intent
+    const intent = await SearchIntent.create({
+      id: generateId(),
+      conversationId,
+      rawText: text || '',
+      filters: {}
+    });
+    
+    await SearchConversation.updateOne(
+      { id: conversationId },
+      { intentId: intent.id, updatedAt: new Date() }
+    );
+    
+    // Создаем сообщение пользователя
+    await SearchMessage.create({
+      id: generateId(),
+      conversationId,
+      sender: 'CUSTOMER',
+      text: text || '',
+      attachmentIds: []
+    });
+    
+    // Продолжаем с новым conversation и intent
+    return await processSearchWithIntent(conversationId, intent, text, requestId);
+  }
 
   // Создаем сообщение пользователя
   await SearchMessage.create({
@@ -460,6 +560,12 @@ async function processWappiMessage(chatId, text, requestId) {
   } else if (text) {
     intent.rawText = (intent.rawText ? intent.rawText + ' ' : '') + text;
   }
+
+  return await processSearchWithIntent(conversationId, intent, text, requestId);
+}
+
+// Функция обработки поиска с intent
+async function processSearchWithIntent(conversationId, intent, text, requestId) {
 
   // Обновляем intent на основе ответов пользователя
   if (text && text.trim()) {
@@ -624,6 +730,16 @@ async function processWappiMessage(chatId, text, requestId) {
         { state: 'DONE', updatedAt: new Date() }
       );
 
+      // После показа результатов сбрасываем состояние для следующего поиска
+      // Удаляем intent, чтобы следующий запрос начался заново
+      if (intent && intent.id) {
+        await SearchIntent.deleteOne({ id: intent.id });
+      }
+      await SearchConversation.updateOne(
+        { id: conversationId },
+        { intentId: null, state: 'DONE', updatedAt: new Date() }
+      );
+
       return responseText;
     } else {
       const productName = `${candidates[0].name}${candidates[0].brandName ? ' (' + candidates[0].brandName + ')' : ''}${candidates[0].packageInfo ? ' - ' + candidates[0].packageInfo : ''}`;
@@ -635,6 +751,20 @@ async function processWappiMessage(chatId, text, requestId) {
         sender: 'SYSTEM',
         text: responseText
       });
+
+      await SearchConversation.updateOne(
+        { id: conversationId },
+        { state: 'DONE', updatedAt: new Date() }
+      );
+
+      // Сбрасываем состояние для следующего поиска
+      if (intent && intent.id) {
+        await SearchIntent.deleteOne({ id: intent.id });
+      }
+      await SearchConversation.updateOne(
+        { id: conversationId },
+        { intentId: null, state: 'DONE', updatedAt: new Date() }
+      );
 
       return responseText;
     }
@@ -684,14 +814,14 @@ async function processWappiMessage(chatId, text, requestId) {
 
   // Формируем сообщение с вопросом и списком товаров
   let responseText = '';
-  
+
   // Добавляем вопрос
   const question = clarification.questions.length > 0
     ? clarification.questions[0]
     : 'Уточните, какой именно товар вас интересует?';
-  
+
   responseText = question;
-  
+
   // Добавляем список найденных товаров (если их не слишком много)
   if (candidates.length > 1 && candidates.length <= 10) {
     responseText += '\n\nНайдено товаров:\n';
@@ -705,7 +835,7 @@ async function processWappiMessage(chatId, text, requestId) {
   } else if (candidates.length > 10) {
     responseText += `\n\nНайдено товаров: ${candidates.length}. Уточните запрос для более точного поиска.`;
   }
-  
+
   // Убеждаемся, что responseText не пустой
   if (!responseText || !responseText.trim()) {
     responseText = 'Уточните, какой именно товар вас интересует?';
