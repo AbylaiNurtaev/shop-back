@@ -19,7 +19,7 @@ router.use(authenticateToken);
 router.post('/', createProduct);
 router.post('/search', searchProducts);
 
-// Оплата товаров (активация на 30 дней после оплаты на фронтенде)
+// Оплата товаров (активация на выбранный период: 6, 9 или 12 месяцев после оплаты на фронтенде)
 router.post('/:productId/pay', payProduct); // Оплата одного товара
 router.post('/pay/multiple', payMultipleProducts); // Оплата нескольких товаров
 

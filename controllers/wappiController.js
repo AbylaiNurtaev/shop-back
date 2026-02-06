@@ -346,7 +346,7 @@ function formatSearchResultsWithStores(item) {
   // Группируем предложения по магазинам (по store.id)
   // Для каждого магазина берем только одно предложение (самое дешевое)
   const storesMap = new Map();
-  
+
   item.offers.forEach(offer => {
     const storeId = offer.store.id;
     if (!storesMap.has(storeId)) {

@@ -2,7 +2,7 @@
 
 ## Обзор
 
-Оплата товаров происходит **на фронтенде**. Backend только активирует товары на 30 дней после успешной оплаты.
+Оплата товаров происходит **на фронтенде**. Backend только активирует товары на выбранный период (6, 9 или 12 месяцев) после успешной оплаты. Минимальный период оплаты - 6 месяцев.
 
 ## API Эндпоинты
 
@@ -10,23 +10,36 @@
 
 **POST** `/api/products/:productId/pay`
 
-Активирует один товар на 30 дней.
+Активирует один товар на выбранный период (6, 9 или 12 месяцев).
 
 **Headers:**
 ```
 Authorization: Bearer <token>
+Content-Type: application/json
 ```
+
+**Body:**
+```json
+{
+  "periodMonths": 6
+}
+```
+
+**Параметры:**
+- `periodMonths` (number, required) - Период оплаты в месяцах. Допустимые значения: `6`, `9`, `12`
 
 **Пример запроса:**
 ```bash
 curl -X POST http://localhost:3000/api/products/prod_123/pay \
-  -H "Authorization: Bearer YOUR_TOKEN"
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"periodMonths": 6}'
 ```
 
 **Успешный ответ (200):**
 ```json
 {
-  "message": "Товар успешно оплачен. Показ товара активен на 30 дней.",
+  "message": "Товар успешно оплачен. Показ товара активен на 6 месяцев.",
   "product": {
     "id": "prod_123",
     "name": "Coca-Cola 0.5L",
@@ -34,13 +47,14 @@ curl -X POST http://localhost:3000/api/products/prod_123/pay \
     "brandName": "Coca-Cola",
     "isPayed": true,
     "paymentDate": "2026-02-05T12:00:00.000Z",
-    "paymentExpiresAt": "2026-03-07T12:00:00.000Z",
+    "paymentExpiresAt": "2026-08-05T12:00:00.000Z",
     ...
   }
 }
 ```
 
 **Ошибки:**
+- `400` - Период оплаты не указан или имеет недопустимое значение (должен быть 6, 9 или 12 месяцев)
 - `403` - Пользователь не бренд или товар не принадлежит бренду
 - `404` - Товар не найден
 - `500` - Ошибка сервера
@@ -51,19 +65,25 @@ curl -X POST http://localhost:3000/api/products/prod_123/pay \
 
 **POST** `/api/products/pay/multiple`
 
-Активирует несколько товаров на 30 дней.
+Активирует несколько товаров на выбранный период (6, 9 или 12 месяцев).
 
 **Headers:**
 ```
 Authorization: Bearer <token>
+Content-Type: application/json
 ```
 
 **Body:**
 ```json
 {
-  "productIds": ["prod_123", "prod_456", "prod_789"]
+  "productIds": ["prod_123", "prod_456", "prod_789"],
+  "periodMonths": 12
 }
 ```
+
+**Параметры:**
+- `productIds` (array, required) - Массив ID товаров для оплаты
+- `periodMonths` (number, required) - Период оплаты в месяцах. Допустимые значения: `6`, `9`, `12`
 
 **Пример запроса:**
 ```bash
@@ -71,21 +91,22 @@ curl -X POST http://localhost:3000/api/products/pay/multiple \
   -H "Authorization: Bearer YOUR_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "productIds": ["prod_123", "prod_456", "prod_789"]
+    "productIds": ["prod_123", "prod_456", "prod_789"],
+    "periodMonths": 12
   }'
 ```
 
 **Успешный ответ (200):**
 ```json
 {
-  "message": "3 товаров успешно оплачено. Показ товаров активен на 30 дней.",
+  "message": "3 товаров успешно оплачено. Показ товаров активен на 12 месяцев.",
   "products": [
     {
       "id": "prod_123",
       "name": "Coca-Cola 0.5L",
       "isPayed": true,
       "paymentDate": "2026-02-05T12:00:00.000Z",
-      "paymentExpiresAt": "2026-03-07T12:00:00.000Z",
+      "paymentExpiresAt": "2027-02-05T12:00:00.000Z",
       ...
     },
     {
@@ -93,7 +114,7 @@ curl -X POST http://localhost:3000/api/products/pay/multiple \
       "name": "Coca-Cola 1.0L",
       "isPayed": true,
       "paymentDate": "2026-02-05T12:00:00.000Z",
-      "paymentExpiresAt": "2026-03-07T12:00:00.000Z",
+      "paymentExpiresAt": "2027-02-05T12:00:00.000Z",
       ...
     },
     ...
@@ -203,13 +224,17 @@ async function payForProduct(productId, amount) {
 После успешной оплаты вызовите API бэкенда:
 
 ```javascript
-async function activateProduct(productId) {
+async function activateProduct(productId, periodMonths = 6) {
   try {
     const response = await fetch(`/api/products/${productId}/pay`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${yourToken}`
-      }
+        'Authorization': `Bearer ${yourToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        periodMonths: periodMonths // 6, 9 или 12
+      })
     });
 
     const data = await response.json();
@@ -217,7 +242,8 @@ async function activateProduct(productId) {
     if (response.ok) {
       console.log('Товар активирован:', data.product);
       // Обновите UI - товар теперь оплачен
-      alert('Товар успешно оплачен и активирован на 30 дней!');
+      const periodText = periodMonths === 6 ? '6 месяцев' : periodMonths === 9 ? '9 месяцев' : '12 месяцев';
+      alert(`Товар успешно оплачен и активирован на ${periodText}!`);
     }
   } catch (error) {
     console.error('Ошибка активации:', error);
@@ -277,7 +303,7 @@ async function payForMultipleProducts(productIds, totalAmount) {
   });
 }
 
-async function activateMultipleProducts(productIds) {
+async function activateMultipleProducts(productIds, periodMonths = 6) {
   try {
     const response = await fetch('/api/products/pay/multiple', {
       method: 'POST',
@@ -286,7 +312,8 @@ async function activateMultipleProducts(productIds) {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        productIds: productIds
+        productIds: productIds,
+        periodMonths: periodMonths // 6, 9 или 12
       })
     });
 
@@ -317,9 +344,10 @@ async function activateMultipleProducts(productIds) {
 - Требуется авторизация (Bearer token)
 
 ### 3. Срок действия
-- После активации товар показывается **30 дней**
+- После активации товар показывается на выбранный период: **6, 9 или 12 месяцев**
+- Минимальный период оплаты - **6 месяцев**
 - По истечении срока товар автоматически скрывается
-- Товар можно оплатить повторно
+- Товар можно оплатить повторно (срок продлится на новый период)
 
 ### 4. Видимость товаров
 - **Бренды** видят все свои товары (оплаченные и неоплаченные)
@@ -339,7 +367,9 @@ curl -X GET "http://localhost:3000/api/products" \
 
 # 2. Активируйте товар
 curl -X POST "http://localhost:3000/api/products/PRODUCT_ID/pay" \
-  -H "Authorization: Bearer YOUR_BRAND_TOKEN"
+  -H "Authorization: Bearer YOUR_BRAND_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"periodMonths": 6}'
 
 # 3. Проверьте что товар оплачен
 curl -X GET "http://localhost:3000/api/products/PRODUCT_ID" \
@@ -354,7 +384,8 @@ curl -X POST "http://localhost:3000/api/products/pay/multiple" \
   -H "Authorization: Bearer YOUR_BRAND_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "productIds": ["prod_1", "prod_2", "prod_3"]
+    "productIds": ["prod_1", "prod_2", "prod_3"],
+    "periodMonths": 12
   }'
 ```
 
@@ -369,7 +400,7 @@ A: Нет. Оплата происходит на фронтенде, бэкен
 A: Это ответственность фронтенда. Вызывайте API активации только после подтверждения оплаты от платежной системы.
 
 **Q: Можно ли оплатить уже оплаченный товар?**  
-A: Да, срок действия продлится еще на 30 дней с момента новой оплаты.
+A: Да, срок действия продлится еще на выбранный период (6, 9 или 12 месяцев) с момента новой оплаты.
 
 **Q: Что делать, если срок оплаты истек?**  
 A: Товар скроется автоматически. Нужно оплатить снова, чтобы активировать.

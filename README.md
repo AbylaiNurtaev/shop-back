@@ -76,8 +76,8 @@ SMTP_FROM_EMAIL=your-smtp-user
 - `POST /api/products/search` - Поиск товаров с геолокацией
 
 **Оплата товаров брендами:**
-- `POST /api/products/:productId/pay` - Оплата (активация) одного товара на 30 дней
-- `POST /api/products/pay/multiple` - Оплата (активация) нескольких товаров на 30 дней
+- `POST /api/products/:productId/pay` - Оплата (активация) одного товара на выбранный период (6, 9 или 12 месяцев)
+- `POST /api/products/pay/multiple` - Оплата (активация) нескольких товаров на выбранный период (6, 9 или 12 месяцев)
 
 > 📖 Подробная документация: [PRODUCT_PAYMENT_SIMPLE.md](./PRODUCT_PAYMENT_SIMPLE.md)  
 > **Примечание:** Оплата происходит на фронтенде, backend только активирует товары

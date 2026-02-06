@@ -614,15 +614,27 @@ async function generateUniqueSku(req, res) {
   }
 }
 
-// Оплата одного товара брендом (активация на 30 дней)
+// Оплата одного товара брендом (активация на выбранный период)
 // Оплата происходит на фронтенде, здесь только активация
 async function payProduct(req, res) {
   try {
     const { productId } = req.params;
+    const { periodMonths } = req.body; // Период оплаты в месяцах: 6, 9 или 12
 
     // Проверяем, что пользователь является брендом
     if (!req.user || req.user.role !== 'BRAND' || !req.user.brandId) {
       return res.status(403).json({ error: 'Только бренды могут оплачивать товары' });
+    }
+
+    // Валидация периода оплаты
+    const allowedPeriods = [6, 9, 12];
+    const period = periodMonths ? parseInt(periodMonths, 10) : null;
+    
+    if (!period || !allowedPeriods.includes(period)) {
+      return res.status(400).json({ 
+        error: 'Период оплаты обязателен и должен быть 6, 9 или 12 месяцев',
+        allowedPeriods: allowedPeriods
+      });
     }
 
     const product = await Product.findOne({ id: productId }).lean();
@@ -635,10 +647,11 @@ async function payProduct(req, res) {
       return res.status(403).json({ error: 'Вы можете оплачивать только свои товары' });
     }
 
-    // Устанавливаем оплату на 30 дней
+    // Устанавливаем оплату на выбранный период
     const paymentDate = new Date();
-    const paymentExpiresAt = new Date();
-    paymentExpiresAt.setDate(paymentExpiresAt.getDate() + 30);
+    const paymentExpiresAt = new Date(paymentDate);
+    // Добавляем месяцы к дате оплаты
+    paymentExpiresAt.setMonth(paymentExpiresAt.getMonth() + period);
 
     const updatedProduct = await Product.findOneAndUpdate(
       { id: productId },
@@ -651,8 +664,9 @@ async function payProduct(req, res) {
       { new: true }
     ).lean();
 
+    const periodText = period === 6 ? '6 месяцев' : period === 9 ? '9 месяцев' : '12 месяцев';
     res.json({
-      message: 'Товар успешно оплачен. Показ товара активен на 30 дней.',
+      message: `Товар успешно оплачен. Показ товара активен на ${periodText}.`,
       product: updatedProduct
     });
   } catch (error) {
@@ -664,20 +678,31 @@ async function payProduct(req, res) {
   }
 }
 
-// Оплата нескольких товаров брендом (активация на 30 дней)
+// Оплата нескольких товаров брендом (активация на выбранный период)
 // Оплата происходит на фронтенде, здесь только активация
 async function payMultipleProducts(req, res) {
   try {
-    const { productIds } = req.body;
+    const { productIds, periodMonths } = req.body; // Период оплаты в месяцах: 6, 9 или 12
 
     // Проверяем, что пользователь является брендом
     if (!req.user || req.user.role !== 'BRAND' || !req.user.brandId) {
       return res.status(403).json({ error: 'Только бренды могут оплачивать товары' });
     }
 
-    // Валидация
+    // Валидация списка товаров
     if (!productIds || !Array.isArray(productIds) || productIds.length === 0) {
       return res.status(400).json({ error: 'Список товаров не указан или пустой' });
+    }
+
+    // Валидация периода оплаты
+    const allowedPeriods = [6, 9, 12];
+    const period = periodMonths ? parseInt(periodMonths, 10) : null;
+    
+    if (!period || !allowedPeriods.includes(period)) {
+      return res.status(400).json({ 
+        error: 'Период оплаты обязателен и должен быть 6, 9 или 12 месяцев',
+        allowedPeriods: allowedPeriods
+      });
     }
 
     // Проверяем все товары
@@ -696,10 +721,11 @@ async function payMultipleProducts(req, res) {
       });
     }
 
-    // Устанавливаем оплату на 30 дней для всех товаров
+    // Устанавливаем оплату на выбранный период для всех товаров
     const paymentDate = new Date();
-    const paymentExpiresAt = new Date();
-    paymentExpiresAt.setDate(paymentExpiresAt.getDate() + 30);
+    const paymentExpiresAt = new Date(paymentDate);
+    // Добавляем месяцы к дате оплаты
+    paymentExpiresAt.setMonth(paymentExpiresAt.getMonth() + period);
 
     await Product.updateMany(
       { id: { $in: productIds } },
@@ -714,8 +740,9 @@ async function payMultipleProducts(req, res) {
     // Получаем обновленные товары
     const updatedProducts = await Product.find({ id: { $in: productIds } }).lean();
 
+    const periodText = period === 6 ? '6 месяцев' : period === 9 ? '9 месяцев' : '12 месяцев';
     res.json({
-      message: `${updatedProducts.length} товаров успешно оплачено. Показ товаров активен на 30 дней.`,
+      message: `${updatedProducts.length} товаров успешно оплачено. Показ товаров активен на ${periodText}.`,
       products: updatedProducts
     });
   } catch (error) {
