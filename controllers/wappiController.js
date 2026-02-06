@@ -229,7 +229,33 @@ async function handleWappiWebhook(req, res) {
     const maskedBody = JSON.parse(JSON.stringify(rawBody));
 
     // Маскируем чувствительные данные в теле запроса
-    if (maskedBody.message && maskedBody.message.chatId) {
+    // Обрабатываем структуру { messages: [...] }
+    if (maskedBody.messages && Array.isArray(maskedBody.messages)) {
+      maskedBody.messages = maskedBody.messages.map(msg => {
+        const maskedMsg = { ...msg };
+        if (maskedMsg.chatId) {
+          const chatId = maskedMsg.chatId;
+          maskedMsg.chatId = chatId.length > 7
+            ? `${chatId.substring(0, 3)}****${chatId.substring(chatId.length - 2)}`
+            : '****';
+        }
+        if (maskedMsg.from) {
+          const from = maskedMsg.from;
+          maskedMsg.from = from.length > 7
+            ? `${from.substring(0, 3)}****${from.substring(from.length - 2)}`
+            : '****';
+        }
+        if (maskedMsg.to) {
+          const to = maskedMsg.to;
+          maskedMsg.to = to.length > 7
+            ? `${to.substring(0, 3)}****${to.substring(to.length - 2)}`
+            : '****';
+        }
+        return maskedMsg;
+      });
+    }
+    // Обрабатываем старую структуру { message: {...} }
+    else if (maskedBody.message && maskedBody.message.chatId) {
       const chatId = maskedBody.message.chatId;
       if (chatId.length > 7) {
         maskedBody.message.chatId = `${chatId.substring(0, 3)}****${chatId.substring(chatId.length - 2)}`;
@@ -242,32 +268,38 @@ async function handleWappiWebhook(req, res) {
     console.log(`[WAPPI WEBHOOK] [${requestId}] 📋 Ключи в req.body:`, Object.keys(rawBody));
 
     // Извлекаем данные из запроса
-    // Пробуем разные варианты структуры данных от Wappi
-    let instance_id = rawBody.instance_id || rawBody.instanceId || rawBody.instance;
-    let message = rawBody.message || rawBody.data || rawBody.event || rawBody.payload;
+    // Wappi отправляет данные в формате { messages: [...] }
+    const messages = rawBody.messages || rawBody.message || (Array.isArray(rawBody) ? rawBody : []);
+
+    // Если это массив сообщений, берем первое
+    const message = Array.isArray(messages) && messages.length > 0 ? messages[0] : messages;
 
     // Логируем полученные данные (без чувствительной информации)
     console.log(`[WAPPI WEBHOOK] [${requestId}] 📋 Извлеченные данные:`, {
-      instance_id: instance_id || 'не указан',
+      hasMessages: !!messages,
+      messagesCount: Array.isArray(messages) ? messages.length : 0,
       hasMessage: !!message,
       messageType: message ? typeof message : 'undefined',
       messageKeys: message && typeof message === 'object' ? Object.keys(message) : 'не объект',
       allBodyKeys: Object.keys(rawBody)
     });
 
-    if (!message) {
-      console.error(`[WAPPI WEBHOOK] [${requestId}] ❌ Отсутствует поле message в запросе от Wappi`);
+    if (!message || typeof message !== 'object') {
+      console.error(`[WAPPI WEBHOOK] [${requestId}] ❌ Отсутствует или некорректное поле messages/message в запросе от Wappi`);
       console.error(`[WAPPI WEBHOOK] [${requestId}] ❌ Доступные ключи в req.body:`, Object.keys(rawBody));
-      console.error(`[WAPPI WEBHOOK] [${requestId}] ❌ Полное тело запроса:`, JSON.stringify(rawBody, null, 2));
-      res.status(200).json({ received: true, error: 'Missing message field', availableKeys: Object.keys(rawBody) });
+      res.status(200).json({ received: true, error: 'Missing or invalid messages field', availableKeys: Object.keys(rawBody) });
       return;
     }
 
-    const { chatId, body, fromMe } = message;
+    // Извлекаем данные из сообщения (структура Wappi)
+    const chatId = message.chatId || message.from;
+    const body = message.body;
+    const fromMe = message.is_me || message.fromMe || false;
+    const profile_id = message.profile_id;
 
     // Игнорируем сообщения, отправленные нами самими
-    if (fromMe === true) {
-      console.log(`[WAPPI WEBHOOK] [${requestId}] ⏭️  Игнорируем сообщение, отправленное нами самими (fromMe: true)`);
+    if (fromMe === true || message.is_me === true) {
+      console.log(`[WAPPI WEBHOOK] [${requestId}] ⏭️  Игнорируем сообщение, отправленное нами самими (is_me/fromMe: true)`);
       res.status(200).json({ received: true, ignored: true, reason: 'fromMe' });
       return;
     }
@@ -293,11 +325,12 @@ async function handleWappiWebhook(req, res) {
       : body;
 
     console.log(`[WAPPI WEBHOOK] [${requestId}] ✅ Валидный запрос:`, {
-      instance_id: instance_id || 'не указан',
+      profile_id: profile_id || 'не указан',
       chatId: maskedChatId,
       bodyLength: body.length,
       bodyPreview: bodyPreview,
-      fromMe: fromMe || false
+      fromMe: fromMe || false,
+      wh_type: message.wh_type || 'не указан'
     });
 
     // Сразу отвечаем 200 OK, чтобы Wappi не ждал
