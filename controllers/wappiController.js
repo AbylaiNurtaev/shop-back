@@ -175,30 +175,68 @@ async function sendWappiMessage(phoneNumber, messageText) {
   };
 
   try {
+    const sendStartTime = Date.now();
     const wappiResponse = await sendWithRetry(wappiUrl, payload, headers);
-    console.log('Сообщение успешно отправлено через Wappi:', {
-      phone: normalizedPhone.substring(0, 3) + '****',
-      status: wappiResponse.status
+    const sendDuration = Date.now() - sendStartTime;
+    
+    const maskedPhone = normalizedPhone.length > 7 
+      ? `${normalizedPhone.substring(0, 3)}****${normalizedPhone.substring(normalizedPhone.length - 2)}` 
+      : '****';
+    
+    console.log(`[WAPPI API] ✅ Сообщение успешно отправлено:`, {
+      phone: maskedPhone,
+      status: wappiResponse.status,
+      duration: `${sendDuration}ms`,
+      messageLength: messageText.length
     });
     return wappiResponse;
   } catch (error) {
     const errorMessage = error.response?.data || error.message;
-    console.error('Ошибка при отправке сообщения через Wappi API:', errorMessage);
+    const errorStatus = error.response?.status || 'unknown';
+    const maskedPhone = normalizedPhone.length > 7 
+      ? `${normalizedPhone.substring(0, 3)}****${normalizedPhone.substring(normalizedPhone.length - 2)}` 
+      : '****';
+    
+    console.error(`[WAPPI API] ❌ Ошибка при отправке сообщения:`, {
+      phone: maskedPhone,
+      status: errorStatus,
+      error: errorMessage,
+      messageLength: messageText.length
+    });
     throw error;
   }
 }
 
 // Основная функция обработки webhook от Wappi
 async function handleWappiWebhook(req, res) {
-  try {
-    // Сразу отвечаем 200 OK, чтобы Wappi не ждал
-    res.status(200).json({ received: true });
+  const startTime = Date.now();
+  const requestId = `wappi-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  const clientIp = req.ip || req.connection.remoteAddress || req.headers['x-forwarded-for'] || 'unknown';
 
+  // Логируем входящий запрос
+  console.log(`[WAPPI WEBHOOK] [${requestId}] 📥 Входящий запрос:`, {
+    method: req.method,
+    path: req.path,
+    ip: clientIp,
+    userAgent: req.headers['user-agent'] || 'unknown',
+    timestamp: new Date().toISOString(),
+    bodySize: JSON.stringify(req.body || {}).length
+  });
+
+  try {
     // Извлекаем данные из запроса
     const { instance_id, message } = req.body || {};
 
+    // Логируем полученные данные (без чувствительной информации)
+    console.log(`[WAPPI WEBHOOK] [${requestId}] 📋 Данные запроса:`, {
+      instance_id: instance_id || 'не указан',
+      hasMessage: !!message,
+      messageKeys: message ? Object.keys(message) : []
+    });
+
     if (!message) {
-      console.error('Отсутствует поле message в запросе от Wappi');
+      console.error(`[WAPPI WEBHOOK] [${requestId}] ❌ Отсутствует поле message в запросе от Wappi`);
+      res.status(200).json({ received: true, error: 'Missing message field' });
       return;
     }
 
@@ -206,57 +244,116 @@ async function handleWappiWebhook(req, res) {
 
     // Игнорируем сообщения, отправленные нами самими
     if (fromMe === true) {
-      console.log('Игнорируем сообщение, отправленное нами самими');
+      console.log(`[WAPPI WEBHOOK] [${requestId}] ⏭️  Игнорируем сообщение, отправленное нами самими (fromMe: true)`);
+      res.status(200).json({ received: true, ignored: true, reason: 'fromMe' });
       return;
     }
 
     if (!body || !body.trim()) {
-      console.log('Получено пустое сообщение от Wappi');
+      console.log(`[WAPPI WEBHOOK] [${requestId}] ⚠️  Получено пустое сообщение от Wappi`);
+      res.status(200).json({ received: true, ignored: true, reason: 'empty body' });
       return;
     }
 
     if (!chatId) {
-      console.error('Отсутствует chatId в сообщении от Wappi');
+      console.error(`[WAPPI WEBHOOK] [${requestId}] ❌ Отсутствует chatId в сообщении от Wappi`);
+      res.status(200).json({ received: true, error: 'Missing chatId' });
       return;
     }
 
-    console.log('Получен запрос от Wappi:', {
-      instance_id,
-      chatId: chatId.substring(0, 3) + '****',
-      body: body.substring(0, 50) + '...',
-      fromMe
+    // Маскируем чувствительные данные для логов
+    const maskedChatId = chatId.length > 7 
+      ? `${chatId.substring(0, 3)}****${chatId.substring(chatId.length - 2)}` 
+      : '****';
+    const bodyPreview = body.length > 100 
+      ? `${body.substring(0, 100)}...` 
+      : body;
+
+    console.log(`[WAPPI WEBHOOK] [${requestId}] ✅ Валидный запрос:`, {
+      instance_id: instance_id || 'не указан',
+      chatId: maskedChatId,
+      bodyLength: body.length,
+      bodyPreview: bodyPreview,
+      fromMe: fromMe || false
     });
+
+    // Сразу отвечаем 200 OK, чтобы Wappi не ждал
+    res.status(200).json({ received: true, requestId });
 
     // Выполняем поиск товаров асинхронно
     (async () => {
+      const processingStartTime = Date.now();
       try {
+        console.log(`[WAPPI WEBHOOK] [${requestId}] 🔍 Начинаем обработку запроса...`);
+
         // Шаг Б: Поиск товаров по тексту
+        const searchStartTime = Date.now();
+        console.log(`[WAPPI WEBHOOK] [${requestId}] 🔎 Запуск поиска товаров по запросу: "${bodyPreview}"`);
         const candidates = await buildCandidatesByText(body);
+        const searchDuration = Date.now() - searchStartTime;
+        console.log(`[WAPPI WEBHOOK] [${requestId}] ✅ Поиск завершен за ${searchDuration}ms, найдено товаров: ${candidates.length}`);
 
         // Шаг В: Форматируем результат
+        const formatStartTime = Date.now();
         const responseText = formatSearchResults(candidates);
+        const formatDuration = Date.now() - formatStartTime;
+        console.log(`[WAPPI WEBHOOK] [${requestId}] 📝 Результат отформатирован за ${formatDuration}ms, длина сообщения: ${responseText.length} символов`);
 
         // Шаг Г: Отправляем результат через Wappi API
+        const sendStartTime = Date.now();
+        console.log(`[WAPPI WEBHOOK] [${requestId}] 📤 Отправка ответа пользователю через Wappi API...`);
         await sendWappiMessage(chatId, responseText);
+        const sendDuration = Date.now() - sendStartTime;
+        
+        const totalProcessingTime = Date.now() - processingStartTime;
+        const totalRequestTime = Date.now() - startTime;
 
-        console.log('Успешно обработан запрос от Wappi');
+        console.log(`[WAPPI WEBHOOK] [${requestId}] ✅ Успешно обработан запрос:`, {
+          searchDuration: `${searchDuration}ms`,
+          formatDuration: `${formatDuration}ms`,
+          sendDuration: `${sendDuration}ms`,
+          totalProcessingTime: `${totalProcessingTime}ms`,
+          totalRequestTime: `${totalRequestTime}ms`,
+          candidatesFound: candidates.length,
+          responseLength: responseText.length
+        });
+
       } catch (error) {
-        console.error('Ошибка при обработке запроса от Wappi:', error);
+        const totalProcessingTime = Date.now() - processingStartTime;
+        const totalRequestTime = Date.now() - startTime;
+
+        console.error(`[WAPPI WEBHOOK] [${requestId}] ❌ Ошибка при обработке запроса:`, {
+          error: error.message,
+          stack: error.stack,
+          totalProcessingTime: `${totalProcessingTime}ms`,
+          totalRequestTime: `${totalRequestTime}ms`
+        });
         
         // Пытаемся отправить сообщение об ошибке
         try {
+          console.log(`[WAPPI WEBHOOK] [${requestId}] 📤 Попытка отправить сообщение об ошибке пользователю...`);
           await sendWappiMessage(chatId, 'Произошла ошибка при поиске товаров. Попробуйте позже.');
+          console.log(`[WAPPI WEBHOOK] [${requestId}] ✅ Сообщение об ошибке отправлено`);
         } catch (sendError) {
-          console.error('Не удалось отправить сообщение об ошибке:', sendError);
+          console.error(`[WAPPI WEBHOOK] [${requestId}] ❌ Не удалось отправить сообщение об ошибке:`, {
+            error: sendError.message,
+            stack: sendError.stack
+          });
         }
       }
     })();
 
   } catch (error) {
-    console.error('Критическая ошибка при обработке webhook от Wappi:', error);
+    const totalRequestTime = Date.now() - startTime;
+    console.error(`[WAPPI WEBHOOK] [${requestId}] 💥 Критическая ошибка при обработке webhook от Wappi:`, {
+      error: error.message,
+      stack: error.stack,
+      totalRequestTime: `${totalRequestTime}ms`
+    });
+    
     // Все равно отвечаем 200, чтобы Wappi не повторял запрос
     if (!res.headersSent) {
-      res.status(200).json({ received: true, error: 'Internal error' });
+      res.status(200).json({ received: true, error: 'Internal error', requestId });
     }
   }
 }
