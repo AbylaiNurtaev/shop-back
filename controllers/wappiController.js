@@ -1,7 +1,6 @@
 const axios = require('axios');
 const { generateId } = require('../utils/uuid');
 const { getIntentFromGemini, findProductsBySemanticSearch, generateClarificationQuestions, getWappiChatAIResponse } = require('../utils/gemini');
-const { getCoordinatesFromLink } = require('../utils/distance');
 const { models } = require('../models/database');
 
 const {
@@ -23,7 +22,8 @@ const PROFILE_ID_WAPPI = process.env.PROFILE_ID_WAPPI;
 const API_KEY_WAPPI = process.env.API_KEY_WAPPI;
 
 // Константы для работы с conversations
-const CONVERSATION_TTL_MS = 24 * 60 * 60 * 1000;
+// Чат живет 5 минут без активности, результаты поиска храним дольше
+const CONVERSATION_TTL_MS = 5 * 60 * 1000; // 5 минут
 const RESULT_TTL_MS = 24 * 60 * 60 * 1000;
 
 // Настройка Axios с таймаутами
@@ -42,7 +42,7 @@ function normalizeText(value) {
   return String(value || '').trim().toLowerCase();
 }
 
-// Пытаемся вытащить геолокацию из текста (координаты или ссылка 2ГИС)
+// Пытаемся вытащить геолокацию из текста (явные координаты вида "lat, lng")
 function extractGeoFromText(text) {
   if (!text || !text.trim()) return null;
   const raw = text.trim();
@@ -54,46 +54,6 @@ function extractGeoFromText(text) {
     const lng = parseFloat(coordMatch[2]);
     if (!Number.isNaN(lat) && !Number.isNaN(lng)) {
       return { lat, lng };
-    }
-  }
-
-  // 2. Ссылка (в т.ч. 2ГИС) с координатами в query-параметрах
-  const urlMatch = raw.match(/https?:\/\/[^\s]+/);
-  if (urlMatch) {
-    const urlString = urlMatch[0];
-    try {
-      const parsed = new URL(urlString);
-
-      // Попробуем параметры ll, center, geo
-      const llParam = parsed.searchParams.get('ll') || parsed.searchParams.get('center') || parsed.searchParams.get('geo');
-      if (llParam) {
-        const parts = llParam.split(/[,;]/).map(p => p.trim());
-        if (parts.length >= 2) {
-          const lon = parseFloat(parts[0]);
-          const lat = parseFloat(parts[1]);
-          if (!Number.isNaN(lat) && !Number.isNaN(lon)) {
-            return { lat, lng: lon };
-          }
-        }
-      }
-
-      // Типичный параметр 2ГИС: m=lon%2Clat%2Fzoom
-      const mParam = parsed.searchParams.get('m');
-      if (mParam) {
-        const decoded = decodeURIComponent(mParam);
-        // Пример: "71.418442,51.160431/17"
-        const firstPart = decoded.split('/')[0];
-        const parts = firstPart.split(',').map(p => p.trim());
-        if (parts.length >= 2) {
-          const lon = parseFloat(parts[0]);
-          const lat = parseFloat(parts[1]);
-          if (!Number.isNaN(lat) && !Number.isNaN(lon)) {
-            return { lat, lng: lon };
-          }
-        }
-      }
-    } catch (e) {
-      console.warn('[WAPPI] Не удалось распарсить ссылку для геолокации:', e.message);
     }
   }
 
@@ -376,7 +336,7 @@ function filterCandidatesByIntent(candidates, intent) {
   return filtered;
 }
 
-// Функция performSearch (из customerController)
+// Функция performSearch (облегченная версия из customerController)
 async function performSearch({ text, geo, radiusMeters, intent }) {
   let products = [];
   const candidateIds = intent && intent.filters ? intent.filters.candidateProductIds : null;
@@ -429,9 +389,33 @@ async function performSearch({ text, geo, radiusMeters, intent }) {
 
   const offersByProduct = new Map();
 
+  // Функция для форматирования расстояния
+  const formatDistance = (meters) => {
+    if (!meters || Number.isNaN(meters)) return null;
+    if (meters < 1000) {
+      return `${Math.round(meters)} м`;
+    }
+    const km = (meters / 1000).toFixed(1);
+    return `${km} км`;
+  };
+
   for (const offer of offers) {
     const store = storeById.get(offer.storeId);
     if (!store) continue;
+
+    let distanceMeters = null;
+    let distanceFormatted = null;
+
+    // Если есть геолокация пользователя и координаты магазина - считаем расстояние
+    if (geo && geo.lat !== undefined && geo.lng !== undefined && store.locationCoords && store.locationCoords.lat !== undefined && store.locationCoords.lng !== undefined) {
+      try {
+        const { calculateDistance } = require('../utils/distance');
+        distanceMeters = calculateDistance(geo.lat, geo.lng, store.locationCoords.lat, store.locationCoords.lng);
+        distanceFormatted = formatDistance(distanceMeters);
+      } catch (e) {
+        console.warn('[WAPPI] Не удалось посчитать расстояние до магазина:', e.message);
+      }
+    }
 
     const mappedOffer = {
       offerId: offer.id,
@@ -444,7 +428,9 @@ async function performSearch({ text, geo, radiusMeters, intent }) {
         name: store.name,
         address: store.address,
         location: store.location,
-        locationCoords: store.locationCoords || null
+        locationCoords: store.locationCoords || null,
+        distanceMeters: distanceMeters !== null ? Math.round(distanceMeters) : null,
+        distanceFormatted: distanceFormatted
       }
     };
 
@@ -457,7 +443,17 @@ async function performSearch({ text, geo, radiusMeters, intent }) {
   return products
     .map(product => {
       const offersWithStores = (offersByProduct.get(product.id) || [])
-        .sort((a, b) => (a.price || 0) - (b.price || 0));
+        .sort((a, b) => {
+          // Сначала по расстоянию (если есть), потом по цене
+          const aDist = a.store.distanceMeters;
+          const bDist = b.store.distanceMeters;
+          if (aDist !== null && bDist !== null) {
+            return aDist - bDist;
+          }
+          if (aDist !== null) return -1;
+          if (bDist !== null) return 1;
+          return (a.price || 0) - (b.price || 0);
+        });
 
       const category = categoryById.get(product.categoryId) || null;
 
@@ -555,8 +551,11 @@ function formatSearchResultsWithStores(item) {
       message += `   Адрес: ${offer.store.address}\n`;
     }
     message += `   Цена: ${offer.price} ${offer.currency || 'RUB'}\n`;
+    if (offer.store.distanceFormatted) {
+      message += `   Расстояние: ${offer.store.distanceFormatted}\n`;
+    }
     if (offer.store.location) {
-      message += `   ${offer.store.location}\n`;
+      message += `   Локация: ${offer.store.location}\n`;
     }
     message += '\n';
   });
@@ -660,6 +659,7 @@ function isSearchQuery(text) {
 // Основная функция обработки сообщения (адаптированная из customerController)
 async function processWappiMessage(chatId, text, requestId, options = {}) {
   const debug = options.debug || false;
+  const locationFromMessage = options.location || null;
 
   const conversation = await getOrCreateConversation(chatId);
   const conversationId = conversation.id;
@@ -693,41 +693,33 @@ async function processWappiMessage(chatId, text, requestId, options = {}) {
   let geo = conversation.geo || null;
   let radiusMeters = conversation.radiusMeters || 1000;
   let geoRequested = conversation.geoRequested || false;
+  let geoSource = conversation.geoSource || null;
 
-  // Пробуем вытащить геолокацию из текущего сообщения (координаты или ссылка 2ГИС)
-  let extractedGeo = extractGeoFromText(text);
-
-  // Если явные координаты не нашли, но есть ссылка — пробуем вытащить координаты через getCoordinatesFromLink
-  if (!extractedGeo && text && text.trim()) {
-    const urlMatch = text.match(/https?:\/\/[^\s]+/);
-    if (urlMatch) {
-      const url = urlMatch[0];
-      try {
-        const coords = await getCoordinatesFromLink(url);
-        if (coords && typeof coords.lat === 'number' && typeof coords.lon === 'number') {
-          extractedGeo = { lat: coords.lat, lng: coords.lon };
-          console.log(`[WAPPI] [${requestId}] Координаты получены из ссылки через getCoordinatesFromLink:`, extractedGeo);
-        }
-      } catch (e) {
-        console.warn(`[WAPPI] [${requestId}] Не удалось получить координаты из ссылки через getCoordinatesFromLink:`, e.message);
-      }
-    }
+  // Пробуем вытащить геолокацию из самого сообщения:
+  // 1) если есть объект location из WhatsApp (Wappi)
+  // 2) либо явные координаты в тексте
+  let extractedGeo = null;
+  if (locationFromMessage && typeof locationFromMessage.lat === 'number' && typeof locationFromMessage.lng === 'number') {
+    extractedGeo = { lat: locationFromMessage.lat, lng: locationFromMessage.lng };
+    console.log(`[WAPPI] [${requestId}] Геолокация получена из сообщения WhatsApp:`, extractedGeo);
+  } else {
+    extractedGeo = extractGeoFromText(text);
   }
 
   if (extractedGeo) {
     geo = extractedGeo;
     radiusMeters = radiusMeters || 1000;
-    geoRequested = true;
+    geoSource = locationFromMessage ? 'whatsapp' : 'manual';
     await SearchConversation.updateOne(
       { id: conversationId },
-      { geo, radiusMeters, geoRequested: true, updatedAt: new Date() }
+      { geo, radiusMeters, geoSource, geoRequested: true, updatedAt: new Date() }
     );
-    console.log(`[WAPPI] [${requestId}] Обновлена геолокация для беседы:`, geo);
+    console.log(`[WAPPI] [${requestId}] Обновлена геолокация для беседы (source=${geoSource}):`, geo);
   }
 
-  // Если геолокации всё еще нет — сначала (ОДИН РАЗ) просим её, затем больше не блокируем поиск
-  if ((!geo || geo.lat === undefined || geo.lng === undefined) && !geoRequested) {
-    const askGeoText = 'Чтобы подобрать ближайшие магазины, отправьте геопозицию (поделиться местоположением) или ссылку из 2ГИС с вашим адресом, а затем напишите, какой товар вы ищете.';
+  // Если геолокации нет ИЛИ она не из нативного WhatsApp-местоположения — просим отправить geo
+  if (!geo || geo.lat === undefined || geo.lng === undefined || geoSource !== 'whatsapp') {
+    const askGeoText = 'Чтобы подобрать ближайшие магазины, отправьте геопозицию (поделиться местоположением в WhatsApp), а затем напишите, какой товар вы ищете.';
 
     await SearchConversation.updateOne(
       { id: conversationId },
@@ -1184,7 +1176,7 @@ async function processSearchWithIntent(conversationId, intent, text, requestId) 
       const packageInfo = product.packageInfo ? ` - ${product.packageInfo}` : '';
       responseText += `${index + 1}. ${productName}${brandName}${packageInfo}\n`;
     });
-    responseText += '\nУточните, какой именно товар вас интересует?';
+    responseText += '\nУточните, какой именно товар вас интересует?\n';
 
     await SearchMessage.create({
       id: generateId(),
@@ -1325,7 +1317,7 @@ async function handleWappiWebhook(req, res) {
     }
 
     const chatId = message.chatId || message.from;
-    const body = message.body;
+    const body = message.body || '';
     const fromMe = message.is_me || message.fromMe || false;
     const profile_id = message.profile_id;
 
@@ -1335,9 +1327,27 @@ async function handleWappiWebhook(req, res) {
       return;
     }
 
-    if (!body || !body.trim()) {
-      console.log(`[WAPPI WEBHOOK] [${requestId}] ⚠️  Получено пустое сообщение`);
-      res.status(200).json({ received: true, ignored: true, reason: 'empty body' });
+    // Пытаемся вытащить геолокацию из сообщения Wappi (чистая гео WhatsApp)
+    let location = null;
+    if (message.location && typeof message.location === 'object') {
+      const loc = message.location;
+      const lat = loc.lat ?? loc.latitude;
+      const lng = loc.lng ?? loc.longitude ?? loc.lon;
+      if (typeof lat === 'number' && typeof lng === 'number') {
+        location = { lat, lng };
+      }
+    }
+    if (!location) {
+      const lat = message.lat ?? message.latitude;
+      const lng = message.lng ?? message.longitude ?? message.lon;
+      if (typeof lat === 'number' && typeof lng === 'number') {
+        location = { lat, lng };
+      }
+    }
+
+    if (!body && !location) {
+      console.log(`[WAPPI WEBHOOK] [${requestId}] ⚠️  Получено сообщение без текста и без геолокации`);
+      res.status(200).json({ received: true, ignored: true, reason: 'empty body and no location' });
       return;
     }
 
@@ -1369,7 +1379,7 @@ async function handleWappiWebhook(req, res) {
       try {
         console.log(`[WAPPI WEBHOOK] [${requestId}] 🧪 ТЕСТОВЫЙ РЕЖИМ - синхронная обработка (с DEBUG)...`);
 
-        const result = await processWappiMessage(chatId, body, requestId, { debug: true });
+        const result = await processWappiMessage(chatId, body, requestId, { debug: true, location });
 
         let responseText = typeof result === 'string' ? result : (result.replyText || '');
         if (!responseText || !responseText.trim()) {
@@ -1436,7 +1446,7 @@ async function handleWappiWebhook(req, res) {
           console.warn(`[WAPPI WEBHOOK] [${requestId}] ⚠️ Не удалось отправить сообщение о начале обработки:`, e.message);
         }
 
-        const result = await processWappiMessage(chatId, body, requestId, { debug: false });
+        const result = await processWappiMessage(chatId, body, requestId, { debug: false, location });
 
         let responseText = typeof result === 'string' ? result : (result.replyText || '');
 

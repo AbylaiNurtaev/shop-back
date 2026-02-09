@@ -292,6 +292,8 @@ const searchConversationSchema = new mongoose.Schema(
       lng: { type: Number, default: null }
     },
     radiusMeters: { type: Number, default: null },
+    // Источник геолокации: 'whatsapp' (нативное местоположение), 'manual' (введено руками), null (нет источника)
+    geoSource: { type: String, default: null },
     // Флаг, что мы уже попросили геолокацию у пользователя (чтобы не зацикливаться)
     geoRequested: { type: Boolean, default: false },
     expiresAt: { type: Date, required: true, index: { expires: 0 } }

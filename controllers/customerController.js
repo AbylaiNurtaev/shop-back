@@ -23,7 +23,8 @@ const {
 } = models;
 
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const CONVERSATION_TTL_MS = 24 * 60 * 60 * 1000;
+// Веб-чат с клиентом: беседа живет 5 минут без активности
+const CONVERSATION_TTL_MS = 5 * 60 * 1000; // 5 минут
 const RESULT_TTL_MS = 24 * 60 * 60 * 1000;
 const ATTACHMENT_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -725,19 +726,25 @@ async function postMessage(req, res) {
           if (items.length === 0) {
             systemMessage += '\nК сожалению, в базе нет предложений по этому товару.';
           } else {
-            const item = items[0]; // Берем первый товар (должен быть один)
-            const totalOffers = item.offers?.length || 0;
+          const item = items[0]; // Берем первый товар (должен быть один)
+          const totalOffers = item.offers?.length || 0;
 
-            if (totalOffers === 0) {
-              systemMessage += '\nК сожалению, в базе нет предложений по этому товару.';
-            } else {
-              const nearest = item.nearestStore;
-              if (nearest && nearest.distance) {
-                systemMessage += `\nНайдено предложений: ${totalOffers}. Ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
+          if (totalOffers === 0) {
+            systemMessage += '\nК сожалению, в базе нет предложений по этому товару.';
+          } else {
+            const nearest = item.nearestStore;
+            if (nearest && nearest.distance && typeof nearest.distanceMeters === 'number') {
+              if (nearest.distanceMeters > 1000) {
+                systemMessage += `\nРядом с вами (в радиусе 1 км) магазины с этим товаром не найдены. Самый ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
               } else {
-                systemMessage += `\nНайдено предложений: ${totalOffers}.`;
+                systemMessage += `\nНайдено предложений: ${totalOffers}. Ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
               }
+            } else if (nearest && nearest.distance) {
+              systemMessage += `\nНайдено предложений: ${totalOffers}. Ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
+            } else {
+              systemMessage += `\nНайдено предложений: ${totalOffers}.`;
             }
+          }
           }
 
           // Добавляем ответное сообщение от системы
