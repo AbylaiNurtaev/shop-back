@@ -50,12 +50,12 @@ async function getCoordinatesFromLink(link) {
   const normalizedLink = normalizeLocationLink(link);
   if (!normalizedLink) return null;
   let finalUrl = normalizedLink;
-  if (String(normalizedLink).includes('go.2gis.com')) {
-    try {
-      finalUrl = await resolveShortUrl(normalizedLink);
-    } catch (error) {
-      return null;
-    }
+  try {
+    // Пытаемся разрезолвить короткие и переадресованные ссылки (2ГИС и др.)
+    finalUrl = await resolveShortUrl(normalizedLink);
+  } catch (error) {
+    // Если не получилось - используем исходный URL
+    finalUrl = normalizedLink;
   }
   return extractCoordinatesFromUrl(finalUrl);
 }

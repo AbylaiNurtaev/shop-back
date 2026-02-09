@@ -1,6 +1,7 @@
 const axios = require('axios');
 const { generateId } = require('../utils/uuid');
-const { getIntentFromGemini, findProductsBySemanticSearch, generateClarificationQuestions } = require('../utils/gemini');
+const { getIntentFromGemini, findProductsBySemanticSearch, generateClarificationQuestions, getWappiChatAIResponse } = require('../utils/gemini');
+const { getCoordinatesFromLink } = require('../utils/distance');
 const { models } = require('../models/database');
 
 const {
@@ -41,6 +42,96 @@ function normalizeText(value) {
   return String(value || '').trim().toLowerCase();
 }
 
+// Пытаемся вытащить геолокацию из текста (координаты или ссылка 2ГИС)
+function extractGeoFromText(text) {
+  if (!text || !text.trim()) return null;
+  const raw = text.trim();
+
+  // 1. Явные координаты вида "51.1605, 71.4703"
+  const coordMatch = raw.match(/(-?\d{1,3}\.\d+)[,\s]+(-?\d{1,3}\.\d+)/);
+  if (coordMatch) {
+    const lat = parseFloat(coordMatch[1]);
+    const lng = parseFloat(coordMatch[2]);
+    if (!Number.isNaN(lat) && !Number.isNaN(lng)) {
+      return { lat, lng };
+    }
+  }
+
+  // 2. Ссылка (в т.ч. 2ГИС) с координатами в query-параметрах
+  const urlMatch = raw.match(/https?:\/\/[^\s]+/);
+  if (urlMatch) {
+    const urlString = urlMatch[0];
+    try {
+      const parsed = new URL(urlString);
+
+      // Попробуем параметры ll, center, geo
+      const llParam = parsed.searchParams.get('ll') || parsed.searchParams.get('center') || parsed.searchParams.get('geo');
+      if (llParam) {
+        const parts = llParam.split(/[,;]/).map(p => p.trim());
+        if (parts.length >= 2) {
+          const lon = parseFloat(parts[0]);
+          const lat = parseFloat(parts[1]);
+          if (!Number.isNaN(lat) && !Number.isNaN(lon)) {
+            return { lat, lng: lon };
+          }
+        }
+      }
+
+      // Типичный параметр 2ГИС: m=lon%2Clat%2Fzoom
+      const mParam = parsed.searchParams.get('m');
+      if (mParam) {
+        const decoded = decodeURIComponent(mParam);
+        // Пример: "71.418442,51.160431/17"
+        const firstPart = decoded.split('/')[0];
+        const parts = firstPart.split(',').map(p => p.trim());
+        if (parts.length >= 2) {
+          const lon = parseFloat(parts[0]);
+          const lat = parseFloat(parts[1]);
+          if (!Number.isNaN(lat) && !Number.isNaN(lon)) {
+            return { lat, lng: lon };
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[WAPPI] Не удалось распарсить ссылку для геолокации:', e.message);
+    }
+  }
+
+  return null;
+}
+
+// Нормализуем пользовательский запрос до "ядра" (убираем служебные слова: "найди", "хочу", "что из ... есть" и т.п.)
+// Примеры:
+//  - "Найди цветы"        -> "цветы"
+//  - "Хочу цветы"         -> "цветы"
+//  - "Какие цветы есть?"  -> "цветы"
+//  - "Что из напитков есть?" -> "напитки"
+function extractCoreSearchQuery(text) {
+  let query = normalizeText(text);
+
+  // Убираем типичные вводные глаголы в начале
+  query = query.replace(/^(найди|найти|ищу|ищем|хочу|нужно|нужны|посоветуй|посоветуйте|подбери|подберите|подскажи|подскажите)\s+/i, '');
+
+  // Убираем конструкции вида "что из X есть", "а что из X есть"
+  query = query.replace(/^(а\s+)?что\s+из\s+/i, '');
+
+  // Убираем конструкции вида "какие X есть", "какая X есть"
+  query = query.replace(/^(а\s+)?какие\s+/i, '');
+  query = query.replace(/^(а\s+)?какая\s+/i, '');
+
+  // Убираем хвостовое "есть", "бывают" и т.п.
+  query = query.replace(/\s+(есть|бывают|бывает|вообще есть)\??$/i, '');
+
+  query = query.trim();
+
+  // Если после всех преобразований строка опустела — возвращаем исходную нормализованную
+  if (!query) {
+    query = normalizeText(text);
+  }
+
+  return query;
+}
+
 // Retry функция для запросов к внешнему API (Wappi)
 async function sendWithRetry(url, payload, headers, maxRetries = 3) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -59,33 +150,122 @@ async function sendWithRetry(url, payload, headers, maxRetries = 3) {
 }
 
 // Функция для поиска товаров по тексту (использует существующую логику)
-async function buildCandidatesByText(text) {
+async function buildCandidatesByText(text, conversationContext = null) {
   if (!text || !text.trim()) return [];
 
   console.log(`🔍 AI семантический поиск для запроса: "${text}"`);
+  const coreQuery = extractCoreSearchQuery(text);
+  if (coreQuery !== normalizeText(text)) {
+    console.log(`🔍 Нормализованный запрос для AI: "${coreQuery}"`);
+  }
+  if (conversationContext && conversationContext.length > 0) {
+    console.log(`📝 Контекст разговора: ${conversationContext.length} предыдущих сообщений`);
+  }
 
   try {
-    // Получаем все оплаченные товары для AI поиска
+    // Получаем все оплаченные товары для AI поиска (увеличено для покрытия всех категорий)
     const allProducts = await Product.find({
       isPayed: true,
       paymentExpiresAt: { $gt: new Date() }
-    }).limit(500).lean();
+    }).limit(1000).lean();
+
+    console.log(`[WAPPI] Всего оплаченных товаров в БД: ${allProducts.length}`);
 
     if (allProducts.length === 0) {
-      console.log('Нет доступных товаров для поиска');
+      console.log('[WAPPI] ⚠️ Нет доступных товаров для поиска (все товары не оплачены или срок оплаты истек)');
+      // Пробуем найти хотя бы какие-то товары без фильтра по оплате (для отладки)
+      const allProductsWithoutPayment = await Product.find({}).limit(50).lean();
+      console.log(`[WAPPI] Всего товаров в БД (без фильтра оплаты): ${allProductsWithoutPayment.length}`);
+      if (allProductsWithoutPayment.length > 0) {
+        console.log(`[WAPPI] Примеры товаров:`, allProductsWithoutPayment.slice(0, 3).map(p => ({
+          name: p.name,
+          brandName: p.brandName,
+          isPayed: p.isPayed,
+          paymentExpiresAt: p.paymentExpiresAt
+        })));
+      }
       return [];
     }
 
-    // Используем только AI семантический поиск
-    const candidates = await findProductsBySemanticSearch({
-      searchQuery: text,
-      allProducts: allProducts,
-      limit: 30
+    // Обогащаем товары названиями категорий, чтобы AI мог использовать категорию
+    const categoryIds = Array.from(new Set(allProducts.map(p => p.categoryId).filter(Boolean)));
+    let categoryById = new Map();
+    if (categoryIds.length > 0) {
+      const categories = await Category.find({ id: { $in: categoryIds } }).lean();
+      categoryById = new Map(categories.map(cat => [cat.id, cat]));
+    }
+
+    const allProductsWithCategory = allProducts.map(product => ({
+      ...product,
+      categoryName: product.categoryId ? (categoryById.get(product.categoryId)?.name || null) : null
+    }));
+
+    // Используем только AI семантический поиск с контекстом
+    let candidates = await findProductsBySemanticSearch({
+      searchQuery: coreQuery,
+      allProducts: allProductsWithCategory,
+      limit: 30,
+      conversationContext: conversationContext
     });
 
     console.log(`✅ AI семантический поиск нашел ${candidates.length} товаров`);
+
+    // ВАЛИДАЦИЯ: Проверяем релевантность найденных товаров
     if (candidates.length > 0) {
-      console.log('Найденные товары:');
+      const normalizedQuery = coreQuery;
+      const validatedCandidates = candidates.filter(product => {
+        const productText = `${product.name || ''} ${product.description || ''} ${product.brandName || ''} ${product.categoryName || ''}`.toLowerCase();
+
+        // Если запрос про цветы - проверяем, что товар действительно цветок
+        if (normalizedQuery === 'цветы' || normalizedQuery === 'цветок' || normalizedQuery === 'букет' ||
+          normalizedQuery.includes('цвет') || normalizedQuery.includes('роза') || normalizedQuery.includes('тюльпан') ||
+          normalizedQuery.includes('лилия') || normalizedQuery.includes('хризантема') || normalizedQuery.includes('орхидея')) {
+          // Товар должен содержать слова, связанные с цветами
+          const flowerKeywords = ['роза', 'тюльпан', 'лилия', 'хризантема', 'орхидея', 'цветок', 'букет', 'цветы', 'rose', 'tulip', 'lily'];
+          const isFlower = flowerKeywords.some(keyword => productText.includes(keyword));
+          if (!isFlower) {
+            console.log(`[WAPPI] ⚠️ Товар "${product.name}" не является цветком, отфильтрован (запрос: "${text}")`);
+            return false;
+          }
+          // Дополнительная проверка: НЕ должен быть напитком
+          const drinkKeywords = ['cola', 'coca', 'pepsi', 'напиток', 'газировка', 'лимонад', 'сок', 'вода', 'drink', 'beverage'];
+          const isDrink = drinkKeywords.some(keyword => productText.includes(keyword));
+          if (isDrink) {
+            console.log(`[WAPPI] ⚠️ Товар "${product.name}" является напитком, а не цветком, отфильтрован (запрос: "${text}")`);
+            return false;
+          }
+        }
+
+        // Если запрос про напитки - проверяем, что товар действительно напиток
+        if (normalizedQuery === 'напитки' || normalizedQuery === 'напиток' || normalizedQuery === 'газировка' ||
+          normalizedQuery.includes('кола') || normalizedQuery.includes('пепси') || normalizedQuery.includes('лимонад') ||
+          normalizedQuery.includes('сок') || normalizedQuery.includes('вода')) {
+          const drinkKeywords = ['cola', 'coca', 'pepsi', 'напиток', 'газировка', 'лимонад', 'сок', 'вода', 'drink', 'beverage', 'fanta', 'sprite'];
+          const isDrink = drinkKeywords.some(keyword => productText.includes(keyword));
+          if (!isDrink) {
+            console.log(`[WAPPI] ⚠️ Товар "${product.name}" не является напитком, отфильтрован (запрос: "${text}")`);
+            return false;
+          }
+          // Дополнительная проверка: НЕ должен быть цветком
+          const flowerKeywords = ['роза', 'тюльпан', 'лилия', 'хризантема', 'орхидея', 'цветок', 'букет', 'цветы'];
+          const isFlower = flowerKeywords.some(keyword => productText.includes(keyword));
+          if (isFlower) {
+            console.log(`[WAPPI] ⚠️ Товар "${product.name}" является цветком, а не напитком, отфильтрован (запрос: "${text}")`);
+            return false;
+          }
+        }
+
+        return true;
+      });
+
+      if (validatedCandidates.length < candidates.length) {
+        console.log(`[WAPPI] ⚠️ Отфильтровано ${candidates.length - validatedCandidates.length} нерелевантных товаров из ${candidates.length}`);
+        candidates = validatedCandidates;
+      }
+    }
+
+    if (candidates.length > 0) {
+      console.log('Найденные товары после валидации:');
       candidates.forEach((product, index) => {
         console.log(`  ${index + 1}. "${product.name || 'без названия'}" (бренд: ${product.brandName || 'нет'}, ID: ${product.id})`);
       });
@@ -460,101 +640,31 @@ function isSearchQuery(text) {
   if (trimmed.length < 2) return false;
 
   // Простые приветствия и короткие фразы - не поисковые запросы
-  const greetings = ['привет', 'здравствуй', 'здравствуйте', 'hi', 'hello', 'да', 'нет', 'ок', 'окей', 'спасибо', 'благодарю'];
+  const greetings = ['привет', 'здравствуй', 'здравствуйте', 'hi', 'hello', 'да', 'нет', 'ок', 'окей', 'спасибо', 'благодарю', 'пока', 'до свидания'];
   if (greetings.includes(trimmed)) return false;
 
   // Если сообщение содержит только цифры или один символ - не поисковый запрос
   if (/^[\d\s\?\!\.\,]+$/.test(trimmed) && trimmed.length < 3) return false;
 
-  // Если сообщение слишком длинное (больше 100 символов) - возможно, не поисковый запрос
-  if (trimmed.length > 100) return false;
+  // Если сообщение слишком длинное (больше 150 символов) - возможно, не поисковый запрос
+  if (trimmed.length > 150) return false;
 
+  // Если сообщение выглядит как вопрос о системе/помощи, но не о товаре - не поисковый запрос
+  const systemQuestions = ['как пользоваться', 'что это', 'помощь', 'help', 'что умеешь', 'что можешь'];
+  if (systemQuestions.some(q => trimmed.includes(q) && trimmed.length < 30)) return false;
+
+  // Всё остальное считаем поисковым запросом (более гибкая логика)
   return true;
 }
 
 // Основная функция обработки сообщения (адаптированная из customerController)
-async function processWappiMessage(chatId, text, requestId) {
+async function processWappiMessage(chatId, text, requestId, options = {}) {
+  const debug = options.debug || false;
+
   const conversation = await getOrCreateConversation(chatId);
   const conversationId = conversation.id;
 
-  // Проверяем, является ли сообщение поисковым запросом
-  if (!isSearchQuery(text)) {
-    // Если это не поисковый запрос, отвечаем нейтрально
-    const neutralResponses = [
-      'Напишите, какой товар вы ищете? Например: "Кола", "Найди кроссовки Nike"',
-      'Я могу помочь найти товар. Опишите, что вы ищете?',
-      'Для поиска товара напишите название или описание. Например: "Coca-Cola" или "Найди кроссовки"'
-    ];
-    const randomResponse = neutralResponses[Math.floor(Math.random() * neutralResponses.length)];
-
-    await SearchMessage.create({
-      id: generateId(),
-      conversationId,
-      sender: 'CUSTOMER',
-      text: text || '',
-      attachmentIds: []
-    });
-
-    await SearchMessage.create({
-      id: generateId(),
-      conversationId,
-      sender: 'SYSTEM',
-      text: randomResponse
-    });
-
-    return randomResponse;
-  }
-
-  // Если предыдущий поиск завершен (DONE), сбрасываем состояние для нового поиска
-  if (conversation.state === 'DONE') {
-    console.log(`[WAPPI] Сбрасываем состояние conversation для нового поиска`);
-
-    // Удаляем старый intent
-    if (conversation.intentId) {
-      await SearchIntent.deleteOne({ id: conversation.intentId });
-    }
-
-    // Создаем новую conversation
-    const newConversation = await SearchConversation.create({
-      id: generateId(),
-      sessionId: chatId,
-      state: 'NEW',
-      intentId: null,
-      requestId: null,
-      resultId: null,
-      expiresAt: nowPlus(CONVERSATION_TTL_MS)
-    });
-
-    // Обновляем conversationId для дальнейшей работы
-    const conversationId = newConversation.id;
-
-    // Создаем новый intent
-    const intent = await SearchIntent.create({
-      id: generateId(),
-      conversationId,
-      rawText: text || '',
-      filters: {}
-    });
-
-    await SearchConversation.updateOne(
-      { id: conversationId },
-      { intentId: intent.id, updatedAt: new Date() }
-    );
-
-    // Создаем сообщение пользователя
-    await SearchMessage.create({
-      id: generateId(),
-      conversationId,
-      sender: 'CUSTOMER',
-      text: text || '',
-      attachmentIds: []
-    });
-
-    // Продолжаем с новым conversation и intent
-    return await processSearchWithIntent(conversationId, intent, text, requestId);
-  }
-
-  // Создаем сообщение пользователя
+  // Сохраняем сообщение пользователя
   await SearchMessage.create({
     id: generateId(),
     conversationId,
@@ -563,30 +673,240 @@ async function processWappiMessage(chatId, text, requestId) {
     attachmentIds: []
   });
 
-  // Получаем или создаем intent
-  let intent = conversation.intentId
-    ? await SearchIntent.findOne({ id: conversation.intentId })
-    : null;
-  if (!intent) {
-    intent = await SearchIntent.create({
-      id: generateId(),
-      conversationId,
-      rawText: text || '',
-      filters: {}
-    });
-    await SearchConversation.updateOne(
-      { id: conversationId },
-      { intentId: intent.id, updatedAt: new Date() }
-    );
-  } else if (text) {
-    intent.rawText = (intent.rawText ? intent.rawText + ' ' : '') + text;
+  // Собираем контекст последних сообщений (и пользователя, и системы) для AI
+  const recentMessages = await SearchMessage.find({
+    conversationId
+  })
+    .sort({ createdAt: -1 })
+    .limit(20)
+    .lean();
+
+  const conversationContext = recentMessages
+    .reverse()
+    .map(msg => {
+      const role = msg.sender === 'CUSTOMER' ? 'ПОЛЬЗОВАТЕЛЬ' : 'СИСТЕМА';
+      return `${role}: ${msg.text}`;
+    })
+    .filter(t => t && t.trim());
+
+  // Геолокация (для WAPPI определяем её один раз на чат и используем дальше)
+  let geo = conversation.geo || null;
+  let radiusMeters = conversation.radiusMeters || 1000;
+  let geoRequested = conversation.geoRequested || false;
+
+  // Пробуем вытащить геолокацию из текущего сообщения (координаты или ссылка 2ГИС)
+  let extractedGeo = extractGeoFromText(text);
+
+  // Если явные координаты не нашли, но есть ссылка — пробуем вытащить координаты через getCoordinatesFromLink
+  if (!extractedGeo && text && text.trim()) {
+    const urlMatch = text.match(/https?:\/\/[^\s]+/);
+    if (urlMatch) {
+      const url = urlMatch[0];
+      try {
+        const coords = await getCoordinatesFromLink(url);
+        if (coords && typeof coords.lat === 'number' && typeof coords.lon === 'number') {
+          extractedGeo = { lat: coords.lat, lng: coords.lon };
+          console.log(`[WAPPI] [${requestId}] Координаты получены из ссылки через getCoordinatesFromLink:`, extractedGeo);
+        }
+      } catch (e) {
+        console.warn(`[WAPPI] [${requestId}] Не удалось получить координаты из ссылки через getCoordinatesFromLink:`, e.message);
+      }
+    }
   }
 
-  return await processSearchWithIntent(conversationId, intent, text, requestId);
+  if (extractedGeo) {
+    geo = extractedGeo;
+    radiusMeters = radiusMeters || 1000;
+    geoRequested = true;
+    await SearchConversation.updateOne(
+      { id: conversationId },
+      { geo, radiusMeters, geoRequested: true, updatedAt: new Date() }
+    );
+    console.log(`[WAPPI] [${requestId}] Обновлена геолокация для беседы:`, geo);
+  }
+
+  // Если геолокации всё еще нет — сначала (ОДИН РАЗ) просим её, затем больше не блокируем поиск
+  if ((!geo || geo.lat === undefined || geo.lng === undefined) && !geoRequested) {
+    const askGeoText = 'Чтобы подобрать ближайшие магазины, отправьте геопозицию (поделиться местоположением) или ссылку из 2ГИС с вашим адресом, а затем напишите, какой товар вы ищете.';
+
+    await SearchConversation.updateOne(
+      { id: conversationId },
+      { geoRequested: true, updatedAt: new Date() }
+    );
+
+    await SearchMessage.create({
+      id: generateId(),
+      conversationId,
+      sender: 'SYSTEM',
+      text: askGeoText
+    });
+
+    const debugPayload = {
+      replyText: askGeoText,
+      needGeo: true,
+      allProductsCount: 0,
+      allProductsSample: [],
+      matchedProductIds: [],
+      matchedProducts: []
+    };
+
+    return debug ? debugPayload : askGeoText;
+  }
+
+  // Получаем все оплаченные товары
+  const allProducts = await Product.find({
+    isPayed: true,
+    paymentExpiresAt: { $gt: new Date() }
+  }).limit(1000).lean();
+
+  console.log(`[WAPPI] [${requestId}] Всего оплаченных товаров для AI: ${allProducts.length}`);
+
+  // Обогащаем товары категориями
+  const categoryIds = Array.from(new Set(allProducts.map(p => p.categoryId).filter(Boolean)));
+  let categoryById = new Map();
+  if (categoryIds.length > 0) {
+    const categories = await Category.find({ id: { $in: categoryIds } }).lean();
+    categoryById = new Map(categories.map(cat => [cat.id, cat]));
+  }
+
+  const productsWithCategory = allProducts.map(product => ({
+    ...product,
+    categoryName: product.categoryId ? (categoryById.get(product.categoryId)?.name || null) : null
+  }));
+
+  if (productsWithCategory.length === 0) {
+    const emptyMsg = 'Сейчас в каталоге нет доступных товаров для поиска.';
+    await SearchMessage.create({
+      id: generateId(),
+      conversationId,
+      sender: 'SYSTEM',
+      text: emptyMsg
+    });
+
+    const debugPayload = {
+      replyText: emptyMsg,
+      allProductsCount: 0,
+      allProductsSample: [],
+      matchedProductIds: [],
+      matchedProducts: []
+    };
+
+    return debug ? debugPayload : emptyMsg;
+  }
+
+  // Отправляем сообщение + каталог напрямую в Gemini
+  const aiResult = await getWappiChatAIResponse({
+    message: text,
+    products: productsWithCategory,
+    conversationContext
+  });
+
+  let replyText = aiResult && typeof aiResult.replyText === 'string'
+    ? aiResult.replyText
+    : 'Не удалось обработать запрос. Попробуйте описать товар по-другому.';
+
+  // На основе matchedProductIds собираем подробную информацию о найденных товарах
+  let matchedProducts = [];
+  if (Array.isArray(aiResult.matchedProductIds) && aiResult.matchedProductIds.length > 0) {
+    const matchedIds = new Set(aiResult.matchedProductIds);
+    matchedProducts = productsWithCategory.filter(p => matchedIds.has(p.id));
+  }
+
+  console.log(`[WAPPI] [${requestId}] AI выбрал ${matchedProducts.length} товаров из ${productsWithCategory.length}`);
+  if (matchedProducts.length > 0) {
+    console.log(
+      `[WAPPI] [${requestId}] Примеры выбранных товаров:`,
+      matchedProducts.slice(0, 5).map(p => ({
+        id: p.id,
+        name: p.name,
+        brandName: p.brandName,
+        categoryName: p.categoryName
+      }))
+    );
+  }
+
+  // Если AI сузил выбор до ОДНОГО товара — сразу показываем магазины, без дополнительных подтверждений
+  if (matchedProducts.length === 1) {
+    try {
+      const singleProduct = matchedProducts[0];
+      console.log(`[WAPPI] [${requestId}] Один выбранный товар (${singleProduct.id}), подготавливаем ответ с магазинами`);
+
+      const searchResultItems = await performSearch({
+        text,
+        geo,
+        radiusMeters,
+        intent: {
+          filters: { candidateProductIds: [singleProduct.id] },
+          brand: null,
+          packageInfo: null
+        }
+      });
+
+      if (Array.isArray(searchResultItems) && searchResultItems.length > 0) {
+        replyText = formatSearchResultsWithStores(searchResultItems[0]);
+        console.log(`[WAPPI] [${requestId}] Сформирован ответ с магазинами для товара ${singleProduct.id}`);
+      } else {
+        console.log(`[WAPPI] [${requestId}] Для товара ${singleProduct.id} не найдено доступных магазинов, оставляем текст AI`);
+      }
+    } catch (error) {
+      console.error(`[WAPPI] [${requestId}] Ошибка при формировании ответа с магазинами:`, error);
+    }
+  }
+
+  // Сохраняем ответ системы
+  await SearchMessage.create({
+    id: generateId(),
+    conversationId,
+    sender: 'SYSTEM',
+    text: replyText
+  });
+
+  const debugPayload = {
+    replyText,
+    reasoning: aiResult.reasoning || null,
+    allProductsCount: productsWithCategory.length,
+    allProductsSample: productsWithCategory.slice(0, 10).map(p => ({
+      id: p.id,
+      name: p.name,
+      brandName: p.brandName,
+      categoryName: p.categoryName
+    })),
+    matchedProductIds: Array.isArray(aiResult.matchedProductIds) ? aiResult.matchedProductIds : [],
+    matchedProducts: matchedProducts.map(p => ({
+      id: p.id,
+      name: p.name,
+      brandName: p.brandName,
+      categoryName: p.categoryName,
+      packageInfo: p.packageInfo,
+      sku: p.sku
+    })),
+    rawAI: aiResult
+  };
+
+  if (debug) {
+    console.log(`[WAPPI] [${requestId}] DEBUG payload:`, JSON.stringify(debugPayload, null, 2));
+    return debugPayload;
+  }
+
+  return replyText;
 }
 
 // Функция обработки поиска с intent
 async function processSearchWithIntent(conversationId, intent, text, requestId) {
+  // Получаем историю сообщений для контекста (последние 10 сообщений)
+  const recentMessages = await SearchMessage.find({
+    conversationId,
+    sender: 'CUSTOMER'
+  })
+    .sort({ createdAt: -1 })
+    .limit(10)
+    .lean();
+
+  // Формируем контекст разговора (только тексты сообщений пользователя)
+  const conversationContext = recentMessages
+    .reverse() // Возвращаем в хронологическом порядке
+    .map(msg => msg.text)
+    .filter(t => t && t.trim());
 
   // Обновляем intent на основе ответов пользователя
   if (text && text.trim()) {
@@ -643,11 +963,16 @@ async function processSearchWithIntent(conversationId, intent, text, requestId) 
       paymentExpiresAt: { $gt: new Date() }
     }).lean();
   } else {
-    candidates = await buildCandidatesByText(text);
+    // Передаем контекст разговора для лучшего понимания запроса
+    console.log(`[WAPPI] 🔍 Поиск товаров по запросу: "${text}"`);
+    candidates = await buildCandidatesByText(text, conversationContext);
+    console.log(`[WAPPI] Найдено кандидатов до фильтрации по оплате: ${candidates.length}`);
     candidates = candidates.filter(p => p.isPayed && p.paymentExpiresAt && new Date(p.paymentExpiresAt) > new Date());
+    console.log(`[WAPPI] Найдено кандидатов после фильтрации по оплате: ${candidates.length}`);
   }
 
   if (candidates.length === 0) {
+    console.log(`[WAPPI] ❌ Товары не найдены для запроса: "${text}"`);
     await SearchConversation.updateOne(
       { id: conversationId },
       { state: 'NEEDS_CLARIFICATION', updatedAt: new Date() }
@@ -659,12 +984,24 @@ async function processSearchWithIntent(conversationId, intent, text, requestId) 
     intent.packageType = null;
     await intent.save();
 
-    return 'Не нашел такой товар. Попробуйте написать название по-другому или укажите бренд.';
+    const errorMessage = 'Не нашел такой товар. Попробуйте написать название по-другому или укажите бренд.';
+    await SearchMessage.create({
+      id: generateId(),
+      conversationId,
+      sender: 'SYSTEM',
+      text: errorMessage
+    });
+    return errorMessage;
   }
 
-  // Используем Gemini для извлечения intent
+  // НЕ фильтруем кандидатов по intent, если это первый поиск
+  // Фильтрация применяется только при уточняющих вопросах
+  const isFirstSearch = !intent.brand && !intent.packageInfo && !intent.type && !intent.packageType;
+
+  // Используем Gemini для извлечения intent ТОЛЬКО если это уточняющий запрос (не первый поиск)
+  // При первом поиске AI уже нашел товары, не нужно дополнительно извлекать intent
   let geminiResult = null;
-  if (text && text.trim() && candidates.length > 0) {
+  if (!isFirstSearch && text && text.trim() && candidates.length > 0) {
     try {
       const candidatesForGemini = candidates.slice(0, 15).map(item => ({
         id: item.id,
@@ -683,11 +1020,13 @@ async function processSearchWithIntent(conversationId, intent, text, requestId) 
           packageInfo: intent.packageInfo !== undefined ? intent.packageInfo : null,
           type: intent.type || null,
           packageType: intent.packageType || null
-        }
+        },
+        conversationContext: conversationContext
       });
 
       if (geminiResult && geminiResult.action === 'READY_TO_SEARCH') {
         const aiIntent = geminiResult.intent || {};
+        // Обновляем intent только если новые значения релевантны
         if (aiIntent.brand !== undefined && aiIntent.brand !== null) {
           intent.brand = aiIntent.brand;
         }
@@ -705,19 +1044,47 @@ async function processSearchWithIntent(conversationId, intent, text, requestId) 
     } catch (error) {
       console.error('Ошибка при получении intent от Gemini:', error);
     }
+  } else if (isFirstSearch) {
+    console.log(`[WAPPI] Первый поиск, извлечение intent пропущено (AI уже нашел товары)`);
   }
 
-  // Фильтруем кандидатов
-  const previousCandidateIds = intent.filters && Array.isArray(intent.filters.candidateProductIds)
-    ? intent.filters.candidateProductIds
-    : candidates.map(c => c.id);
+  if (!isFirstSearch) {
+    // Фильтруем только если есть уточняющие параметры от пользователя
+    const previousCandidateIds = intent.filters && Array.isArray(intent.filters.candidateProductIds)
+      ? intent.filters.candidateProductIds
+      : candidates.map(c => c.id);
 
-  candidates = filterCandidatesByIntent(candidates, {
-    brand: intent.brand || null,
-    packageInfo: intent.packageInfo !== undefined ? intent.packageInfo : null,
-    type: intent.type || null,
-    packageType: intent.packageType || null
-  });
+    const candidatesBeforeFilter = candidates.length;
+    console.log(`[WAPPI] Кандидатов до фильтрации: ${candidatesBeforeFilter}`);
+
+    candidates = filterCandidatesByIntent(candidates, {
+      brand: intent.brand || null,
+      packageInfo: intent.packageInfo !== undefined ? intent.packageInfo : null,
+      type: intent.type || null,
+      packageType: intent.packageType || null
+    });
+
+    console.log(`[WAPPI] Кандидатов после фильтрации: ${candidates.length}`);
+    console.log(`[WAPPI] Intent для фильтрации:`, {
+      brand: intent.brand,
+      packageInfo: intent.packageInfo,
+      type: intent.type,
+      packageType: intent.packageType
+    });
+
+    // Если после фильтрации все товары отфильтровались, но были до фильтрации - используем исходные кандидаты
+    if (candidates.length === 0 && candidatesBeforeFilter > 0) {
+      console.log(`[WAPPI] ⚠️ Все товары отфильтровались, используем исходные кандидаты`);
+      candidates = await Product.find({
+        id: { $in: previousCandidateIds },
+        isPayed: true,
+        paymentExpiresAt: { $gt: new Date() }
+      }).lean();
+      console.log(`[WAPPI] Восстановлено кандидатов: ${candidates.length}`);
+    }
+  } else {
+    console.log(`[WAPPI] Первый поиск, фильтрация по intent не применяется`);
+  }
 
   intent.filters = {
     ...(intent.filters || {}),
@@ -791,75 +1158,104 @@ async function processSearchWithIntent(conversationId, intent, text, requestId) 
     }
   }
 
-  // Если товаров больше одного - задаем уточняющие вопросы
-  const previousSystemMessages = await SearchMessage.find({
-    conversationId,
-    sender: 'SYSTEM'
-  })
-    .sort({ createdAt: -1 })
-    .limit(10)
-    .lean();
-
-  const previousQuestions = previousSystemMessages
-    .map(msg => msg.text)
-    .filter(text => text && text.trim().length > 0);
-
-  let clarification = null;
-  try {
-    clarification = await generateClarificationQuestions({
-      candidates: candidates.map(item => ({
-        id: item.id,
-        name: item.name,
-        brandName: item.brandName,
-        packageInfo: item.packageInfo,
-        description: item.description,
-        sku: item.sku
-      })),
-      known: {
-        brand: intent.brand || null,
-        packageInfo: intent.packageInfo !== undefined ? intent.packageInfo : null,
-        type: intent.type || null,
-        packageType: intent.packageType || null
-      },
-      previousQuestions: previousQuestions
+  // Проверяем, что товары есть после всех фильтраций
+  if (candidates.length === 0) {
+    console.log(`[WAPPI] ❌ Нет кандидатов после фильтрации, возвращаем сообщение об ошибке`);
+    await SearchMessage.create({
+      id: generateId(),
+      conversationId,
+      sender: 'SYSTEM',
+      text: 'Не нашел такой товар. Попробуйте написать название по-другому или укажите бренд.'
     });
-  } catch (error) {
-    console.error('Ошибка при генерации вопросов:', error);
-    clarification = { questions: ['Уточните, какой именно товар вас интересует?'], quickReplies: [] };
+    return 'Не нашел такой товар. Попробуйте написать название по-другому или укажите бренд.';
   }
 
-  await SearchConversation.updateOne(
-    { id: conversationId },
-    { state: 'NEEDS_CLARIFICATION', updatedAt: new Date() }
-  );
+  // Если товаров больше одного - показываем их список (до 10 товаров)
+  // Если товаров больше 10 - показываем первые 10 и просим уточнить
 
-  // Формируем сообщение с вопросом и списком товаров
-  let responseText = '';
+  console.log(`[WAPPI] ✅ Найдено ${candidates.length} кандидатов, показываем список`);
 
-  // Добавляем вопрос
-  const question = clarification.questions.length > 0
-    ? clarification.questions[0]
-    : 'Уточните, какой именно товар вас интересует?';
-
-  responseText = question;
-
-  // Добавляем список найденных товаров (если их не слишком много)
-  if (candidates.length > 1 && candidates.length <= 10) {
-    responseText += '\n\nНайдено товаров:\n';
+  if (candidates.length >= 2 && candidates.length <= 10) {
+    // Показываем все найденные товары
+    let responseText = `Найдено товаров: ${candidates.length}\n\n`;
     candidates.forEach((product, index) => {
       const productName = product.name || 'Без названия';
       const brandName = product.brandName ? ` (${product.brandName})` : '';
       const packageInfo = product.packageInfo ? ` - ${product.packageInfo}` : '';
       responseText += `${index + 1}. ${productName}${brandName}${packageInfo}\n`;
     });
-    responseText += '\nОтветьте на вопрос выше, чтобы уточнить выбор.';
-  } else if (candidates.length > 10) {
-    responseText += `\n\nНайдено товаров: ${candidates.length}. Уточните запрос для более точного поиска.`;
+    responseText += '\nУточните, какой именно товар вас интересует?';
+
+    await SearchMessage.create({
+      id: generateId(),
+      conversationId,
+      sender: 'SYSTEM',
+      text: responseText
+    });
+
+    await SearchConversation.updateOne(
+      { id: conversationId },
+      { state: 'NEEDS_CLARIFICATION', updatedAt: new Date() }
+    );
+
+    return responseText;
   }
 
-  // Убеждаемся, что responseText не пустой
-  if (!responseText || !responseText.trim()) {
-    responseText = 'Уточните, какой именно товар вас интересует?';
+  // Если товаров больше 10 - показываем первые 10 и просим уточнить
+  if (candidates.length > 10) {
+    let responseText = `Найдено товаров: ${candidates.length}. Показаны первые 10:\n\n`;
+    candidates.slice(0, 10).forEach((product, index) => {
+      const productName = product.name || 'Без названия';
+      const brandName = product.brandName ? ` (${product.brandName})` : '';
+      const packageInfo = product.packageInfo ? ` - ${product.packageInfo}` : '';
+      responseText += `${index + 1}. ${productName}${brandName}${packageInfo}\n`;
+    });
+    responseText += `\n... и еще ${candidates.length - 10} товаров.\nУточните запрос для более точного поиска.`;
+
+    await SearchMessage.create({
+      id: generateId(),
+      conversationId,
+      sender: 'SYSTEM',
+      text: responseText
+    });
+
+    await SearchConversation.updateOne(
+      { id: conversationId },
+      { state: 'NEEDS_CLARIFICATION', updatedAt: new Date() }
+    );
+
+    return responseText;
+  }
+
+  // Если дошли сюда, значит товары есть, но их больше 10 или что-то пошло не так
+  // В любом случае показываем товары, которые есть
+  console.log(`[WAPPI] ⚠️ Попали в fallback блок, кандидатов: ${candidates.length}`);
+
+  // Показываем товары, даже если их много
+  let responseText = '';
+  if (candidates.length > 0) {
+    if (candidates.length <= 10) {
+      responseText = `Найдено товаров: ${candidates.length}\n\n`;
+      candidates.forEach((product, index) => {
+        const productName = product.name || 'Без названия';
+        const brandName = product.brandName ? ` (${product.brandName})` : '';
+        const packageInfo = product.packageInfo ? ` - ${product.packageInfo}` : '';
+        responseText += `${index + 1}. ${productName}${brandName}${packageInfo}\n`;
+      });
+      responseText += '\nУточните, какой именно товар вас интересует?';
+    } else {
+      responseText = `Найдено товаров: ${candidates.length}. Показаны первые 10:\n\n`;
+      candidates.slice(0, 10).forEach((product, index) => {
+        const productName = product.name || 'Без названия';
+        const brandName = product.brandName ? ` (${product.brandName})` : '';
+        const packageInfo = product.packageInfo ? ` - ${product.packageInfo}` : '';
+        responseText += `${index + 1}. ${productName}${brandName}${packageInfo}\n`;
+      });
+      responseText += `\n... и еще ${candidates.length - 10} товаров.\nУточните запрос для более точного поиска.`;
+    }
+  } else {
+    // Если товаров нет (не должно быть, но на всякий случай)
+    responseText = 'Не нашел такой товар. Попробуйте написать название по-другому или укажите бренд.';
   }
 
   await SearchMessage.create({
@@ -869,6 +1265,11 @@ async function processSearchWithIntent(conversationId, intent, text, requestId) 
     text: responseText
   });
 
+  await SearchConversation.updateOne(
+    { id: conversationId },
+    { state: 'NEEDS_CLARIFICATION', updatedAt: new Date() }
+  );
+
   return responseText;
 }
 
@@ -877,6 +1278,7 @@ async function handleWappiWebhook(req, res) {
   const startTime = Date.now();
   const requestId = `wappi-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
   const clientIp = req.ip || req.connection.remoteAddress || req.headers['x-forwarded-for'] || 'unknown';
+  const isTestMode = req.query.test === 'true' || req.query.test === '1' || req.headers['x-test-mode'] === 'true';
 
   console.log(`[WAPPI WEBHOOK] [${requestId}] 📥 Входящий запрос:`, {
     method: req.method,
@@ -884,7 +1286,8 @@ async function handleWappiWebhook(req, res) {
     ip: clientIp,
     userAgent: req.headers['user-agent'] || 'unknown',
     timestamp: new Date().toISOString(),
-    bodySize: JSON.stringify(req.body || {}).length
+    bodySize: JSON.stringify(req.body || {}).length,
+    testMode: isTestMode
   });
 
   try {
@@ -956,9 +1359,67 @@ async function handleWappiWebhook(req, res) {
       chatId: maskedChatId,
       bodyLength: body.length,
       bodyPreview: bodyPreview,
-      fromMe: fromMe || false
+      fromMe: fromMe || false,
+      testMode: isTestMode
     });
 
+    // Если тестовый режим - обрабатываем синхронно и возвращаем результат (с доп. данными для отладки)
+    if (isTestMode) {
+      const processingStartTime = Date.now();
+      try {
+        console.log(`[WAPPI WEBHOOK] [${requestId}] 🧪 ТЕСТОВЫЙ РЕЖИМ - синхронная обработка (с DEBUG)...`);
+
+        const result = await processWappiMessage(chatId, body, requestId, { debug: true });
+
+        let responseText = typeof result === 'string' ? result : (result.replyText || '');
+        if (!responseText || !responseText.trim()) {
+          console.warn(`[WAPPI WEBHOOK] [${requestId}] ⚠️  Получен пустой ответ, используем дефолтное сообщение`);
+          responseText = 'Обрабатываю ваш запрос. Пожалуйста, подождите...';
+        }
+
+        const totalProcessingTime = Date.now() - processingStartTime;
+        const totalRequestTime = Date.now() - startTime;
+
+        console.log(`[WAPPI WEBHOOK] [${requestId}] ✅ Тестовый запрос обработан:`, {
+          totalProcessingTime: `${totalProcessingTime}ms`,
+          totalRequestTime: `${totalRequestTime}ms`,
+          responseLength: responseText.length
+        });
+
+        return res.status(200).json({
+          received: true,
+          requestId,
+          testMode: true,
+          // В тестовом режиме возвращаем ПОЛНЫЙ объект результата, включая список товаров
+          response: result,
+          processingTime: totalProcessingTime,
+          totalTime: totalRequestTime
+        });
+
+      } catch (error) {
+        const totalProcessingTime = Date.now() - processingStartTime;
+        const totalRequestTime = Date.now() - startTime;
+
+        console.error(`[WAPPI WEBHOOK] [${requestId}] ❌ Ошибка в тестовом режиме:`, {
+          error: error.message,
+          stack: error.stack,
+          totalProcessingTime: `${totalProcessingTime}ms`,
+          totalRequestTime: `${totalRequestTime}ms`
+        });
+
+        return res.status(200).json({
+          received: true,
+          requestId,
+          testMode: true,
+          error: error.message,
+          response: 'Произошла ошибка при поиске товаров. Попробуйте позже.',
+          processingTime: totalProcessingTime,
+          totalTime: totalRequestTime
+        });
+      }
+    }
+
+    // Обычный режим - возвращаем сразу и обрабатываем асинхронно
     res.status(200).json({ received: true, requestId });
 
     // Обрабатываем сообщение асинхронно
@@ -967,12 +1428,22 @@ async function handleWappiWebhook(req, res) {
       try {
         console.log(`[WAPPI WEBHOOK] [${requestId}] 🔍 Начинаем обработку запроса...`);
 
-        let responseText = await processWappiMessage(chatId, body, requestId);
+        // Сразу отправляем пользователю сообщение о том, что запрос обрабатывается
+        const processingMessage = 'Обрабатываю ваш запрос, пожалуйста подождите...';
+        try {
+          await sendWappiMessage(chatId, processingMessage);
+        } catch (e) {
+          console.warn(`[WAPPI WEBHOOK] [${requestId}] ⚠️ Не удалось отправить сообщение о начале обработки:`, e.message);
+        }
+
+        const result = await processWappiMessage(chatId, body, requestId, { debug: false });
+
+        let responseText = typeof result === 'string' ? result : (result.replyText || '');
 
         // Проверяем, что ответ не пустой
         if (!responseText || !responseText.trim()) {
           console.warn(`[WAPPI WEBHOOK] [${requestId}] ⚠️  Получен пустой ответ, используем дефолтное сообщение`);
-          responseText = 'Обрабатываю ваш запрос. Пожалуйста, подождите...';
+          responseText = 'Не удалось обработать запрос. Попробуйте описать товар по-другому.';
         }
 
         console.log(`[WAPPI WEBHOOK] [${requestId}] 📤 Отправка ответа пользователю через Wappi API...`);

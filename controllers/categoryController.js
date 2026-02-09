@@ -1,6 +1,7 @@
 const { models } = require('../models/database');
 const { generateId } = require('../utils/uuid');
 const { sendEmail } = require('../utils/email');
+const { createNotificationForBrandUsers } = require('./notificationController');
 
 const { Category, CategoryRequest, Brand } = models;
 
@@ -384,53 +385,87 @@ async function approveCategoryRequest(req, res) {
       parentCategoryId: parentCategoryId || null 
     }).lean();
     
+    let category;
     if (existingCategory) {
-      // Обновляем статус заявки на отклоненную
+      // Категория уже существует (возможно, создана администратором вручную)
+      // Помечаем заявку как одобренную, так как цель заявки (создание категории) уже достигнута
+      category = existingCategory;
+      
+      // Обновляем статус заявки на одобренную
       await CategoryRequest.findOneAndUpdate(
         { id: requestId },
         { 
-          status: 'REJECTED', 
-          rejectedReason: 'Категория с таким именем уже существует',
+          status: 'ACCEPTED', 
           updatedAt: new Date() 
         }
       );
-      return res.status(409).json({ error: 'Категория с таким именем уже существует' });
+    } else {
+      // Создаем категорию
+      category = await Category.create({
+        id: generateId(),
+        name: categoryRequest.name,
+        description: categoryRequest.description || null,
+        parentCategoryId: parentCategoryId || null
+      });
+
+      // Обновляем статус заявки
+      await CategoryRequest.findOneAndUpdate(
+        { id: requestId },
+        { 
+          status: 'ACCEPTED', 
+          updatedAt: new Date() 
+        }
+      );
     }
-
-    // Создаем категорию
-    const category = await Category.create({
-      id: generateId(),
-      name: categoryRequest.name,
-      description: categoryRequest.description || null,
-      parentCategoryId: parentCategoryId || null
-    });
-
-    // Обновляем статус заявки
-    await CategoryRequest.findOneAndUpdate(
-      { id: requestId },
-      { 
-        status: 'ACCEPTED', 
-        updatedAt: new Date() 
-      }
-    );
 
     // Отправляем уведомление бренду
     const brand = await Brand.findOne({ id: categoryRequest.brandId }).lean();
     if (brand && brand.email) {
       try {
+        const messageText = existingCategory 
+          ? `Ваша заявка на создание категории "${categoryRequest.name}" была одобрена администратором. Категория уже существовала в системе.`
+          : `Ваша заявка на создание категории "${categoryRequest.name}" была одобрена администратором.`;
+        
         await sendEmail({
           to: brand.email,
           subject: 'Ваша заявка на создание категории одобрена',
-          text: `Ваша заявка на создание категории "${categoryRequest.name}" была одобрена администратором.`
+          text: messageText
         });
       } catch (e) {
         console.error('Не удалось отправить email об одобрении заявки:', e);
       }
     }
 
+    // Создаем уведомление для пользователей бренда
+    try {
+      const notificationMessage = existingCategory 
+        ? `Ваша заявка на создание категории "${categoryRequest.name}" была одобрена. Категория уже существовала в системе.`
+        : `Ваша заявка на создание категории "${categoryRequest.name}" была одобрена администратором.`;
+      
+      await createNotificationForBrandUsers({
+        brandId: categoryRequest.brandId,
+        type: 'CATEGORY_REQUEST_APPROVED',
+        title: 'Заявка на категорию одобрена',
+        message: notificationMessage,
+        metadata: {
+          categoryRequestId: requestId,
+          categoryName: categoryRequest.name,
+          categoryId: category.id,
+          brandId: categoryRequest.brandId
+        }
+      });
+    } catch (notificationError) {
+      console.error('Ошибка при создании уведомления об одобрении заявки:', notificationError);
+      // Не прерываем процесс, если уведомление не создалось
+    }
+
+    const message = existingCategory 
+      ? 'Заявка одобрена. Категория уже существовала в системе.'
+      : 'Заявка одобрена, категория создана';
+
     res.json({
-      message: 'Заявка одобрена, категория создана',
-      category: category.toObject(),
+      message,
+      category: category.toObject ? category.toObject() : category,
       request: {
         ...categoryRequest,
         status: 'ACCEPTED'
@@ -479,6 +514,27 @@ async function rejectCategoryRequest(req, res) {
       } catch (e) {
         console.error('Не удалось отправить email об отклонении заявки:', e);
       }
+    }
+
+    // Создаем уведомление для пользователей бренда
+    try {
+      const notificationMessage = `Ваша заявка на создание категории "${categoryRequest.name}" была отклонена.${reason ? ` Причина: ${reason}` : ''}`;
+      
+      await createNotificationForBrandUsers({
+        brandId: categoryRequest.brandId,
+        type: 'CATEGORY_REQUEST_REJECTED',
+        title: 'Заявка на категорию отклонена',
+        message: notificationMessage,
+        metadata: {
+          categoryRequestId: requestId,
+          categoryName: categoryRequest.name,
+          brandId: categoryRequest.brandId,
+          rejectedReason: reason || null
+        }
+      });
+    } catch (notificationError) {
+      console.error('Ошибка при создании уведомления об отклонении заявки:', notificationError);
+      // Не прерываем процесс, если уведомление не создалось
     }
 
     const updatedRequest = await CategoryRequest.findOne({ id: requestId }).lean();

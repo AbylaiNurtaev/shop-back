@@ -286,6 +286,14 @@ const searchConversationSchema = new mongoose.Schema(
     intentId: { type: String, default: null },
     requestId: { type: String, default: null },
     resultId: { type: String, default: null },
+    // Геолокация и радиус для поиска ближайших магазинов (используется в чате/WhatsApp)
+    geo: {
+      lat: { type: Number, default: null },
+      lng: { type: Number, default: null }
+    },
+    radiusMeters: { type: Number, default: null },
+    // Флаг, что мы уже попросили геолокацию у пользователя (чтобы не зацикливаться)
+    geoRequested: { type: Boolean, default: false },
     expiresAt: { type: Date, required: true, index: { expires: 0 } }
   },
   baseSchemaOptions

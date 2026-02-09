@@ -232,11 +232,11 @@ async function buildCandidatesByText(text) {
   console.log(`🔍 AI семантический поиск для запроса: "${text}"`);
 
   try {
-    // Получаем все оплаченные товары для AI поиска
+    // Получаем все оплаченные товары для AI поиска (увеличено для покрытия всех категорий)
     const allProducts = await Product.find({
       isPayed: true,
       paymentExpiresAt: { $gt: new Date() }
-    }).limit(500).lean();
+    }).limit(1000).lean();
 
     if (allProducts.length === 0) {
       console.log('Нет доступных товаров для поиска');
