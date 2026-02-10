@@ -214,6 +214,7 @@ const offerSchema = new mongoose.Schema(
     productId: { type: String, required: true },
     storeId: { type: String, required: true },
     price: { type: Number, required: true },
+    markup: { type: Number, default: 0 },
     currency: { type: String, required: true },
     isAvailable: { type: Boolean, default: true },
     quantity: { type: Number, default: 0 }

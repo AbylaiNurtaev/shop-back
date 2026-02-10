@@ -21,7 +21,7 @@ async function getStoreIdForStoreOwner(user) {
 
 async function createOffer(req, res) {
   try {
-    const { productId, storeId, price, currency, isAvailable, quantity } = req.body;
+    const { productId, storeId, price, markup, currency, isAvailable, quantity } = req.body;
 
     if (!productId || !storeId || price === undefined || !currency) {
       return res.status(400).json({ error: 'Отсутствуют обязательные поля' });
@@ -64,6 +64,7 @@ async function createOffer(req, res) {
       productId,
       storeId,
       price,
+      markup: markup || 0,
       currency,
       isAvailable: isAvailable !== undefined ? isAvailable : true,
       quantity: quantity || 0
@@ -195,7 +196,7 @@ async function getOffers(req, res) {
 async function updateOffer(req, res) {
   try {
     const { offerId } = req.params;
-    let { price, currency, isAvailable, quantity } = req.body;
+    let { price, currency, isAvailable, quantity, markup } = req.body;
 
     // Проверяем существование оффера
     const offer = await Offer.findOne({ id: offerId }).lean();
@@ -239,6 +240,15 @@ async function updateOffer(req, res) {
       quantity = numQuantity;
     }
 
+    // Валидация markup
+    if (markup !== undefined && markup !== null) {
+      const numMarkup = typeof markup === 'string' ? parseFloat(markup) : markup;
+      if (isNaN(numMarkup) || numMarkup < 0) {
+        return res.status(400).json({ error: 'markup должен быть неотрицательным числом' });
+      }
+      markup = numMarkup;
+    }
+
     // Валидация isAvailable
     if (isAvailable !== undefined && isAvailable !== null) {
       if (typeof isAvailable !== 'boolean') {
@@ -256,6 +266,9 @@ async function updateOffer(req, res) {
     if (price !== undefined && price !== null) {
       update.price = price;
       console.log(`Обновление цены оффера ${offerId}: старая цена = ${offer.price}, новая цена = ${price}`);
+    }
+    if (markup !== undefined && markup !== null) {
+      update.markup = markup;
     }
     if (currency !== undefined) update.currency = currency;
     if (isAvailable !== undefined) update.isAvailable = isAvailable;

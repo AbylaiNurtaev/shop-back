@@ -474,7 +474,9 @@ async function performSearch({ text, geo, radiusMeters, intent }) {
         nearestStore: offersWithStores.length > 0 ? {
           name: offersWithStores[0].store.name,
           address: offersWithStores[0].store.address,
-          location: offersWithStores[0].store.location
+          location: offersWithStores[0].store.location,
+          distanceMeters: offersWithStores[0].store.distanceMeters ?? null,
+          distanceFormatted: offersWithStores[0].store.distanceFormatted ?? null
         } : null
       };
     });
@@ -536,32 +538,55 @@ function formatSearchResultsWithStores(item) {
     }
   });
 
-  // Преобразуем Map в массив и сортируем по цене
+  // Преобразуем Map в массив и сортируем по расстоянию (если есть), затем по цене
   const uniqueStores = Array.from(storesMap.values())
-    .sort((a, b) => (a.price || 0) - (b.price || 0));
+    .sort((a, b) => {
+      const aDist = a.store.distanceMeters;
+      const bDist = b.store.distanceMeters;
+      if (aDist !== null && aDist !== undefined && bDist !== null && bDist !== undefined) {
+        return aDist - bDist;
+      }
+      if (aDist !== null && aDist !== undefined) return -1;
+      if (bDist !== null && bDist !== undefined) return 1;
+      return (a.price || 0) - (b.price || 0);
+    });
 
   let message = `✅ Найден товар: ${productName}\n\n`;
-  message += `Найдено магазинов: ${uniqueStores.length}\n\n`;
 
-  // Показываем первые 5 уникальных магазинов
-  const storesToShow = uniqueStores.slice(0, 5);
-  storesToShow.forEach((offer, index) => {
-    message += `${index + 1}. ${offer.store.name}\n`;
-    if (offer.store.address) {
-      message += `   Адрес: ${offer.store.address}\n`;
-    }
-    message += `   Цена: ${offer.price} ${offer.currency || 'RUB'}\n`;
-    if (offer.store.distanceFormatted) {
-      message += `   Расстояние: ${offer.store.distanceFormatted}\n`;
-    }
-    if (offer.store.location) {
-      message += `   Локация: ${offer.store.location}\n`;
-    }
-    message += '\n';
-  });
+  // Определяем один ближайший магазин
+  const nearestOffer = uniqueStores[0];
 
-  if (uniqueStores.length > 5) {
-    message += `... и еще ${uniqueStores.length - 5} магазинов.`;
+  if (nearestOffer) {
+    const distMeters = nearestOffer.store.distanceMeters;
+    const distFormatted = nearestOffer.store.distanceFormatted ||
+      (typeof distMeters === 'number'
+        ? (distMeters >= 1000 ? `${(distMeters / 1000).toFixed(1)} км` : `${Math.round(distMeters)} м`)
+        : null);
+
+    if (typeof distMeters === 'number') {
+      if (distMeters > 1000) {
+        message += `В радиусе 1 км магазины с этим товаром не найдены. Самый ближайший магазин "${nearestOffer.store.name}" находится на расстоянии ${distFormatted}.\n\n`;
+      } else {
+        message += `Найдено магазинов: ${uniqueStores.length}. Ближайший магазин "${nearestOffer.store.name}" находится на расстоянии ${distFormatted}.\n\n`;
+      }
+    } else {
+      message += `Найдено магазинов: ${uniqueStores.length}. Показываю ближайший магазин:\n\n`;
+    }
+
+    // Детали только одного (самого ближайшего) магазина
+    message += `${nearestOffer.store.name}\n`;
+    if (nearestOffer.store.address) {
+      message += `Адрес: ${nearestOffer.store.address}\n`;
+    }
+    message += `Цена: ${nearestOffer.price} ${nearestOffer.currency || 'RUB'}\n`;
+    if (distFormatted) {
+      message += `Расстояние: ${distFormatted}\n`;
+    }
+    if (nearestOffer.store.location) {
+      message += `Локация: ${nearestOffer.store.location}\n`;
+    }
+  } else {
+    message += 'К сожалению, не удалось определить ближайший магазин.';
   }
 
   return message;
@@ -717,8 +742,34 @@ async function processWappiMessage(chatId, text, requestId, options = {}) {
     console.log(`[WAPPI] [${requestId}] Обновлена геолокация для беседы (source=${geoSource}):`, geo);
   }
 
-  // Если геолокации нет ИЛИ она не из нативного WhatsApp-местоположения — просим отправить geo
-  if (!geo || geo.lat === undefined || geo.lng === undefined || geoSource !== 'whatsapp') {
+  // Если геолокация есть, но сообщение само по себе не похоже на поисковый запрос
+  // (например, пользователь отправил только координаты) — подтверждаем гео и просим товар
+  if (geo && geo.lat !== undefined && geo.lng !== undefined && !isSearchQuery(text || '')) {
+    const geoOnlyText = 'Геолокация получена. Теперь напишите, какой товар вы ищете.';
+
+    await SearchMessage.create({
+      id: generateId(),
+      conversationId,
+      sender: 'SYSTEM',
+      text: geoOnlyText
+    });
+
+    const debugPayload = {
+      replyText: geoOnlyText,
+      needGeo: false,
+      geo: geo,
+      geoSource,
+      allProductsCount: 0,
+      allProductsSample: [],
+      matchedProductIds: [],
+      matchedProducts: []
+    };
+
+    return debug ? debugPayload : geoOnlyText;
+  }
+
+  // Если геолокации нет — просим отправить geo
+  if (!geo || geo.lat === undefined || geo.lng === undefined) {
     const askGeoText = 'Чтобы подобрать ближайшие магазины, отправьте геопозицию (поделиться местоположением в WhatsApp), а затем напишите, какой товар вы ищете.';
 
     await SearchConversation.updateOne(

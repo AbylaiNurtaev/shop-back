@@ -14,6 +14,13 @@ function normalizeLocation(location) {
   return location;
 }
 
+function parseCoordinate(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const num = Number(value);
+  if (Number.isNaN(num)) return null;
+  return num;
+}
+
 async function createUser(req, res) {
   try {
     const {
@@ -61,8 +68,19 @@ async function createUser(req, res) {
       const storeFirstName = firstName || store.firstName;
       const storeLastName = lastName || store.lastName;
       const storeMiddleName = middleName || store.middleName;
-      
-      const { name, address, location, description, photos, images, phoneNumber } = store;
+
+      const {
+        name,
+        address,
+        location,
+        description,
+        photos,
+        images,
+        phoneNumber,
+        latitude,
+        longitude
+      } = store;
+
       const normalizedLocation = normalizeLocation(location);
       if (!name || !address || !normalizedLocation) {
         return res.status(400).json({ error: 'Отсутствуют обязательные поля магазина' });
@@ -70,13 +88,25 @@ async function createUser(req, res) {
       if (!storeFirstName || !storeLastName) {
         return res.status(400).json({ error: 'Фамилия и Имя обязательны для заполнения при создании магазина' });
       }
-      const coords = await getCoordinatesFromLink(normalizedLocation);
+
+      // Координаты магазина: приоритет у явно переданных latitude/longitude
+      let locationCoords = null;
+      const latNum = parseCoordinate(latitude);
+      const lngNum = parseCoordinate(longitude);
+
+      if (latNum !== null && lngNum !== null) {
+        locationCoords = { lat: latNum, lng: lngNum };
+      } else {
+        const coords = await getCoordinatesFromLink(normalizedLocation);
+        locationCoords = coords ? { lat: coords.lat, lng: coords.lon } : null;
+      }
+
       const createdStore = await Store.create({
         id: generateId(),
         name,
         address,
         location: normalizedLocation,
-        locationCoords: coords ? { lat: coords.lat, lng: coords.lon } : null,
+        locationCoords,
         description: description || null,
         photos: photos || images || [],
         firstName: storeFirstName,

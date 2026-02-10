@@ -2,7 +2,7 @@ const { generateId } = require('../utils/uuid');
 const { models } = require('../models/database');
 const { getCoordinatesFromLink } = require('../utils/distance');
 
-const { Store, User } = models;
+const { Store, User, AuthCredential } = models;
 
 function normalizeLocation(location) {
   if (typeof location === 'string') return location;
@@ -12,9 +12,40 @@ function normalizeLocation(location) {
   return location;
 }
 
+function parseCoordinate(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const num = Number(value);
+  if (Number.isNaN(num)) return null;
+  return num;
+}
+
+function serializeStore(store) {
+  if (!store) return store;
+
+  const coords = store.locationCoords || {};
+
+  return {
+    ...store,
+    latitude: coords.lat ?? null,
+    longitude: coords.lng ?? null
+  };
+}
+
 async function createStore(req, res) {
   try {
-    const { name, address, location, description, photos, firstName, lastName, middleName, phoneNumber } = req.body;
+    const {
+      name,
+      address,
+      location,
+      description,
+      photos,
+      firstName,
+      lastName,
+      middleName,
+      phoneNumber,
+      latitude,
+      longitude
+    } = req.body;
     const normalizedLocation = normalizeLocation(location);
 
     if (!name || !address || !normalizedLocation) {
@@ -25,13 +56,24 @@ async function createStore(req, res) {
       return res.status(400).json({ error: 'Фамилия и Имя обязательны для заполнения' });
     }
 
-    const coords = await getCoordinatesFromLink(normalizedLocation);
+    // Координаты магазина: приоритет у явно переданных latitude/longitude
+    let locationCoords = null;
+    const latNum = parseCoordinate(latitude);
+    const lngNum = parseCoordinate(longitude);
+
+    if (latNum !== null && lngNum !== null) {
+      locationCoords = { lat: latNum, lng: lngNum };
+    } else {
+      const coords = await getCoordinatesFromLink(normalizedLocation);
+      locationCoords = coords ? { lat: coords.lat, lng: coords.lon } : null;
+    }
+
     const store = await Store.create({
       id: generateId(),
       name,
       address,
       location: normalizedLocation,
-      locationCoords: coords ? { lat: coords.lat, lng: coords.lon } : null,
+      locationCoords,
       description: description || null,
       photos: photos || [],
       firstName: firstName || null,
@@ -55,7 +97,7 @@ async function getStoreById(req, res) {
       return res.status(404).json({ error: 'Магазин не найден' });
     }
 
-    res.json(store);
+    res.json(serializeStore(store));
   } catch (error) {
     res.status(500).json({ error: 'Ошибка при получении магазина' });
   }
@@ -65,7 +107,7 @@ async function getStores(req, res) {
   try {
     const stores = await Store.find({}).lean();
     res.json({
-      items: stores,
+      items: stores.map(serializeStore),
       total: stores.length
     });
   } catch (error) {
@@ -76,17 +118,49 @@ async function getStores(req, res) {
 async function updateStore(req, res) {
   try {
     const { storeId } = req.params;
-    const { name, address, location, description, photos, firstName, lastName, middleName, phoneNumber } = req.body;
+    const {
+      name,
+      address,
+      location,
+      description,
+      photos,
+      firstName,
+      lastName,
+      middleName,
+      phoneNumber,
+      latitude,
+      longitude
+    } = req.body;
     const normalizedLocation = normalizeLocation(location);
 
     const update = { updatedAt: new Date() };
+    let locationCoords = null;
+
+    const latNum = parseCoordinate(latitude);
+    const lngNum = parseCoordinate(longitude);
+    const hasLatLng = latNum !== null && lngNum !== null;
+
     if (name !== undefined) update.name = name;
     if (address !== undefined) update.address = address;
+
     if (location !== undefined) {
       update.location = normalizedLocation;
-      const coords = await getCoordinatesFromLink(normalizedLocation);
-      update.locationCoords = coords ? { lat: coords.lat, lng: coords.lon } : null;
+
+      if (hasLatLng) {
+        locationCoords = { lat: latNum, lng: lngNum };
+      } else {
+        const coords = await getCoordinatesFromLink(normalizedLocation);
+        locationCoords = coords ? { lat: coords.lat, lng: coords.lon } : null;
+      }
+    } else if (hasLatLng) {
+      // Обновляем только координаты без изменения ссылки location
+      locationCoords = { lat: latNum, lng: lngNum };
     }
+
+    if (locationCoords !== null) {
+      update.locationCoords = locationCoords;
+    }
+
     if (description !== undefined) update.description = description;
     if (photos !== undefined) update.photos = photos;
     if (firstName !== undefined) update.firstName = firstName || null;
@@ -99,7 +173,7 @@ async function updateStore(req, res) {
       return res.status(404).json({ error: 'Магазин не найден' });
     }
 
-    res.json(store);
+    res.json(serializeStore(store));
   } catch (error) {
     res.status(500).json({ error: 'Ошибка при обновлении магазина' });
   }
@@ -108,10 +182,28 @@ async function updateStore(req, res) {
 async function deleteStore(req, res) {
   try {
     const { storeId } = req.params;
-    const result = await Store.deleteOne({ id: storeId });
-    if (result.deletedCount === 0) {
+    const store = await Store.findOne({ id: storeId }).lean();
+
+    if (!store) {
       return res.status(404).json({ error: 'Магазин не найден' });
     }
+
+    // Находим всех пользователей, привязанных к этому магазину
+    const users = await User.find({ storeId }).lean();
+    const userEmails = users.map(user => user.email).filter(Boolean);
+
+    // Удаляем пользователей
+    if (users.length > 0) {
+      await User.deleteMany({ storeId });
+    }
+
+    // Удаляем учетные данные по email этих пользователей
+    if (userEmails.length > 0) {
+      await AuthCredential.deleteMany({ login: { $in: userEmails } });
+    }
+
+    // Удаляем сам магазин
+    await Store.deleteOne({ id: storeId });
 
     res.status(204).send();
   } catch (error) {
@@ -143,21 +235,7 @@ async function getMyStoreSettings(req, res) {
     }
 
     // Возвращаем настройки магазина
-    const settings = {
-      id: store.id,
-      name: store.name,
-      address: store.address,
-      location: store.location,
-      locationCoords: store.locationCoords,
-      description: store.description,
-      photos: store.photos,
-      firstName: store.firstName,
-      lastName: store.lastName,
-      middleName: store.middleName,
-      phoneNumber: store.phoneNumber,
-      createdAt: store.createdAt,
-      updatedAt: store.updatedAt
-    };
+    const settings = serializeStore(store);
 
     res.json(settings);
   } catch (error) {
@@ -198,11 +276,18 @@ async function updateMyStoreSettings(req, res) {
       firstName,
       lastName,
       middleName,
-      phoneNumber
+      phoneNumber,
+      latitude,
+      longitude
     } = req.body;
 
     const update = { updatedAt: new Date() };
     const normalizedLocation = location ? normalizeLocation(location) : null;
+    let locationCoords = null;
+
+    const latNum = parseCoordinate(latitude);
+    const lngNum = parseCoordinate(longitude);
+    const hasLatLng = latNum !== null && lngNum !== null;
 
     // Валидация и обновление полей
     if (name !== undefined) {
@@ -224,8 +309,19 @@ async function updateMyStoreSettings(req, res) {
         return res.status(400).json({ error: 'Некорректный формат location' });
       }
       update.location = normalizedLocation;
-      const coords = await getCoordinatesFromLink(normalizedLocation);
-      update.locationCoords = coords ? { lat: coords.lat, lng: coords.lon } : null;
+      if (hasLatLng) {
+        locationCoords = { lat: latNum, lng: lngNum };
+      } else {
+        const coords = await getCoordinatesFromLink(normalizedLocation);
+        locationCoords = coords ? { lat: coords.lat, lng: coords.lon } : null;
+      }
+    } else if (hasLatLng) {
+      // Обновление только координат без изменения ссылки
+      locationCoords = { lat: latNum, lng: lngNum };
+    }
+
+    if (locationCoords !== null) {
+      update.locationCoords = locationCoords;
     }
 
     if (description !== undefined) {
@@ -283,7 +379,7 @@ async function updateMyStoreSettings(req, res) {
       return res.status(404).json({ error: 'Магазин не найден' });
     }
 
-    res.json(updatedStore);
+    res.json(serializeStore(updatedStore));
   } catch (error) {
     console.error('Ошибка при обновлении настроек магазина:', error);
     res.status(500).json({ error: 'Ошибка при обновлении настроек магазина' });
