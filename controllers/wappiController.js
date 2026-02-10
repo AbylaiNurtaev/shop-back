@@ -731,6 +731,8 @@ async function processWappiMessage(chatId, text, requestId, options = {}) {
     extractedGeo = extractGeoFromText(text);
   }
 
+  // Если в ТЕКУЩЕМ сообщении мы получили геолокацию (а не из старой сессии),
+  // то сохраняем её и подтверждаем пользователю
   if (extractedGeo) {
     geo = extractedGeo;
     radiusMeters = radiusMeters || 1000;
@@ -740,11 +742,8 @@ async function processWappiMessage(chatId, text, requestId, options = {}) {
       { geo, radiusMeters, geoSource, geoRequested: true, updatedAt: new Date() }
     );
     console.log(`[WAPPI] [${requestId}] Обновлена геолокация для беседы (source=${geoSource}):`, geo);
-  }
 
-  // Если геолокация есть, но сообщение само по себе не похоже на поисковый запрос
-  // (например, пользователь отправил только координаты) — подтверждаем гео и просим товар
-  if (geo && geo.lat !== undefined && geo.lng !== undefined && !isSearchQuery(text || '')) {
+    // Подтверждаем получение гео и просим ввести запрос
     const geoOnlyText = 'Геолокация получена. Теперь напишите, какой товар вы ищете.';
 
     await SearchMessage.create({
@@ -768,8 +767,9 @@ async function processWappiMessage(chatId, text, requestId, options = {}) {
     return debug ? debugPayload : geoOnlyText;
   }
 
-  // Если геолокации нет — просим отправить geo
-  if (!geo || geo.lat === undefined || geo.lng === undefined) {
+  // Если геолокации нет (и мы не получили её в текущем сообщении) — просим отправить geo
+  // Проверяем на null или undefined, потому что в схеме geo создаётся как { lat: null, lng: null }
+  if (!geo || !geo.lat || !geo.lng || geo.lat === null || geo.lng === null || geo.lat === undefined || geo.lng === undefined) {
     const askGeoText = 'Чтобы подобрать ближайшие магазины, отправьте геопозицию (поделиться местоположением в WhatsApp), а затем напишите, какой товар вы ищете.';
 
     await SearchConversation.updateOne(
@@ -1371,6 +1371,7 @@ async function handleWappiWebhook(req, res) {
     const body = message.body || '';
     const fromMe = message.is_me || message.fromMe || false;
     const profile_id = message.profile_id;
+    const messageType = message.type || null;
 
     if (fromMe === true || message.is_me === true) {
       console.log(`[WAPPI WEBHOOK] [${requestId}] ⏭️  Игнорируем сообщение, отправленное нами самими`);
@@ -1378,19 +1379,13 @@ async function handleWappiWebhook(req, res) {
       return;
     }
 
-    // Пытаемся вытащить геолокацию из сообщения Wappi (чистая гео WhatsApp)
+    // Пытаемся вытащить геолокацию из сообщения Wappi ТОЛЬКО если это явное сообщение с геопозицией
+    // (тип сообщения "location"). Это защищает от скрытой/фоновой геолокации.
     let location = null;
-    if (message.location && typeof message.location === 'object') {
+    if (messageType === 'location' && message.location && typeof message.location === 'object') {
       const loc = message.location;
       const lat = loc.lat ?? loc.latitude;
       const lng = loc.lng ?? loc.longitude ?? loc.lon;
-      if (typeof lat === 'number' && typeof lng === 'number') {
-        location = { lat, lng };
-      }
-    }
-    if (!location) {
-      const lat = message.lat ?? message.latitude;
-      const lng = message.lng ?? message.longitude ?? message.lon;
       if (typeof lat === 'number' && typeof lng === 'number') {
         location = { lat, lng };
       }
@@ -1421,7 +1416,8 @@ async function handleWappiWebhook(req, res) {
       bodyLength: body.length,
       bodyPreview: bodyPreview,
       fromMe: fromMe || false,
-      testMode: isTestMode
+      testMode: isTestMode,
+      messageType: messageType || 'unknown'
     });
 
     // Если тестовый режим - обрабатываем синхронно и возвращаем результат (с доп. данными для отладки)
