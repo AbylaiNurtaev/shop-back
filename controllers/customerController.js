@@ -2,7 +2,7 @@ const multer = require('multer');
 const { generateId } = require('../utils/uuid');
 const { uploadImage } = require('../utils/s3');
 const { calculateDistance, getCoordinatesFromLink } = require('../utils/distance');
-const { getIntentFromGemini, findProductsBySemanticSearch, transcribeAudio, generateClarificationQuestions, analyzeProductImage, getCustomerFAQResponse } = require('../utils/gemini');
+const { getIntentFromGemini, findProductsBySemanticSearch, transcribeAudio, generateClarificationQuestions, analyzeProductImage, getCustomerFAQResponse, getWappiChatAIResponse } = require('../utils/gemini');
 const { models } = require('../models/database');
 
 const {
@@ -655,7 +655,7 @@ async function performSearch({ text, geo, radiusMeters, intent }) {
     .sort((a, b) => {
       const aDist = a.nearestStore?.distanceMeters;
       const bDist = b.nearestStore?.distanceMeters;
-      
+
       // Если у обоих есть расстояние - сортируем по нему
       if (aDist !== null && aDist !== undefined && bDist !== null && bDist !== undefined) {
         return aDist - bDist;
@@ -681,6 +681,7 @@ async function postMessage(req, res) {
       return res.status(404).json({ error: 'Чат не найден' });
     }
 
+    // Сохраняем сообщение пользователя
     const message = await SearchMessage.create({
       id: generateId(),
       conversationId,
@@ -689,10 +690,38 @@ async function postMessage(req, res) {
       attachmentIds: Array.isArray(attachments) ? attachments : []
     });
 
+    // Собираем контекст последних сообщений для AI
+    const recentMessages = await SearchMessage.find({ conversationId })
+      .sort({ createdAt: -1 })
+      .limit(20)
+      .lean();
+
+    const conversationContext = recentMessages
+      .reverse()
+      .map(msg => {
+        const role = msg.sender === 'CUSTOMER' ? 'ПОЛЬЗОВАТЕЛЬ' : 'СИСТЕМА';
+        return `${role}: ${msg.text}`;
+      })
+      .filter(t => t && t.trim());
+
     let intent = conversation.intentId
       ? await SearchIntent.findOne({ id: conversation.intentId })
       : null;
-    if (!intent) {
+
+    // Если разговор завершен (DONE) и пришел новый текстовый запрос - начинаем новый поиск
+    if (intent && conversation.state === 'DONE' && text && text.trim()) {
+      console.log('[NEW SEARCH] Сброс intent для нового поиска после DONE');
+      intent = await SearchIntent.create({
+        id: generateId(),
+        conversationId,
+        rawText: text || '',
+        filters: {}
+      });
+      conversation.intentId = intent.id;
+      conversation.state = 'NEW';
+      conversation.requestId = null;
+      conversation.resultId = null;
+    } else if (!intent) {
       intent = await SearchIntent.create({
         id: generateId(),
         conversationId,
@@ -706,591 +735,281 @@ async function postMessage(req, res) {
 
     conversation.updatedAt = new Date();
 
-    // Проверяем, есть ли уже выбранный товар и пришла ли геолокация
-    if (intent && intent.filters && Array.isArray(intent.filters.candidateProductIds) && intent.filters.candidateProductIds.length === 1) {
-      // Есть выбранный товар - проверяем геолокацию
-      if (geo && geo.lat !== undefined && geo.lng !== undefined) {
-        // Выполняем поиск для уже выбранного товара
-        const selectedProduct = await Product.findOne({ id: intent.filters.candidateProductIds[0] }).lean();
-        if (selectedProduct) {
-          const request = await SearchRequest.create({
-            id: generateId(),
-            conversationId,
-            intentId: intent.id,
-            geo: { lat: geo.lat, lng: geo.lng },
-            radiusMeters: radiusMeters || 1000,
-            expiresAt: nowPlus(RESULT_TTL_MS)
-          });
-
-          conversation.requestId = request.id;
-          conversation.state = 'SEARCHING';
-          await conversation.save();
-
-          const items = await performSearch({ text: intent.rawText || text, geo, radiusMeters, intent });
-          const result = await SearchResult.create({
-            id: generateId(),
-            requestId: request.id,
-            items,
-            expiresAt: nowPlus(RESULT_TTL_MS)
-          });
-
-          conversation.resultId = result.id;
-          conversation.state = 'DONE';
-          await conversation.save();
-
-          // Формируем сообщение о найденном товаре
-          const productName = `${selectedProduct.name}${selectedProduct.brandName ? ' (' + selectedProduct.brandName + ')' : ''}${selectedProduct.packageInfo ? ' - ' + selectedProduct.packageInfo : ''}`;
-          let systemMessage = `Найден товар: ${productName}`;
-
-          if (items.length === 0) {
-            systemMessage += '\nК сожалению, в базе нет предложений по этому товару.';
-          } else {
-            const item = items[0]; // Берем первый товар (должен быть один)
-            const totalOffers = item.offers?.length || 0;
-
-            if (totalOffers === 0) {
-              systemMessage += '\nК сожалению, в базе нет предложений по этому товару.';
-            } else {
-              const nearest = item.nearestStore;
-              if (nearest && nearest.distance && typeof nearest.distanceMeters === 'number') {
-                if (nearest.distanceMeters > 1000) {
-                  systemMessage += `\nРядом с вами (в радиусе 1 км) магазины с этим товаром не найдены. Самый ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
-                } else {
-                  systemMessage += `\nНайдено предложений: ${totalOffers}. Ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
-                }
-              } else if (nearest && nearest.distance) {
-                systemMessage += `\nНайдено предложений: ${totalOffers}. Ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
-              } else {
-                systemMessage += `\nНайдено предложений: ${totalOffers}.`;
-              }
-            }
-          }
-
-          // Добавляем ответное сообщение от системы
-          await SearchMessage.create({
-            id: generateId(),
-            conversationId,
-            sender: 'SYSTEM',
-            text: systemMessage
-          });
-
-          // Логируем успешный поиск товара
-          await logProductSearch({
-            conversationId,
-            searchQuery: intent.rawText || text || '',
-            intent: {
-              brand: intent.brand || null,
-              packageInfo: intent.packageInfo || null,
-              type: intent.type || null,
-              packageType: intent.packageType || null
-            },
-            candidates: [selectedProduct],
-            selectedProduct: {
-              id: selectedProduct.id,
-              name: selectedProduct.name,
-              brandId: selectedProduct.brandId || null,
-              brandName: selectedProduct.brandName || null
-            },
-            searchResult: 'FOUND'
-          });
-
-          return res.json({
-            state: conversation.state,
-            messageId: message.id,
-            requestId: request.id,
-            resultId: result.id,
-            items: items.length > 0 ? items : [],
-            selectedProduct: {
-              id: selectedProduct.id,
-              name: selectedProduct.name,
-              brandName: selectedProduct.brandName,
-              packageInfo: selectedProduct.packageInfo
-            }
-          });
-        }
-      }
-    }
-
-    // Если это первое сообщение и нет геолокации, просим её
+    // Если нет геолокации, просим её
     if (!geo || geo.lat === undefined || geo.lng === undefined) {
-      // Но только если это действительно первое сообщение
       const messageCount = await SearchMessage.countDocuments({ conversationId, sender: 'CUSTOMER' });
       if (messageCount === 1) {
         conversation.state = 'NEEDS_CLARIFICATION';
         await conversation.save();
-        return res.json({
-          state: conversation.state,
-          messageId: message.id,
-          questions: ['Уточните ваше местоположение и радиус поиска']
-        });
-      }
-    }
 
-    // Получаем кандидатов товаров
-    let candidates = [];
-    if (intent.filters && Array.isArray(intent.filters.candidateProductIds) && intent.filters.candidateProductIds.length > 0) {
-      // Используем сохраненных кандидатов из предыдущих шагов
-      candidates = await Product.find({
-        id: { $in: intent.filters.candidateProductIds },
-        isPayed: true,
-        paymentExpiresAt: { $gt: new Date() }
-      }).lean();
-    } else {
-      // Первый поиск по тексту
-      candidates = await buildCandidatesByText(text);
-      // Фильтруем только оплаченные товары
-      candidates = candidates.filter(p => p.isPayed && p.paymentExpiresAt && new Date(p.paymentExpiresAt) > new Date());
-    }
-
-    if (candidates.length === 0) {
-      conversation.state = 'NEEDS_CLARIFICATION';
-      await conversation.save();
-      await intent.save();
-
-      // Сбрасываем фильтры, чтобы начать поиск заново
-      intent.filters = {};
-      intent.brand = null;
-      intent.packageInfo = null;
-      intent.type = null;
-      intent.packageType = null;
-      await intent.save();
-
-      // Логируем, что товар не найден
-      await logProductSearch({
-        conversationId,
-        searchQuery: text || intent.rawText || '',
-        intent: {
-          brand: null,
-          packageInfo: null,
-          type: null,
-          packageType: null
-        },
-        candidates: [],
-        searchResult: 'NOT_FOUND'
-      });
-
-      return res.json({
-        state: conversation.state,
-        messageId: message.id,
-        questions: ['Не нашел такой товар. Попробуйте написать название по-другому или укажите бренд.'],
-        quickReplies: []
-      });
-    }
-
-    // СНАЧАЛА обновляем intent на основе ответов пользователя (быстрые ответы)
-    // Это важно для предотвращения повторных вопросов
-    if (text && text.trim()) {
-      const currentAnswer = normalizeText(text);
-
-      // Проверяем, является ли текущий ответ ответом на вопрос о таре
-      const isTaraAnswer = currentAnswer.includes('металл') ||
-        currentAnswer.includes('стекло') ||
-        currentAnswer.includes('банка') ||
-        currentAnswer.includes('пластик') ||
-        currentAnswer.includes('can') ||
-        currentAnswer.includes('glass') ||
-        currentAnswer.includes('plastic') ||
-        currentAnswer.includes('жб');
-
-      if (isTaraAnswer && !intent.packageType) {
-        // Обновляем intent на основе ответа пользователя
-        if (currentAnswer.includes('металл') || currentAnswer.includes('банка') || currentAnswer.includes('can') || currentAnswer.includes('жб')) {
-          intent.packageType = 'can';
-        } else if (currentAnswer.includes('стекло') || currentAnswer.includes('glass')) {
-          intent.packageType = 'glass';
-        } else if (currentAnswer.includes('пластик') || currentAnswer.includes('plastic')) {
-          intent.packageType = 'plastic';
-        }
-        await intent.save();
-        console.log('Обновлен intent.packageType на основе ответа пользователя:', intent.packageType);
-      }
-
-      // Проверяем ответы на другие вопросы
-      const isTypeAnswer = currentAnswer.includes('classic') ||
-        currentAnswer.includes('zero') ||
-        currentAnswer.includes('light') ||
-        currentAnswer.includes('классическая') ||
-        currentAnswer.includes('ноль');
-
-      if (isTypeAnswer && !intent.type) {
-        if (currentAnswer.includes('classic') || currentAnswer.includes('классическая')) {
-          intent.type = 'classic';
-        } else if (currentAnswer.includes('zero') || currentAnswer.includes('ноль')) {
-          intent.type = 'zero';
-        } else if (currentAnswer.includes('light') || currentAnswer.includes('лайт')) {
-          intent.type = 'light';
-        }
-        await intent.save();
-        console.log('Обновлен intent.type на основе ответа пользователя:', intent.type);
-      }
-    }
-
-    // Пытаемся извлечь информацию из сообщения через Gemini
-    // Используем только если есть кандидаты и текст не пустой
-    let geminiResult = null;
-    if (text && text.trim() && candidates.length > 0) {
-      try {
-        // Ограничиваем количество кандидатов для ускорения
-        const candidatesForGemini = candidates.slice(0, 15).map(item => ({
-          id: item.id,
-          name: item.name,
-          brandName: item.brandName,
-          packageInfo: item.packageInfo,
-          description: item.description,
-          sku: item.sku
-        }));
-
-        geminiResult = await getIntentFromGemini({
-          message: text.trim(),
-          candidates: candidatesForGemini,
-          known: {
-            brand: intent.brand || null,
-            packageInfo: intent.packageInfo !== undefined ? intent.packageInfo : null,
-            type: intent.type || null,
-            packageType: intent.packageType || null
-          }
-        });
-
-        // Логируем поиск через Gemini
-        await logProductSearch({
+        const askGeoText = 'Уточните ваше местоположение и радиус поиска';
+        await SearchMessage.create({
+          id: generateId(),
           conversationId,
-          searchQuery: text.trim(),
-          intent: {
-            brand: intent.brand || null,
-            packageInfo: intent.packageInfo || null,
-            type: intent.type || null,
-            packageType: intent.packageType || null
-          },
-          candidates,
-          searchResult: null // Пока не знаем результат
+          sender: 'SYSTEM',
+          text: askGeoText
         });
-      } catch (error) {
-        console.error('Ошибка при получении intent от Gemini:', error);
-        geminiResult = null;
-      }
-    }
-
-    // Обновляем intent на основе ответа Gemini
-    if (geminiResult && geminiResult.action === 'READY_TO_SEARCH') {
-      const aiIntent = geminiResult.intent || {};
-      if (aiIntent.brand !== undefined && aiIntent.brand !== null) {
-        intent.brand = aiIntent.brand;
-      }
-      if (aiIntent.type !== undefined && aiIntent.type !== null) {
-        intent.type = aiIntent.type;
-      }
-      if (aiIntent.packageInfo !== undefined && aiIntent.packageInfo !== null) {
-        intent.packageInfo = aiIntent.packageInfo;
-      }
-      if (aiIntent.packageType !== undefined && aiIntent.packageType !== null) {
-        intent.packageType = aiIntent.packageType;
-      }
-      // Сохраняем intent сразу после обновления
-      await intent.save();
-    }
-
-    // Сохраняем предыдущих кандидатов перед фильтрацией (для fallback)
-    const previousCandidateIds = intent.filters && Array.isArray(intent.filters.candidateProductIds)
-      ? intent.filters.candidateProductIds
-      : candidates.map(c => c.id);
-
-    // Фильтруем кандидатов на основе текущего intent
-    candidates = filterCandidatesByIntent(candidates, {
-      brand: intent.brand || null,
-      packageInfo: intent.packageInfo !== undefined ? intent.packageInfo : null,
-      type: intent.type || null,
-      packageType: intent.packageType || null
-    });
-
-    // Сохраняем отфильтрованных кандидатов
-    intent.filters = {
-      ...(intent.filters || {}),
-      candidateProductIds: candidates.map(item => item.id)
-    };
-
-    // Если кандидатов нет после фильтрации, пробуем более мягкую фильтрацию
-    if (candidates.length === 0) {
-      // Пробуем фильтровать без последнего добавленного параметра
-      let fallbackCandidates = [];
-
-      if (previousCandidateIds && previousCandidateIds.length > 0) {
-        // Берем предыдущих кандидатов
-        fallbackCandidates = await Product.find({
-          id: { $in: previousCandidateIds },
-          isPayed: true,
-          paymentExpiresAt: { $gt: new Date() }
-        }).lean();
-      } else {
-        // Берем исходных кандидатов из текста
-        fallbackCandidates = await buildCandidatesByText(text);
-        fallbackCandidates = fallbackCandidates.filter(p => p.isPayed && p.paymentExpiresAt && new Date(p.paymentExpiresAt) > new Date());
-      }
-
-      // Фильтруем без последнего параметра (type или packageType)
-      const fallbackIntent = { ...intent };
-      if (intent.type) {
-        // Убираем type и пробуем снова
-        fallbackIntent.type = null;
-        candidates = filterCandidatesByIntent(fallbackCandidates, {
-          brand: fallbackIntent.brand || null,
-          packageInfo: fallbackIntent.packageInfo !== undefined ? fallbackIntent.packageInfo : null,
-          type: null,
-          packageType: fallbackIntent.packageType || null
-        });
-
-        // Если все еще нет кандидатов, сбрасываем все фильтры
-        if (candidates.length === 0) {
-          conversation.state = 'NEEDS_CLARIFICATION';
-          intent.filters = {};
-          intent.brand = null;
-          intent.packageInfo = null;
-          intent.type = null;
-          intent.packageType = null;
-          await intent.save();
-          await conversation.save();
-
-          return res.json({
-            state: conversation.state,
-            messageId: message.id,
-            questions: ['Не нашел подходящих товаров. Попробуйте уточнить запрос по-другому.'],
-            quickReplies: []
-          });
-        } else {
-          // Откатываем type, так как фильтр слишком строгий
-          intent.type = null;
-          await intent.save();
-        }
-      } else {
-        // Если нет кандидатов и не было type, просто сбрасываем
-        conversation.state = 'NEEDS_CLARIFICATION';
-        intent.filters = {};
-        intent.brand = null;
-        intent.packageInfo = null;
-        intent.type = null;
-        intent.packageType = null;
-        await intent.save();
-        await conversation.save();
 
         return res.json({
           state: conversation.state,
           messageId: message.id,
-          questions: ['Не нашел подходящих товаров. Уточните запрос, пожалуйста.'],
-          quickReplies: []
+          questions: [askGeoText]
         });
       }
+      // Если не первое сообщение и нет гео, продолжаем работу без гео
     }
 
-    // Если остался один товар - можно переходить к поиску (если есть геолокация)
-    if (candidates.length === 1) {
-      // Сохраняем intent с выбранным товаром
-      intent.filters = {
-        ...(intent.filters || {}),
-        candidateProductIds: [candidates[0].id]
-      };
-      await intent.save();
+    // Получаем все оплаченные товары
+    const allProducts = await Product.find({
+      isPayed: true,
+      paymentExpiresAt: { $gt: new Date() }
+    }).limit(1000).lean();
 
-      if (!geo || geo.lat === undefined || geo.lng === undefined) {
-        conversation.state = 'NEEDS_CLARIFICATION';
-        await conversation.save();
-        return res.json({
-          state: conversation.state,
-          messageId: message.id,
-          questions: ['Отлично! Найден товар. Уточните ваше местоположение для поиска магазинов.'],
-          selectedProduct: {
-            id: candidates[0].id,
-            name: candidates[0].name,
-            brandName: candidates[0].brandName,
-            packageInfo: candidates[0].packageInfo
-          }
-        });
-      }
+    console.log(`[CUSTOMER] Всего оплаченных товаров для AI: ${allProducts.length}`);
 
-      // Сохраняем intent и продолжаем к поиску
-      await intent.save();
+    // Обогащаем товары категориями
+    const categoryIds = Array.from(new Set(allProducts.map(p => p.categoryId).filter(Boolean)));
+    let categoryById = new Map();
+    if (categoryIds.length > 0) {
+      const categories = await Category.find({ id: { $in: categoryIds } }).lean();
+      categoryById = new Map(categories.map(cat => [cat.id, cat]));
+    }
 
-      const request = await SearchRequest.create({
-        id: generateId(),
-        conversationId,
-        intentId: intent.id,
-        geo: { lat: geo.lat, lng: geo.lng },
-        radiusMeters: radiusMeters || 1000,
-        expiresAt: nowPlus(RESULT_TTL_MS)
-      });
+    const productsWithCategory = allProducts.map(product => ({
+      ...product,
+      categoryName: product.categoryId ? (categoryById.get(product.categoryId)?.name || null) : null
+    }));
 
-      conversation.requestId = request.id;
-      conversation.state = 'SEARCHING';
-      await conversation.save();
-
-      const items = await performSearch({ text, geo, radiusMeters, intent });
-      const result = await SearchResult.create({
-        id: generateId(),
-        requestId: request.id,
-        items,
-        expiresAt: nowPlus(RESULT_TTL_MS)
-      });
-
-      conversation.resultId = result.id;
-      conversation.state = 'DONE';
-      await conversation.save();
-
-      // Формируем сообщение о найденном товаре
-      const productName = `${candidates[0].name}${candidates[0].brandName ? ' (' + candidates[0].brandName + ')' : ''}${candidates[0].packageInfo ? ' - ' + candidates[0].packageInfo : ''}`;
-      let systemMessage = `Найден товар: ${productName}`;
-
-      if (items.length === 0) {
-        systemMessage += '\nК сожалению, в базе нет предложений по этому товару.';
-      } else {
-        const item = items[0]; // Берем первый товар (должен быть один)
-        const totalOffers = item.offers?.length || 0;
-
-        if (totalOffers === 0) {
-          systemMessage += '\nК сожалению, в базе нет предложений по этому товару.';
-        } else {
-          const nearest = item.nearestStore;
-          if (nearest && nearest.distance && typeof nearest.distanceMeters === 'number') {
-            if (nearest.distanceMeters > 1000) {
-              systemMessage += `\nРядом с вами (в радиусе 1 км) магазины с этим товаром не найдены. Самый ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
-            } else {
-              systemMessage += `\nНайдено предложений: ${totalOffers}. Ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
-            }
-          } else if (nearest && nearest.distance) {
-            systemMessage += `\nНайдено предложений: ${totalOffers}. Ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
-          } else {
-            systemMessage += `\nНайдено предложений: ${totalOffers}.`;
-          }
-        }
-      }
-
-      // Добавляем ответное сообщение от системы
+    if (productsWithCategory.length === 0) {
+      const emptyMsg = 'Сейчас в каталоге нет доступных товаров для поиска.';
       await SearchMessage.create({
         id: generateId(),
         conversationId,
         sender: 'SYSTEM',
-        text: systemMessage
+        text: emptyMsg
       });
 
-      // Логируем успешный поиск товара
-      await logProductSearch({
-        conversationId,
-        searchQuery: text || intent.rawText || '',
-        intent: {
-          brand: intent.brand || null,
-          packageInfo: intent.packageInfo || null,
-          type: intent.type || null,
-          packageType: intent.packageType || null
-        },
-        candidates: [candidates[0]],
-        selectedProduct: {
-          id: candidates[0].id,
-          name: candidates[0].name,
-          brandId: candidates[0].brandId || null,
-          brandName: candidates[0].brandName || null
-        },
-        searchResult: 'FOUND'
-      });
+      conversation.state = 'NEEDS_CLARIFICATION';
+      await conversation.save();
 
       return res.json({
         state: conversation.state,
         messageId: message.id,
-        requestId: request.id,
-        resultId: result.id,
-        items: items.length > 0 ? items : [], // Всегда возвращаем массив, даже если пустой
-        selectedProduct: {
-          id: candidates[0].id,
-          name: candidates[0].name,
-          brandName: candidates[0].brandName,
-          packageInfo: candidates[0].packageInfo
+        questions: [emptyMsg]
+      });
+    }
+
+    // Отправляем сообщение + каталог напрямую в Gemini
+    const aiResult = await getWappiChatAIResponse({
+      message: text,
+      products: productsWithCategory,
+      conversationContext
+    });
+
+    let replyText = aiResult && typeof aiResult.replyText === 'string'
+      ? aiResult.replyText
+      : 'Не удалось обработать запрос. Попробуйте описать товар по-другому.';
+
+    // На основе matchedProductIds собираем подробную информацию о найденных товарах
+    let matchedProducts = [];
+    if (Array.isArray(aiResult.matchedProductIds) && aiResult.matchedProductIds.length > 0) {
+      const matchedIds = new Set(aiResult.matchedProductIds);
+      matchedProducts = productsWithCategory.filter(p => matchedIds.has(p.id));
+    }
+
+    console.log(`[CUSTOMER] AI выбрал ${matchedProducts.length} товаров из ${productsWithCategory.length}`);
+    if (matchedProducts.length > 0) {
+      console.log(
+        `[CUSTOMER] Примеры выбранных товаров:`,
+        matchedProducts.slice(0, 5).map(p => ({
+          id: p.id,
+          name: p.name,
+          brandName: p.brandName,
+          categoryName: p.categoryName
+        }))
+      );
+    }
+
+    // Если AI сузил выбор до ОДНОГО товара и есть геолокация — сразу показываем магазины
+    if (matchedProducts.length === 1 && geo && geo.lat !== undefined && geo.lng !== undefined) {
+      try {
+        const singleProduct = matchedProducts[0];
+        console.log(`[CUSTOMER] Один выбранный товар (${singleProduct.id}), подготавливаем ответ с магазинами`);
+
+        // Сохраняем выбранный товар в intent
+        intent.filters = {
+          ...(intent.filters || {}),
+          candidateProductIds: [singleProduct.id]
+        };
+        await intent.save();
+
+        const request = await SearchRequest.create({
+          id: generateId(),
+          conversationId,
+          intentId: intent.id,
+          geo: { lat: geo.lat, lng: geo.lng },
+          radiusMeters: radiusMeters || 1000,
+          expiresAt: nowPlus(RESULT_TTL_MS)
+        });
+
+        conversation.requestId = request.id;
+        conversation.state = 'SEARCHING';
+        await conversation.save();
+
+        const items = await performSearch({
+          text,
+          geo,
+          radiusMeters,
+          intent: {
+            filters: { candidateProductIds: [singleProduct.id] },
+            brand: null,
+            packageInfo: null
+          }
+        });
+
+        const result = await SearchResult.create({
+          id: generateId(),
+          requestId: request.id,
+          items,
+          expiresAt: nowPlus(RESULT_TTL_MS)
+        });
+
+        conversation.resultId = result.id;
+        conversation.state = 'DONE';
+        await conversation.save();
+
+        // Формируем сообщение с магазинами
+        if (Array.isArray(items) && items.length > 0 && items[0].offers && items[0].offers.length > 0) {
+          const item = items[0];
+          const productName = `${singleProduct.name}${singleProduct.brandName ? ' (' + singleProduct.brandName + ')' : ''}${singleProduct.packageInfo ? ' - ' + singleProduct.packageInfo : ''}`;
+          const totalOffers = item.offers.length;
+          const nearest = item.nearestStore;
+
+          replyText = `Найден товар:
+${productName}
+`;
+
+          if (nearest && nearest.distance && typeof nearest.distanceMeters === 'number') {
+            if (nearest.distanceMeters > 1000) {
+              replyText += `
+Рядом с вами (в радиусе 1 км) магазины с этим товаром не найдены. Самый ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
+            } else {
+              replyText += `
+Найдено предложений: ${totalOffers}. Ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
+            }
+          } else {
+            replyText += `
+Найдено предложений: ${totalOffers}.`;
+          }
+
+          console.log(`[CUSTOMER] Сформирован ответ с магазинами для товара ${singleProduct.id}`);
+        } else {
+          replyText = `Товар "${singleProduct.name}" найден, но не доступен в ближайших магазинах в радиусе ${(radiusMeters || 1000) / 1000} км. Попробуйте увеличить радиус поиска.`;
+          console.log(`[CUSTOMER] Для товара ${singleProduct.id} не найдено доступных магазинов`);
         }
-      });
+
+        // Логируем успешный поиск
+        await logProductSearch({
+          conversationId,
+          searchQuery: text || intent.rawText || '',
+          intent: {
+            brand: null,
+            packageInfo: null,
+            type: null,
+            packageType: null
+          },
+          candidates: [singleProduct],
+          selectedProduct: {
+            id: singleProduct.id,
+            name: singleProduct.name,
+            brandId: singleProduct.brandId || null,
+            brandName: singleProduct.brandName || null
+          },
+          searchResult: 'FOUND'
+        });
+
+        // Сохраняем ответ системы
+        await SearchMessage.create({
+          id: generateId(),
+          conversationId,
+          sender: 'SYSTEM',
+          text: replyText
+        });
+
+        return res.json({
+          state: conversation.state,
+          messageId: message.id,
+          requestId: request.id,
+          resultId: result.id,
+          items: items.length > 0 ? items : [],
+          selectedProduct: {
+            id: singleProduct.id,
+            name: singleProduct.name,
+            brandName: singleProduct.brandName,
+            packageInfo: singleProduct.packageInfo
+          }
+        });
+      } catch (error) {
+        console.error(`[CUSTOMER] Ошибка при формировании ответа с магазинами:`, error);
+        // Продолжаем с обычным ответом от AI
+      }
+    } else if (matchedProducts.length === 1 && (!geo || geo.lat === undefined || geo.lng === undefined)) {
+      // Один товар найден, но нет геолокации
+      const singleProduct = matchedProducts[0];
+      intent.filters = {
+        ...(intent.filters || {}),
+        candidateProductIds: [singleProduct.id]
+      };
+      await intent.save();
+
+      replyText = `Отлично! Найден товар: ${singleProduct.name}${singleProduct.brandName ? ' (' + singleProduct.brandName + ')' : ''}.
+Уточните ваше местоположение для поиска магазинов.`;
     }
 
-    // Если товаров больше одного - генерируем умные вопросы через Gemini
-    // Цель: сузить выбор до одного товара (работает как Акинатор)
-
-    // Получаем предыдущие вопросы из истории сообщений системы
-    const previousSystemMessages = await SearchMessage.find({
-      conversationId,
-      sender: 'SYSTEM'
-    })
-      .sort({ createdAt: -1 })
-      .limit(10)
-      .lean();
-
-    // Получаем предыдущие ответы пользователя для анализа
-    const previousUserMessages = await SearchMessage.find({
-      conversationId,
-      sender: 'CUSTOMER'
-    })
-      .sort({ createdAt: -1 })
-      .limit(10)
-      .lean();
-
-    const previousQuestions = previousSystemMessages
-      .map(msg => msg.text)
-      .filter(text => text && text.trim().length > 0);
-
-    // Анализируем ответы пользователя, чтобы понять, на какие вопросы он уже ответил
-    const userAnswers = previousUserMessages
-      .map(msg => normalizeText(msg.text || ''))
-      .filter(text => text.length > 0);
-
-
-    let clarification = null;
-    try {
-      clarification = await generateClarificationQuestions({
-        candidates: candidates.map(item => ({
-          id: item.id,
-          name: item.name,
-          brandName: item.brandName,
-          packageInfo: item.packageInfo,
-          description: item.description,
-          sku: item.sku
-        })),
-        known: {
-          brand: intent.brand || null,
-          packageInfo: intent.packageInfo !== undefined ? intent.packageInfo : null,
-          type: intent.type || null,
-          packageType: intent.packageType || null
-        },
-        previousQuestions: previousQuestions
-      });
-    } catch (error) {
-      console.error('Ошибка при генерации вопросов:', error);
-      // Fallback на простые вопросы
-      clarification = buildClarificationQuestions(candidates, {
-        brand: intent.brand || null,
-        packageInfo: intent.packageInfo !== undefined ? intent.packageInfo : null
-      });
-    }
-
-    conversation.state = 'NEEDS_CLARIFICATION';
-    await intent.save();
-    await conversation.save();
-
-    // Формируем вопрос (только один, как Акинатор)
-    const question = clarification.questions.length > 0
-      ? clarification.questions[0]
-      : 'Уточните, какой именно товар вас интересует?';
-
-    // Добавляем ответное сообщение от системы с вопросом
+    // Сохраняем ответ системы
     await SearchMessage.create({
       id: generateId(),
       conversationId,
       sender: 'SYSTEM',
-      text: question
+      text: replyText
     });
+
+    conversation.state = matchedProducts.length === 1 ? 'NEEDS_CLARIFICATION' : 'NEEDS_CLARIFICATION';
+    await conversation.save();
+    await intent.save();
+
+    // Формируем quickReplies (кнопки) для выбора товара
+    let quickReplies = [];
+    if (matchedProducts.length > 1 && matchedProducts.length <= 10) {
+      // Если найдено от 2 до 10 товаров, показываем их как кнопки
+      quickReplies = matchedProducts.map(p => {
+        let label = p.name;
+        if (p.packageInfo) {
+          label += ` (${p.packageInfo})`;
+        }
+        return label;
+      });
+    }
 
     return res.json({
       state: conversation.state,
       messageId: message.id,
-      questions: [question],
-      quickReplies: clarification.quickReplies || []
+      questions: [replyText],
+      quickReplies: quickReplies,
+      matchedProducts: matchedProducts.map(p => ({
+        id: p.id,
+        name: p.name,
+        brandName: p.brandName,
+        categoryName: p.categoryName,
+        packageInfo: p.packageInfo
+      }))
     });
   } catch (error) {
     console.error('Ошибка при обработке сообщения:', error);
     res.status(500).json({ error: 'Ошибка при обработке сообщения' });
   }
 }
+
 
 async function createSearch(req, res) {
   try {
