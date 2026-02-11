@@ -51,6 +51,58 @@ function normalizeText(value) {
 }
 
 /**
+ * Извлекает количество товара из текста сообщения
+ * Примеры: "20 шт", "15 штук", "10", "5 единиц"
+ * @param {string} text - текст сообщения
+ * @returns {number|null} - количество или null, если не найдено
+ */
+function extractQuantityFromText(text) {
+  if (!text) return null;
+  // Паттерны для поиска количества
+  const patterns = [
+    /(\d+)\s*(?:шт|штук|штука|штуки|единиц|единица|единицы|pieces?|pcs?)/i,
+    /(?:количество|нужно|хочу|куплю|купить)\s*(\d+)/i,
+    /(\d+)\s*$/ // просто число в конце сообщения
+  ];
+
+  /**
+   * Внутренняя функция для извлечения количества из переданной строки
+   * @param {string} source
+   * @returns {number|null}
+   */
+  const tryExtract = (source) => {
+    if (!source) return null;
+    for (const pattern of patterns) {
+      const match = source.match(pattern);
+      if (match && match[1]) {
+        const quantity = parseInt(match[1], 10);
+        if (!isNaN(quantity) && quantity > 0 && quantity <= 1000) {
+          return quantity;
+        }
+      }
+    }
+    return null;
+  };
+
+  // 1) Сначала пытаемся найти количество ВНЕ скобок
+  // Пример: "Coca-Cola Vanilla (1 шт) 20 шт" -> убираем "(1 шт)" и находим "20 шт"
+  const textWithoutParens = text.replace(/\([^)]*\)/g, ' ');
+  let quantity = tryExtract(textWithoutParens);
+
+  // 2) Если ничего не нашли, пробуем по всей строке (на случай, если количество только в скобках)
+  if (!quantity) {
+    quantity = tryExtract(text);
+  }
+
+  if (quantity) {
+    console.log(`[QUANTITY] Извлечено количество: ${quantity} из текста: "${text}"`);
+    return quantity;
+  }
+
+  return null;
+}
+
+/**
  * Логирование поискового запроса через Gemini
  */
 async function logProductSearch({ conversationId, searchQuery, intent, candidates, selectedProduct, searchResult }) {
@@ -491,7 +543,7 @@ async function getConversation(req, res) {
   }
 }
 
-async function performSearch({ text, geo, radiusMeters, intent }) {
+async function performSearch({ text, geo, radiusMeters, intent, requestedQuantity }) {
   let products = [];
   const candidateIds = intent && intent.filters ? intent.filters.candidateProductIds : null;
   if (Array.isArray(candidateIds) && candidateIds.length > 0) {
@@ -621,6 +673,49 @@ async function performSearch({ text, geo, radiusMeters, intent }) {
           return (a.price || 0) - (b.price || 0);
         });
 
+      // НОВАЯ ЛОГИКА: Если указано запрошенное количество, распределяем по магазинам
+      let distributedOffers = offersWithStores;
+      let fulfillmentInfo = null;
+
+      if (requestedQuantity && requestedQuantity > 0) {
+        console.log(`[QUANTITY_DISTRIBUTION] Запрошено ${requestedQuantity} шт. товара "${product.name}"`);
+
+        let remainingQuantity = requestedQuantity;
+        const selectedOffers = [];
+
+        // Проходим по магазинам (уже отсортированы по расстоянию)
+        for (const offer of offersWithStores) {
+          if (remainingQuantity <= 0) break;
+
+          const availableInStore = offer.quantity || 0;
+          if (availableInStore > 0) {
+            const quantityFromStore = Math.min(remainingQuantity, availableInStore);
+
+            selectedOffers.push({
+              ...offer,
+              allocatedQuantity: quantityFromStore
+            });
+
+            console.log(`[QUANTITY_DISTRIBUTION] Магазин "${offer.store.name}": выделено ${quantityFromStore} из ${availableInStore} шт.`);
+
+            remainingQuantity -= quantityFromStore;
+          }
+        }
+
+        if (selectedOffers.length > 0) {
+          distributedOffers = selectedOffers;
+          fulfillmentInfo = {
+            requestedQuantity: requestedQuantity,
+            fulfilledQuantity: requestedQuantity - remainingQuantity,
+            remainingQuantity: remainingQuantity,
+            storesCount: selectedOffers.length,
+            isFullyFulfilled: remainingQuantity === 0
+          };
+
+          console.log(`[QUANTITY_DISTRIBUTION] Итого: выполнено ${fulfillmentInfo.fulfilledQuantity} из ${requestedQuantity} шт. в ${selectedOffers.length} магазинах`);
+        }
+      }
+
       const category = categoryById.get(product.categoryId) || null;
 
       return {
@@ -639,15 +734,17 @@ async function performSearch({ text, geo, radiusMeters, intent }) {
           allergens: product.allergens,
           ageRestrictions: product.ageRestrictions
         },
-        offers: offersWithStores,
+        offers: distributedOffers,
+        // Информация о выполнении заказа (если запрошено количество)
+        fulfillmentInfo: fulfillmentInfo,
         // Статистика для удобства
-        totalOffers: offersWithStores.length,
-        nearestStore: offersWithStores.length > 0 ? {
-          name: offersWithStores[0].store.name,
-          distance: offersWithStores[0].store.distanceFormatted,
-          distanceMeters: offersWithStores[0].store.distanceMeters,
-          address: offersWithStores[0].store.address,
-          location: offersWithStores[0].store.location
+        totalOffers: distributedOffers.length,
+        nearestStore: distributedOffers.length > 0 ? {
+          name: distributedOffers[0].store.name,
+          distance: distributedOffers[0].store.distanceFormatted,
+          distanceMeters: distributedOffers[0].store.distanceMeters,
+          address: distributedOffers[0].store.address,
+          location: distributedOffers[0].store.location
         } : null
       };
     })
@@ -679,6 +776,22 @@ async function postMessage(req, res) {
     const conversation = await SearchConversation.findOne({ id: conversationId });
     if (!conversation) {
       return res.status(404).json({ error: 'Чат не найден' });
+    }
+
+    // Извлекаем количество из текста сообщения или используем ранее сохраненное
+    let requestedQuantity = extractQuantityFromText(text);
+
+    // Если количество не найдено в текущем сообщении, проверяем сохраненное в intent
+    if (!requestedQuantity && conversation.intentId) {
+      const existingIntent = await SearchIntent.findOne({ id: conversation.intentId }).lean();
+      if (existingIntent && existingIntent.filters && existingIntent.filters.requestedQuantity) {
+        requestedQuantity = existingIntent.filters.requestedQuantity;
+        console.log(`[CUSTOMER_MESSAGE] Используем ранее сохраненное количество: ${requestedQuantity} шт.`);
+      }
+    }
+
+    if (requestedQuantity) {
+      console.log(`[CUSTOMER_MESSAGE] Пользователь запросил ${requestedQuantity} шт. товара`);
     }
 
     // Сохраняем сообщение пользователя
@@ -839,7 +952,8 @@ async function postMessage(req, res) {
         // Сохраняем выбранный товар в intent
         intent.filters = {
           ...(intent.filters || {}),
-          candidateProductIds: [singleProduct.id]
+          candidateProductIds: [singleProduct.id],
+          requestedQuantity: requestedQuantity || null
         };
         await intent.save();
 
@@ -864,7 +978,8 @@ async function postMessage(req, res) {
             filters: { candidateProductIds: [singleProduct.id] },
             brand: null,
             packageInfo: null
-          }
+          },
+          requestedQuantity: requestedQuantity
         });
 
         const result = await SearchResult.create({
@@ -884,22 +999,57 @@ async function postMessage(req, res) {
           const productName = `${singleProduct.name}${singleProduct.brandName ? ' (' + singleProduct.brandName + ')' : ''}${singleProduct.packageInfo ? ' - ' + singleProduct.packageInfo : ''}`;
           const totalOffers = item.offers.length;
           const nearest = item.nearestStore;
+          const fulfillment = item.fulfillmentInfo;
 
           replyText = `Найден товар:
 ${productName}
 `;
 
-          if (nearest && nearest.distance && typeof nearest.distanceMeters === 'number') {
-            if (nearest.distanceMeters > 1000) {
+          // Если пользователь запросил количество, показываем информацию о распределении
+          if (fulfillment && requestedQuantity) {
+            if (fulfillment.isFullyFulfilled) {
               replyText += `
-Рядом с вами (в радиусе 1 км) магазины с этим товаром не найдены. Самый ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
+✅ Запрошенное количество (${requestedQuantity} шт.) доступно в ${fulfillment.storesCount} магазин${fulfillment.storesCount === 1 ? 'е' : fulfillment.storesCount < 5 ? 'ах' : 'ах'}:
+`;
+
+              // Показываем распределение по магазинам
+              item.offers.forEach((offer, index) => {
+                if (offer.allocatedQuantity) {
+                  replyText += `
+${index + 1}. "${offer.store.name}"${offer.store.distanceFormatted ? ` (${offer.store.distanceFormatted})` : ''}: ${offer.allocatedQuantity} шт. по ${offer.price} ${offer.currency}`;
+                }
+              });
             } else {
               replyText += `
-Найдено предложений: ${totalOffers}. Ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
+⚠️ Запрошенное количество (${requestedQuantity} шт.) частично доступно. Найдено ${fulfillment.fulfilledQuantity} шт. в ${fulfillment.storesCount} магазин${fulfillment.storesCount === 1 ? 'е' : fulfillment.storesCount < 5 ? 'ах' : 'ах'}:
+`;
+
+              // Показываем распределение по магазинам
+              item.offers.forEach((offer, index) => {
+                if (offer.allocatedQuantity) {
+                  replyText += `
+${index + 1}. "${offer.store.name}"${offer.store.distanceFormatted ? ` (${offer.store.distanceFormatted})` : ''}: ${offer.allocatedQuantity} шт. по ${offer.price} ${offer.currency}`;
+                }
+              });
+
+              replyText += `
+
+Не хватает: ${fulfillment.remainingQuantity} шт.`;
             }
           } else {
-            replyText += `
+            // Если количество не запрошено, показываем стандартную информацию
+            if (nearest && nearest.distance && typeof nearest.distanceMeters === 'number') {
+              if (nearest.distanceMeters > 1000) {
+                replyText += `
+Рядом с вами (в радиусе 1 км) магазины с этим товаром не найдены. Самый ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
+              } else {
+                replyText += `
+Найдено предложений: ${totalOffers}. Ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
+              }
+            } else {
+              replyText += `
 Найдено предложений: ${totalOffers}.`;
+            }
           }
 
           console.log(`[CUSTOMER] Сформирован ответ с магазинами для товара ${singleProduct.id}`);
@@ -958,11 +1108,13 @@ ${productName}
       const singleProduct = matchedProducts[0];
       intent.filters = {
         ...(intent.filters || {}),
-        candidateProductIds: [singleProduct.id]
+        candidateProductIds: [singleProduct.id],
+        requestedQuantity: requestedQuantity || null
       };
       await intent.save();
 
-      replyText = `Отлично! Найден товар: ${singleProduct.name}${singleProduct.brandName ? ' (' + singleProduct.brandName + ')' : ''}.
+      const quantityText = requestedQuantity ? ` в количестве ${requestedQuantity} шт` : '';
+      replyText = `Отлично! Найден товар: ${singleProduct.name}${singleProduct.brandName ? ' (' + singleProduct.brandName + ')' : ''}${quantityText}.
 Уточните ваше местоположение для поиска магазинов.`;
     }
 
@@ -973,6 +1125,14 @@ ${productName}
       sender: 'SYSTEM',
       text: replyText
     });
+
+    // Сохраняем запрошенное количество в intent (если есть)
+    if (requestedQuantity) {
+      intent.filters = {
+        ...(intent.filters || {}),
+        requestedQuantity: requestedQuantity
+      };
+    }
 
     conversation.state = matchedProducts.length === 1 ? 'NEEDS_CLARIFICATION' : 'NEEDS_CLARIFICATION';
     await conversation.save();
@@ -986,6 +1146,10 @@ ${productName}
         let label = p.name;
         if (p.packageInfo) {
           label += ` (${p.packageInfo})`;
+        }
+        // Добавляем запрошенное количество в название кнопки
+        if (requestedQuantity) {
+          label += ` ${requestedQuantity} шт`;
         }
         return label;
       });
@@ -1013,7 +1177,7 @@ ${productName}
 
 async function createSearch(req, res) {
   try {
-    const { conversationId, text, geo, radiusMeters } = req.body || {};
+    const { conversationId, text, geo, radiusMeters, requestedQuantity } = req.body || {};
     if (!conversationId || !geo || geo.lat === undefined || geo.lng === undefined) {
       return res.status(400).json({ error: 'Отсутствуют обязательные поля' });
     }
@@ -1021,6 +1185,9 @@ async function createSearch(req, res) {
     if (!conversation) {
       return res.status(404).json({ error: 'Чат не найден' });
     }
+
+    // Извлекаем количество из текста, если не передано явно
+    const quantity = requestedQuantity || extractQuantityFromText(text);
 
     const request = await SearchRequest.create({
       id: generateId(),
@@ -1031,7 +1198,7 @@ async function createSearch(req, res) {
       expiresAt: nowPlus(RESULT_TTL_MS)
     });
 
-    const items = await performSearch({ text, geo, radiusMeters });
+    const items = await performSearch({ text, geo, radiusMeters, requestedQuantity: quantity });
     const result = await SearchResult.create({
       id: generateId(),
       requestId: request.id,
@@ -1213,7 +1380,7 @@ async function deleteHistory(req, res) {
 
 async function searchByImage(req, res) {
   try {
-    let { conversationId, geo, radiusMeters } = req.body || {};
+    let { conversationId, geo, radiusMeters, requestedQuantity } = req.body || {};
     const file = req.file;
 
     if (!file) {
@@ -1236,6 +1403,11 @@ async function searchByImage(req, res) {
     // Парсим radiusMeters, если это строка
     if (radiusMeters && typeof radiusMeters === 'string') {
       radiusMeters = parseInt(radiusMeters, 10) || 1000;
+    }
+
+    // Парсим requestedQuantity, если это строка
+    if (requestedQuantity && typeof requestedQuantity === 'string') {
+      requestedQuantity = parseInt(requestedQuantity, 10) || null;
     }
 
     // Анализируем изображение с помощью Gemini
@@ -1674,7 +1846,8 @@ async function searchByImage(req, res) {
         text: searchText,
         geo,
         radiusMeters,
-        intent
+        intent,
+        requestedQuantity: requestedQuantity
       });
     }
 
