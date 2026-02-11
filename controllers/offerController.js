@@ -198,11 +198,20 @@ async function updateOffer(req, res) {
     const { offerId } = req.params;
     let { price, currency, isAvailable, quantity, markup } = req.body;
 
+    console.log(`[UPDATE OFFER] Запрос на обновление оффера ${offerId}:`, { price, markup, currency, isAvailable, quantity });
+
     // Проверяем существование оффера
     const offer = await Offer.findOne({ id: offerId }).lean();
     if (!offer) {
       return res.status(404).json({ error: 'Оффер не найден' });
     }
+
+    console.log(`[UPDATE OFFER] Текущее состояние оффера:`, { 
+      price: offer.price, 
+      markup: offer.markup, 
+      currency: offer.currency,
+      productId: offer.productId 
+    });
 
     // Проверяем права доступа: владелец магазина может обновлять только свои офферы
     const userStoreId = await getStoreIdForStoreOwner(req.user);
@@ -242,11 +251,16 @@ async function updateOffer(req, res) {
 
     // Валидация markup
     if (markup !== undefined && markup !== null) {
+      console.log(`[UPDATE OFFER] Валидация markup: входное значение = ${markup} (тип: ${typeof markup})`);
       const numMarkup = typeof markup === 'string' ? parseFloat(markup) : markup;
       if (isNaN(numMarkup) || numMarkup < 0) {
+        console.log(`[UPDATE OFFER] Ошибка валидации markup: ${numMarkup}`);
         return res.status(400).json({ error: 'markup должен быть неотрицательным числом' });
       }
       markup = numMarkup;
+      console.log(`[UPDATE OFFER] Markup после валидации: ${markup}`);
+    } else {
+      console.log(`[UPDATE OFFER] Markup не передан или null: markup = ${markup}`);
     }
 
     // Валидация isAvailable
@@ -257,6 +271,7 @@ async function updateOffer(req, res) {
     }
 
     const oldPrice = offer.price;
+    const oldMarkup = offer.markup;
     const oldQuantity = offer.quantity || 0;
     const oldIsAvailable = offer.isAvailable;
     const oldCurrency = offer.currency;
@@ -265,20 +280,27 @@ async function updateOffer(req, res) {
     // Явно обновляем цену, даже если она равна 0
     if (price !== undefined && price !== null) {
       update.price = price;
-      console.log(`Обновление цены оффера ${offerId}: старая цена = ${offer.price}, новая цена = ${price}`);
+      console.log(`[UPDATE OFFER] Обновление цены оффера ${offerId}: старая цена = ${offer.price}, новая цена = ${price}`);
     }
     if (markup !== undefined && markup !== null) {
       update.markup = markup;
+      console.log(`[UPDATE OFFER] Обновление наценки оффера ${offerId}: старая наценка = ${offer.markup}, новая наценка = ${markup}`);
     }
     if (currency !== undefined) update.currency = currency;
     if (isAvailable !== undefined) update.isAvailable = isAvailable;
     if (quantity !== undefined) update.quantity = quantity;
 
+    console.log(`[UPDATE OFFER] Объект обновления:`, update);
+
     const updatedOffer = await Offer.findOneAndUpdate({ id: offerId }, update, {
       new: true
     }).lean();
 
-    console.log(`Оффер ${offerId} обновлен. Финальная цена: ${updatedOffer.price}`);
+    console.log(`[UPDATE OFFER] Оффер ${offerId} успешно обновлен:`, { 
+      price: updatedOffer.price, 
+      markup: updatedOffer.markup,
+      updatedAt: updatedOffer.updatedAt 
+    });
 
     // Логируем действия, если это владелец магазина
     if (userStoreId && userStoreId === offer.storeId) {
@@ -301,6 +323,25 @@ async function updateOffer(req, res) {
               newPrice: price,
               oldCurrency: oldCurrency,
               newCurrency: updatedOffer.currency,
+              offerId: updatedOffer.id
+            }
+          );
+        }
+
+        // Логируем изменение наценки
+        if (markup !== undefined && markup !== null && oldMarkup !== markup) {
+          await logStoreActivity(
+            offer.storeId,
+            req.user.userId,
+            'UPDATE_MARKUP',
+            `Изменена наценка товара "${product.name}" (SKU: ${product.sku}). Старая наценка: ${oldMarkup || 0}, новая наценка: ${markup}`,
+            {
+              productId: product.id,
+              productName: product.name,
+              sku: product.sku,
+              brandName: product.brandName,
+              oldMarkup: oldMarkup || 0,
+              newMarkup: markup,
               offerId: updatedOffer.id
             }
           );

@@ -606,7 +606,7 @@ async function performSearch({ text, geo, radiusMeters, intent }) {
     offersByProduct.get(offer.productId).push(mappedOffer);
   }
 
-  return products
+  const items = products
     .map(product => {
       const offersWithStores = (offersByProduct.get(product.id) || [])
         .sort((a, b) => {
@@ -650,7 +650,26 @@ async function performSearch({ text, geo, radiusMeters, intent }) {
           location: offersWithStores[0].store.location
         } : null
       };
-    });
+    })
+    // Сортируем товары по расстоянию до ближайшего магазина (если есть геолокация)
+    .sort((a, b) => {
+      const aDist = a.nearestStore?.distanceMeters;
+      const bDist = b.nearestStore?.distanceMeters;
+      
+      // Если у обоих есть расстояние - сортируем по нему
+      if (aDist !== null && aDist !== undefined && bDist !== null && bDist !== undefined) {
+        return aDist - bDist;
+      }
+      // Если у одного есть расстояние, а у другого нет - сначала с расстоянием
+      if (aDist !== null && aDist !== undefined) return -1;
+      if (bDist !== null && bDist !== undefined) return 1;
+      // Если расстояний нет, сортируем по количеству предложений (больше предложений = лучше)
+      return (b.totalOffers || 0) - (a.totalOffers || 0);
+    })
+    // Ограничиваем до 5 ближайших товаров
+    .slice(0, 5);
+
+  return items;
 }
 
 async function postMessage(req, res) {
