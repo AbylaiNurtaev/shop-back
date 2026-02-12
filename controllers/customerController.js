@@ -1326,7 +1326,8 @@ ${index + 1}. "${offer.store.name}"${offer.store.distanceFormatted ? ` (${offer.
               name: p.name,
               brandName: p.brandName,
               categoryName: p.categoryName,
-              packageInfo: p.packageInfo
+              packageInfo: p.packageInfo,
+              images: p.images || null
             }));
 
             matchedProducts = productsWithVolumes;
@@ -1422,7 +1423,8 @@ ${index + 1}. "${offer.store.name}"${offer.store.distanceFormatted ? ` (${offer.
             name: p.name,
             brandName: p.brandName,
             categoryName: p.categoryName,
-            packageInfo: p.packageInfo
+            packageInfo: p.packageInfo,
+            images: p.images || null
           }));
 
           matchedProducts = productsWithVolumes;
@@ -1675,6 +1677,8 @@ ${index + 1}. "${offer.store.name}"${offer.store.distanceFormatted ? ` (${offer.
           return label;
         });
         productsToShow = volumeOptions;
+        // Заменяем текст на статический для выбора объема
+        replyText = 'Выберите объем:';
       } else {
         productsToShow = volumeOptions;
       }
@@ -1692,6 +1696,9 @@ ${index + 1}. "${offer.store.name}"${offer.store.distanceFormatted ? ` (${offer.
         return label;
       });
 
+      // Заменяем текст на статический для выбора товара
+      replyText = 'У нас есть такие варианты товара:\nКакой именно вас интересует?';
+
       // Для matchedProducts берем по одному товару из каждой группы
       productsToShow = grouped.map(group => {
         // Берем первый товар из группы (без packageInfo, если возможно)
@@ -1701,7 +1708,8 @@ ${index + 1}. "${offer.store.name}"${offer.store.distanceFormatted ? ` (${offer.
           name: productWithoutVolume.name,
           brandName: productWithoutVolume.brandName,
           categoryName: productWithoutVolume.categoryName,
-          packageInfo: null // Не показываем packageInfo в списке товаров
+          packageInfo: null, // Не показываем packageInfo в списке товаров
+          images: productWithoutVolume.images || null
         };
       });
     } else {
@@ -1711,7 +1719,8 @@ ${index + 1}. "${offer.store.name}"${offer.store.distanceFormatted ? ` (${offer.
         name: p.name,
         brandName: p.brandName,
         categoryName: p.categoryName,
-        packageInfo: p.packageInfo
+        packageInfo: p.packageInfo,
+        images: p.images || null
       }));
     }
 
