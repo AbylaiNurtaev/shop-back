@@ -50,6 +50,35 @@ function normalizeText(value) {
   return String(value || '').trim().toLowerCase();
 }
 
+// Функция для получения базового названия товара (без объема)
+function getBaseProductName(product) {
+  let name = product.name || '';
+  // Убираем информацию об объеме из названия, если она есть
+  // Например: "Coca-Cola в стекляшке (250 мл)" -> "Coca-Cola в стекляшке"
+  // Но оставляем название как есть, если packageInfo отдельно
+  return name.trim();
+}
+
+// Функция для группировки товаров по базовому названию
+function groupProductsByBaseName(products) {
+  const grouped = new Map();
+
+  products.forEach(product => {
+    const baseName = getBaseProductName(product);
+    const key = normalizeText(baseName);
+
+    if (!grouped.has(key)) {
+      grouped.set(key, {
+        baseName: baseName,
+        products: []
+      });
+    }
+    grouped.get(key).products.push(product);
+  });
+
+  return Array.from(grouped.values());
+}
+
 /**
  * Извлекает количество товара из текста сообщения
  * Примеры: "20 шт", "15 штук", "10", "5 единиц"
@@ -705,7 +734,7 @@ async function performSearch({ text, geo, radiusMeters, intent, requestedQuantit
         if (selectedOffers.length > 0) {
           distributedOffers = selectedOffers;
           fulfillmentInfo = {
-            requestedQuantity: requestedQuantity,
+            requestedQuantity: requestedQuantity || 1,
             fulfilledQuantity: requestedQuantity - remainingQuantity,
             remainingQuantity: remainingQuantity,
             storesCount: selectedOffers.length,
@@ -780,17 +809,24 @@ async function postMessage(req, res) {
 
     // Извлекаем количество из текста сообщения или используем ранее сохраненное
     let requestedQuantity = extractQuantityFromText(text);
+    let userExplicitlySetQuantity = requestedQuantity !== null && requestedQuantity !== undefined;
 
     // Если количество не найдено в текущем сообщении, проверяем сохраненное в intent
     if (!requestedQuantity && conversation.intentId) {
       const existingIntent = await SearchIntent.findOne({ id: conversation.intentId }).lean();
       if (existingIntent && existingIntent.filters && existingIntent.filters.requestedQuantity) {
         requestedQuantity = existingIntent.filters.requestedQuantity;
+        userExplicitlySetQuantity = true; // Пользователь ранее указал количество
         console.log(`[CUSTOMER_MESSAGE] Используем ранее сохраненное количество: ${requestedQuantity} шт.`);
       }
     }
 
-    if (requestedQuantity) {
+    // Если количество не указано, устанавливаем по умолчанию 1
+    // Но флаг needsQuantityInput будет показывать, что пользователь может изменить количество
+    if (!userExplicitlySetQuantity) {
+      requestedQuantity = 1; // По умолчанию 1 шт
+      console.log(`[CUSTOMER_MESSAGE] Количество не указано, устанавливаем по умолчанию: 1 шт.`);
+    } else {
       console.log(`[CUSTOMER_MESSAGE] Пользователь запросил ${requestedQuantity} шт. товара`);
     }
 
@@ -847,6 +883,9 @@ async function postMessage(req, res) {
     }
 
     conversation.updatedAt = new Date();
+
+    // Получаем выбранный товар из intent (если есть)
+    const selectedProductId = intent.filters?.selectedProductId;
 
     // Если нет геолокации, просим её
     if (!geo || geo.lat === undefined || geo.lng === undefined) {
@@ -912,22 +951,322 @@ async function postMessage(req, res) {
       });
     }
 
-    // Отправляем сообщение + каталог напрямую в Gemini
-    const aiResult = await getWappiChatAIResponse({
-      message: text,
-      products: productsWithCategory,
-      conversationContext
-    });
+    // Проверяем, не выбрал ли пользователь объем из quickReplies
+    if (selectedProductId && text) {
+      // Пользователь уже выбрал товар, теперь выбирает объем
+      const selectedProduct = productsWithCategory.find(p => p.id === selectedProductId);
 
-    let replyText = aiResult && typeof aiResult.replyText === 'string'
-      ? aiResult.replyText
-      : 'Не удалось обработать запрос. Попробуйте описать товар по-другому.';
+      if (selectedProduct) {
+        const baseName = getBaseProductName(selectedProduct);
+        const normalizedText = normalizeText(text);
 
-    // На основе matchedProductIds собираем подробную информацию о найденных товарах
+        // Ищем все товары с таким же базовым названием
+        const sameBaseProducts = productsWithCategory.filter(p => {
+          const pBaseName = getBaseProductName(p);
+          return normalizeText(pBaseName) === normalizeText(baseName);
+        });
+
+        // Ищем товар с выбранным объемом
+        const selectedVolumeProduct = sameBaseProducts.find(p => {
+          if (!p.packageInfo) return false;
+          const normalizedPackageInfo = normalizeText(p.packageInfo);
+          return normalizedText === normalizedPackageInfo ||
+            normalizedText.includes(normalizedPackageInfo) ||
+            normalizedPackageInfo.includes(normalizedText);
+        });
+
+        if (selectedVolumeProduct) {
+          // Пользователь выбрал объем, сохраняем выбранный товар
+          // Используем количество по умолчанию 1, если не указано
+          const quantityToSave = requestedQuantity || intent.filters?.requestedQuantity || 1;
+          intent.filters = {
+            ...(intent.filters || {}),
+            candidateProductIds: [selectedVolumeProduct.id],
+            selectedProductId: null, // Очищаем selectedProductId
+            requestedQuantity: quantityToSave
+          };
+          await intent.save();
+
+          console.log(`[CUSTOMER] Пользователь выбрал объем "${selectedVolumeProduct.packageInfo}" для товара "${baseName}"`);
+
+          // Если есть геолокация, сразу показываем магазины
+          if (geo && geo.lat !== undefined && geo.lng !== undefined) {
+            try {
+              const request = await SearchRequest.create({
+                id: generateId(),
+                conversationId,
+                intentId: intent.id,
+                geo: { lat: geo.lat, lng: geo.lng },
+                radiusMeters: radiusMeters || 1000,
+                expiresAt: nowPlus(RESULT_TTL_MS)
+              });
+
+              conversation.requestId = request.id;
+              conversation.state = 'SEARCHING';
+              await conversation.save();
+
+              const items = await performSearch({
+                text,
+                geo,
+                radiusMeters,
+                intent: {
+                  filters: { candidateProductIds: [selectedVolumeProduct.id] },
+                  brand: null,
+                  packageInfo: null
+                },
+                requestedQuantity: requestedQuantity || 1 || intent.filters?.requestedQuantity || 1
+              });
+
+              const result = await SearchResult.create({
+                id: generateId(),
+                requestId: request.id,
+                items,
+                expiresAt: nowPlus(RESULT_TTL_MS)
+              });
+
+              conversation.resultId = result.id;
+              conversation.state = 'DONE';
+              await conversation.save();
+
+              // Формируем сообщение с магазинами
+              if (Array.isArray(items) && items.length > 0 && items[0].offers && items[0].offers.length > 0) {
+                const item = items[0];
+                const productName = `${selectedVolumeProduct.name}${selectedVolumeProduct.brandName ? ' (' + selectedVolumeProduct.brandName + ')' : ''}${selectedVolumeProduct.packageInfo ? ' - ' + selectedVolumeProduct.packageInfo : ''}`;
+                const totalOffers = item.offers.length;
+                const nearest = item.nearestStore;
+                const fulfillment = item.fulfillmentInfo;
+                const qty = requestedQuantity || intent.filters?.requestedQuantity || 1;
+
+                replyText = `Найден товар:
+${productName}
+`;
+
+                if (fulfillment && qty) {
+                  if (fulfillment.isFullyFulfilled) {
+                    replyText += `
+✅ Запрошенное количество (${qty} шт.) доступно в ${fulfillment.storesCount} магазин${fulfillment.storesCount === 1 ? 'е' : fulfillment.storesCount < 5 ? 'ах' : 'ах'}:
+`;
+
+                    item.offers.forEach((offer, index) => {
+                      if (offer.allocatedQuantity) {
+                        replyText += `
+${index + 1}. "${offer.store.name}"${offer.store.distanceFormatted ? ` (${offer.store.distanceFormatted})` : ''}: ${offer.allocatedQuantity} шт. по ${offer.price} ${offer.currency}`;
+                      }
+                    });
+                  } else {
+                    replyText += `
+⚠️ Запрошенное количество (${qty} шт.) частично доступно. Найдено ${fulfillment.fulfilledQuantity} шт. в ${fulfillment.storesCount} магазин${fulfillment.storesCount === 1 ? 'е' : fulfillment.storesCount < 5 ? 'ах' : 'ах'}:
+`;
+
+                    item.offers.forEach((offer, index) => {
+                      if (offer.allocatedQuantity) {
+                        replyText += `
+${index + 1}. "${offer.store.name}"${offer.store.distanceFormatted ? ` (${offer.store.distanceFormatted})` : ''}: ${offer.allocatedQuantity} шт. по ${offer.price} ${offer.currency}`;
+                      }
+                    });
+
+                    replyText += `
+
+Не хватает: ${fulfillment.remainingQuantity} шт.`;
+                  }
+                } else {
+                  if (nearest && nearest.distance && typeof nearest.distanceMeters === 'number') {
+                    if (nearest.distanceMeters > 1000) {
+                      replyText += `
+Рядом с вами (в радиусе 1 км) магазины с этим товаром не найдены. Самый ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
+                    } else {
+                      replyText += `
+Найдено предложений: ${totalOffers}. Ближайший магазин "${nearest.name}" находится на расстоянии ${nearest.distance}.`;
+                    }
+                  } else {
+                    replyText += `
+Найдено предложений: ${totalOffers}.`;
+                  }
+                }
+              } else {
+                replyText = `Товар "${selectedVolumeProduct.name}" найден, но не доступен в ближайших магазинах в радиусе ${(radiusMeters || 1000) / 1000} км. Попробуйте увеличить радиус поиска.`;
+              }
+
+              await SearchMessage.create({
+                id: generateId(),
+                conversationId,
+                sender: 'SYSTEM',
+                text: replyText
+              });
+
+              return res.json({
+                state: conversation.state,
+                messageId: message.id,
+                requestId: request.id,
+                resultId: result.id,
+                items: items.length > 0 ? items : [],
+                selectedProduct: {
+                  id: selectedVolumeProduct.id,
+                  name: selectedVolumeProduct.name,
+                  brandName: selectedVolumeProduct.brandName,
+                  packageInfo: selectedVolumeProduct.packageInfo,
+                  images: selectedVolumeProduct.images || null
+                }
+              });
+            } catch (error) {
+              console.error(`[CUSTOMER] Ошибка при формировании ответа с магазинами после выбора объема:`, error);
+              // Продолжаем с обычным ответом от AI
+            }
+          } else {
+            // Нет геолокации, просто подтверждаем выбор
+            replyText = `Отлично! Вы выбрали: ${selectedVolumeProduct.name}${selectedVolumeProduct.packageInfo ? ' (' + selectedVolumeProduct.packageInfo + ')' : ''}.
+Уточните ваше местоположение для поиска магазинов.`;
+
+            await SearchMessage.create({
+              id: generateId(),
+              conversationId,
+              sender: 'SYSTEM',
+              text: replyText
+            });
+
+            return res.json({
+              state: conversation.state,
+              messageId: message.id,
+              questions: [replyText],
+              selectedProduct: {
+                id: selectedVolumeProduct.id,
+                name: selectedVolumeProduct.name,
+                brandName: selectedVolumeProduct.brandName,
+                packageInfo: selectedVolumeProduct.packageInfo,
+                images: selectedVolumeProduct.images || null
+              }
+            });
+          }
+        }
+      }
+    }
+
+    // Если уже выбран товар, обрабатываем выбор объема без AI
+    let aiResult = null;
     let matchedProducts = [];
-    if (Array.isArray(aiResult.matchedProductIds) && aiResult.matchedProductIds.length > 0) {
-      const matchedIds = new Set(aiResult.matchedProductIds);
-      matchedProducts = productsWithCategory.filter(p => matchedIds.has(p.id));
+    let replyText = '';
+
+    if (selectedProductId && text) {
+      // Пользователь уже выбрал товар, обрабатываем выбор объема
+      // Этот случай уже обработан выше в блоке проверки выбора объема
+      // Здесь просто инициализируем переменные
+      matchedProducts = [];
+    } else if (text) {
+      // Группируем товары по базовому названию перед отправкой в AI
+      // Это нужно, чтобы AI не показывал отдельные варианты по объемам в тексте сообщения
+      const groupedProductsMap = new Map();
+      const productGroups = new Map(); // Сохраняем все товары в группе для последующего использования
+      const representativeIdToAllIds = new Map(); // Маппинг ID представителя -> все ID в группе
+
+      productsWithCategory.forEach(product => {
+        const baseName = getBaseProductName(product);
+        const key = normalizeText(baseName);
+
+        if (!groupedProductsMap.has(key)) {
+          // Берем первый товар из группы (предпочтительно без packageInfo)
+          const representativeProduct = {
+            ...product,
+            // Убираем packageInfo из названия для AI, чтобы он не показывал объемы
+            name: baseName,
+            packageInfo: null // Скрываем packageInfo от AI
+          };
+          groupedProductsMap.set(key, representativeProduct);
+          productGroups.set(key, [product]);
+          representativeIdToAllIds.set(product.id, [product.id]);
+        } else {
+          // Добавляем товар в группу
+          productGroups.get(key).push(product);
+
+          // Обновляем маппинг для всех представителей группы
+          const representative = groupedProductsMap.get(key);
+          const allIds = representativeIdToAllIds.get(representative.id) || [];
+          allIds.push(product.id);
+          representativeIdToAllIds.set(representative.id, allIds);
+
+          // Если текущий товар без packageInfo, используем его как представителя
+          if (!product.packageInfo && representative.packageInfo) {
+            const newRepresentative = {
+              ...product,
+              name: baseName,
+              packageInfo: null
+            };
+            groupedProductsMap.set(key, newRepresentative);
+            // Обновляем маппинг для нового представителя
+            representativeIdToAllIds.set(product.id, allIds);
+          }
+        }
+      });
+
+      // Преобразуем Map в массив для отправки в AI (убираем служебные поля)
+      const groupedProductsForAI = Array.from(groupedProductsMap.values()).map(p => {
+        const { _allProductIds, ...productWithoutServiceFields } = p;
+        return productWithoutServiceFields;
+      });
+
+      console.log(`[CUSTOMER] Группировка товаров: ${productsWithCategory.length} -> ${groupedProductsForAI.length} уникальных названий`);
+
+      // Отправляем сообщение + каталог напрямую в Gemini
+      try {
+        aiResult = await getWappiChatAIResponse({
+          message: text,
+          products: groupedProductsForAI,
+          conversationContext
+        });
+
+        replyText = aiResult && typeof aiResult.replyText === 'string'
+          ? aiResult.replyText
+          : 'Не удалось обработать запрос. Попробуйте описать товар по-другому.';
+
+        // На основе matchedProductIds собираем подробную информацию о найденных товарах
+        // Если товары были сгруппированы, находим все товары из выбранных групп
+        if (Array.isArray(aiResult.matchedProductIds) && aiResult.matchedProductIds.length > 0) {
+          const matchedIds = new Set(aiResult.matchedProductIds);
+          const allMatchedIds = new Set();
+
+          // Для каждого выбранного ID (представителя группы) находим все товары из его группы
+          matchedIds.forEach(representativeId => {
+            if (representativeIdToAllIds.has(representativeId)) {
+              // Это ID представителя группы, добавляем все ID из группы
+              representativeIdToAllIds.get(representativeId).forEach(id => allMatchedIds.add(id));
+            } else {
+              // Это не ID представителя, возможно товар не был сгруппирован
+              // Ищем в группах
+              let found = false;
+              for (const [key, group] of productGroups.entries()) {
+                if (group.some(p => p.id === representativeId)) {
+                  // Нашли группу, добавляем все ID из группы
+                  group.forEach(p => allMatchedIds.add(p.id));
+                  found = true;
+                  break;
+                }
+              }
+              // Если не нашли в группах, добавляем сам ID
+              if (!found) {
+                allMatchedIds.add(representativeId);
+              }
+            }
+          });
+
+          matchedProducts = productsWithCategory.filter(p => allMatchedIds.has(p.id));
+
+          console.log(`[CUSTOMER] AI выбрал ${matchedIds.size} групп, найдено ${matchedProducts.length} товаров`);
+        }
+      } catch (error) {
+        console.error('[CUSTOMER] Ошибка при вызове AI:', error);
+        replyText = 'Не удалось обработать запрос. Попробуйте описать товар по-другому.';
+        matchedProducts = [];
+        aiResult = {
+          replyText: replyText,
+          matchedProductIds: [],
+          reasoning: 'AI_ERROR'
+        };
+      }
+    }
+
+    // Если AI не был вызван и нет replyText, устанавливаем дефолтное сообщение
+    // Но только если мы не обрабатываем выбор товара из quickReplies
+    if (!replyText && !selectedProductId && (!text || matchedProducts.length === 0)) {
+      replyText = 'Напишите, какой товар вы ищете.';
     }
 
     console.log(`[CUSTOMER] AI выбрал ${matchedProducts.length} товаров из ${productsWithCategory.length}`);
@@ -943,6 +1282,171 @@ async function postMessage(req, res) {
       );
     }
 
+    // Проверяем, есть ли уже выбранный товар (для показа вариантов объемов)
+    let isVolumeSelection = false;
+    let volumeOptions = [];
+
+    if (selectedProductId && text) {
+      // Пользователь уже выбрал товар, проверяем выбор объема
+      // Если выбор объема не обработан выше, обрабатываем здесь
+      const selectedProduct = productsWithCategory.find(p => p.id === selectedProductId);
+
+      if (selectedProduct) {
+        const baseName = getBaseProductName(selectedProduct);
+        // Ищем все товары с таким же базовым названием
+        const sameBaseProducts = productsWithCategory.filter(p => {
+          const pBaseName = getBaseProductName(p);
+          return normalizeText(pBaseName) === normalizeText(baseName);
+        });
+
+        // Фильтруем товары с разными объемами
+        const productsWithVolumes = sameBaseProducts.filter(p => p.packageInfo);
+
+        if (productsWithVolumes.length > 1) {
+          // Проверяем, не выбрал ли пользователь объем из текста
+          const normalizedText = normalizeText(text);
+          const selectedVolumeProduct = productsWithVolumes.find(p => {
+            if (!p.packageInfo) return false;
+            const normalizedPackageInfo = normalizeText(p.packageInfo);
+            return normalizedText === normalizedPackageInfo ||
+              normalizedText.includes(normalizedPackageInfo) ||
+              normalizedPackageInfo.includes(normalizedText);
+          });
+
+          if (selectedVolumeProduct) {
+            // Пользователь выбрал объем, но это должно было обработаться выше
+            // Если дошли сюда, значит что-то пошло не так, продолжаем как обычно
+            matchedProducts = [selectedVolumeProduct];
+            replyText = `Выбран товар: ${selectedVolumeProduct.name}${selectedVolumeProduct.packageInfo ? ' (' + selectedVolumeProduct.packageInfo + ')' : ''}`;
+          } else {
+            // Показываем варианты объемов
+            isVolumeSelection = true;
+            volumeOptions = productsWithVolumes.map(p => ({
+              id: p.id,
+              name: p.name,
+              brandName: p.brandName,
+              categoryName: p.categoryName,
+              packageInfo: p.packageInfo
+            }));
+
+            matchedProducts = productsWithVolumes;
+            replyText = `Выберите объем для "${baseName}":`;
+
+            console.log(`[CUSTOMER] Показываем ${volumeOptions.length} вариантов объемов для товара "${baseName}"`);
+          }
+        } else if (productsWithVolumes.length === 1) {
+          // Только один вариант объема, продолжаем как обычно
+          matchedProducts = productsWithVolumes;
+          if (!replyText) {
+            replyText = `Выбран товар: ${productsWithVolumes[0].name}${productsWithVolumes[0].packageInfo ? ' (' + productsWithVolumes[0].packageInfo + ')' : ''}`;
+          }
+        } else {
+          // Нет вариантов объемов, очищаем selectedProductId и продолжаем поиск
+          intent.filters = {
+            ...(intent.filters || {}),
+            selectedProductId: null
+          };
+          await intent.save();
+        }
+      } else {
+        // Товар не найден, очищаем selectedProductId
+        intent.filters = {
+          ...(intent.filters || {}),
+          selectedProductId: null
+        };
+        await intent.save();
+      }
+    } else if (text) {
+      // Проверяем, не выбрал ли пользователь товар из quickReplies
+      // Ищем во всех товарах, а не только в matchedProducts, так как после группировки
+      // товар может не попасть в matchedProducts, но пользователь может его выбрать
+      const normalizedText = normalizeText(text);
+      let foundProduct = null;
+      let foundBaseName = null;
+
+      // Сначала проверяем в matchedProducts
+      for (const product of matchedProducts) {
+        const baseName = getBaseProductName(product);
+        const normalizedBaseName = normalizeText(baseName);
+
+        if (normalizedText === normalizedBaseName ||
+          normalizedText.includes(normalizedBaseName) ||
+          normalizedBaseName.includes(normalizedText)) {
+          foundProduct = product;
+          foundBaseName = baseName;
+          break;
+        }
+      }
+
+      // Если не нашли в matchedProducts, ищем во всех товарах
+      if (!foundProduct) {
+        for (const product of productsWithCategory) {
+          const baseName = getBaseProductName(product);
+          const normalizedBaseName = normalizeText(baseName);
+
+          if (normalizedText === normalizedBaseName ||
+            normalizedText.includes(normalizedBaseName) ||
+            normalizedBaseName.includes(normalizedText)) {
+            foundProduct = product;
+            foundBaseName = baseName;
+            break;
+          }
+        }
+      }
+
+      if (foundProduct) {
+        // Пользователь выбрал товар, проверяем есть ли варианты объемов
+        const normalizedBaseName = normalizeText(foundBaseName);
+        const sameBaseProducts = productsWithCategory.filter(p => {
+          const pBaseName = getBaseProductName(p);
+          return normalizeText(pBaseName) === normalizedBaseName;
+        });
+
+        const productsWithVolumes = sameBaseProducts.filter(p => p.packageInfo);
+
+        if (productsWithVolumes.length > 1) {
+          // Сохраняем выбранный товар в intent
+          // Используем количество по умолчанию 1, если не указано
+          const quantityToSave = requestedQuantity || 1;
+          intent.filters = {
+            ...(intent.filters || {}),
+            selectedProductId: foundProduct.id,
+            requestedQuantity: quantityToSave
+          };
+          await intent.save();
+
+          // Показываем варианты объемов
+          isVolumeSelection = true;
+          volumeOptions = productsWithVolumes.map(p => ({
+            id: p.id,
+            name: p.name,
+            brandName: p.brandName,
+            categoryName: p.categoryName,
+            packageInfo: p.packageInfo
+          }));
+
+          matchedProducts = productsWithVolumes;
+          replyText = `Выберите объем для "${foundBaseName}":`;
+
+          console.log(`[CUSTOMER] Пользователь выбрал товар "${foundBaseName}", показываем ${volumeOptions.length} вариантов объемов`);
+        } else if (productsWithVolumes.length === 1) {
+          // Только один вариант объема, используем его
+          matchedProducts = productsWithVolumes;
+          replyText = `Выбран товар: ${productsWithVolumes[0].name}${productsWithVolumes[0].packageInfo ? ' (' + productsWithVolumes[0].packageInfo + ')' : ''}`;
+        } else {
+          // Нет вариантов объемов, используем найденный товар
+          matchedProducts = [foundProduct];
+          if (!replyText) {
+            replyText = `Выбран товар: ${foundProduct.name}`;
+          }
+          console.log(`[CUSTOMER] Пользователь выбрал товар "${foundBaseName}", вариантов объемов нет`);
+        }
+      } else {
+        // Товар не найден по тексту, возможно это новый запрос
+        console.log(`[CUSTOMER] Товар не найден по тексту "${text}", возможно это новый запрос`);
+      }
+    }
+
     // Если AI сузил выбор до ОДНОГО товара и есть геолокация — сразу показываем магазины
     if (matchedProducts.length === 1 && geo && geo.lat !== undefined && geo.lng !== undefined) {
       try {
@@ -950,10 +1454,12 @@ async function postMessage(req, res) {
         console.log(`[CUSTOMER] Один выбранный товар (${singleProduct.id}), подготавливаем ответ с магазинами`);
 
         // Сохраняем выбранный товар в intent
+        // Используем количество по умолчанию 1, если не указано
+        const quantityToSave = requestedQuantity || 1;
         intent.filters = {
           ...(intent.filters || {}),
           candidateProductIds: [singleProduct.id],
-          requestedQuantity: requestedQuantity || null
+          requestedQuantity: quantityToSave
         };
         await intent.save();
 
@@ -979,7 +1485,7 @@ async function postMessage(req, res) {
             brand: null,
             packageInfo: null
           },
-          requestedQuantity: requestedQuantity
+          requestedQuantity: requestedQuantity || 1
         });
 
         const result = await SearchResult.create({
@@ -1096,7 +1602,8 @@ ${index + 1}. "${offer.store.name}"${offer.store.distanceFormatted ? ` (${offer.
             id: singleProduct.id,
             name: singleProduct.name,
             brandName: singleProduct.brandName,
-            packageInfo: singleProduct.packageInfo
+            packageInfo: singleProduct.packageInfo,
+            images: singleProduct.images || null
           }
         });
       } catch (error) {
@@ -1106,14 +1613,15 @@ ${index + 1}. "${offer.store.name}"${offer.store.distanceFormatted ? ` (${offer.
     } else if (matchedProducts.length === 1 && (!geo || geo.lat === undefined || geo.lng === undefined)) {
       // Один товар найден, но нет геолокации
       const singleProduct = matchedProducts[0];
+      const quantityToSave = requestedQuantity || 1;
       intent.filters = {
         ...(intent.filters || {}),
         candidateProductIds: [singleProduct.id],
-        requestedQuantity: requestedQuantity || null
+        requestedQuantity: quantityToSave
       };
       await intent.save();
 
-      const quantityText = requestedQuantity ? ` в количестве ${requestedQuantity} шт` : '';
+      const quantityText = ` в количестве ${quantityToSave} шт`;
       replyText = `Отлично! Найден товар: ${singleProduct.name}${singleProduct.brandName ? ' (' + singleProduct.brandName + ')' : ''}${quantityText}.
 Уточните ваше местоположение для поиска магазинов.`;
     }
@@ -1138,21 +1646,73 @@ ${index + 1}. "${offer.store.name}"${offer.store.distanceFormatted ? ` (${offer.
     await conversation.save();
     await intent.save();
 
+    // Определяем, нужно ли показывать инпут для ввода количества
+    // Если isVolumeSelection: true, то спрашиваем количество вместе с объемом
+    // Если isVolumeSelection: false, но товар выбран и количество не указано пользователем, то спрашиваем отдельно
+    let needsQuantityInput = false;
+
+    if (isVolumeSelection) {
+      // Если выбирается объем, всегда спрашиваем количество вместе
+      needsQuantityInput = true;
+    } else if (matchedProducts.length === 1 && !userExplicitlySetQuantity) {
+      // Если товар выбран (один товар), но количество не указано пользователем явно, спрашиваем отдельно
+      needsQuantityInput = true;
+    }
+
     // Формируем quickReplies (кнопки) для выбора товара
     let quickReplies = [];
-    if (matchedProducts.length > 1 && matchedProducts.length <= 10) {
-      // Если найдено от 2 до 10 товаров, показываем их как кнопки
-      quickReplies = matchedProducts.map(p => {
-        let label = p.name;
-        if (p.packageInfo) {
-          label += ` (${p.packageInfo})`;
-        }
-        // Добавляем запрошенное количество в название кнопки
-        if (requestedQuantity) {
+    let productsToShow = [];
+
+    if (isVolumeSelection) {
+      // Показываем варианты объемов
+      if (volumeOptions.length > 1 && volumeOptions.length <= 10) {
+        quickReplies = volumeOptions.map(p => {
+          let label = p.packageInfo || p.name;
+          // Добавляем запрошенное количество в название кнопки только если пользователь указал его явно
+          if (userExplicitlySetQuantity && requestedQuantity) {
+            label += ` ${requestedQuantity} шт`;
+          }
+          return label;
+        });
+        productsToShow = volumeOptions;
+      } else {
+        productsToShow = volumeOptions;
+      }
+    } else if (matchedProducts.length > 1 && matchedProducts.length <= 10) {
+      // Группируем товары по базовому названию
+      const grouped = groupProductsByBaseName(matchedProducts);
+
+      // Показываем только уникальные базовые названия
+      quickReplies = grouped.map(group => {
+        let label = group.baseName;
+        // Добавляем запрошенное количество в название кнопки только если пользователь указал его явно
+        if (userExplicitlySetQuantity && requestedQuantity) {
           label += ` ${requestedQuantity} шт`;
         }
         return label;
       });
+
+      // Для matchedProducts берем по одному товару из каждой группы
+      productsToShow = grouped.map(group => {
+        // Берем первый товар из группы (без packageInfo, если возможно)
+        const productWithoutVolume = group.products.find(p => !p.packageInfo) || group.products[0];
+        return {
+          id: productWithoutVolume.id,
+          name: productWithoutVolume.name,
+          brandName: productWithoutVolume.brandName,
+          categoryName: productWithoutVolume.categoryName,
+          packageInfo: null // Не показываем packageInfo в списке товаров
+        };
+      });
+    } else {
+      // Если товаров меньше 2 или больше 10, показываем все как есть
+      productsToShow = matchedProducts.map(p => ({
+        id: p.id,
+        name: p.name,
+        brandName: p.brandName,
+        categoryName: p.categoryName,
+        packageInfo: p.packageInfo
+      }));
     }
 
     return res.json({
@@ -1160,13 +1720,11 @@ ${index + 1}. "${offer.store.name}"${offer.store.distanceFormatted ? ` (${offer.
       messageId: message.id,
       questions: [replyText],
       quickReplies: quickReplies,
-      matchedProducts: matchedProducts.map(p => ({
-        id: p.id,
-        name: p.name,
-        brandName: p.brandName,
-        categoryName: p.categoryName,
-        packageInfo: p.packageInfo
-      }))
+      isVolumeSelection: isVolumeSelection, // Флаг для фронтенда
+      needsQuantityInput: needsQuantityInput, // Флаг для показа инпута количества
+      defaultQuantity: 1, // Количество по умолчанию
+      requestedQuantity: requestedQuantity, // Текущее количество (может быть по умолчанию 1)
+      matchedProducts: productsToShow
     });
   } catch (error) {
     console.error('Ошибка при обработке сообщения:', error);
