@@ -14,7 +14,8 @@ const {
   searchByImage,
   getHistory,
   exportHistory,
-  deleteHistory
+  deleteHistory,
+  searchBatchProducts
 } = require('../controllers/customerController');
 
 router.post('/sessions', createSession);
@@ -23,6 +24,7 @@ router.get('/sessions/:sessionId', getSession);
 router.post('/conversations', createConversation);
 router.get('/conversations/:conversationId', getConversation);
 router.post('/conversations/:conversationId/messages', postMessage);
+router.post('/conversations/:conversationId/messages/batch', searchBatchProducts);
 
 router.post('/search', createSearch);
 router.get('/search/:requestId', getSearch);

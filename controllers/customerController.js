@@ -90,6 +90,7 @@ function extractQuantityFromText(text) {
   // Паттерны для поиска количества
   const patterns = [
     /(\d+)\s*(?:шт|штук|штука|штуки|единиц|единица|единицы|pieces?|pcs?)/i,
+    /(\d+)\s*(?:бутылок?|бутылк[иа]|банок?|банк[иа]|пачек?|пачк[иа]|упаковок?|упаковк[иа]|bottles?|cans?|packs?)/i,
     /(?:количество|нужно|хочу|куплю|купить)\s*(\d+)/i,
     /(\d+)\s*$/ // просто число в конце сообщения
   ];
@@ -2513,6 +2514,354 @@ async function handleCustomerFAQ(req, res) {
   }
 }
 
+async function searchBatchProducts(req, res) {
+  try {
+    const { conversationId } = req.params;
+    const { productNames, geo, radiusMeters } = req.body || {};
+
+    if (!conversationId) {
+      return res.status(400).json({ error: 'conversationId обязателен' });
+    }
+
+    if (!Array.isArray(productNames) || productNames.length === 0) {
+      return res.status(400).json({ error: 'productNames должен быть непустым массивом названий товаров' });
+    }
+
+    if (!geo || geo.lat === undefined || geo.lng === undefined) {
+      return res.status(400).json({ error: 'Геолокация обязательна' });
+    }
+
+    const conversation = await SearchConversation.findOne({ id: conversationId });
+    if (!conversation) {
+      return res.status(404).json({ error: 'Чат не найден' });
+    }
+
+    // Получаем все оплаченные товары для AI поиска
+    const allProducts = await Product.find({
+      isPayed: true,
+      paymentExpiresAt: { $gt: new Date() }
+    }).limit(1000).lean();
+
+    if (allProducts.length === 0) {
+      return res.json({
+        found: [],
+        notFound: productNames.map(name => ({ productName: name, reason: 'В каталоге нет доступных товаров' }))
+      });
+    }
+
+    // Обогащаем товары категориями
+    const categoryIds = Array.from(new Set(allProducts.map(p => p.categoryId).filter(Boolean)));
+    let categoryById = new Map();
+    if (categoryIds.length > 0) {
+      const categories = await Category.find({ id: { $in: categoryIds } }).lean();
+      categoryById = new Map(categories.map(cat => [cat.id, cat]));
+    }
+
+    const productsWithCategory = allProducts.map(product => ({
+      ...product,
+      categoryName: product.categoryId ? (categoryById.get(product.categoryId)?.name || null) : null
+    }));
+
+    // Для каждого названия товара ищем через AI и извлекаем количество
+    const productSearchResults = new Map(); // productName -> { product, requestedQuantity }
+    const notFoundInCatalog = [];
+
+    for (const productNameInput of productNames) {
+      if (!productNameInput || typeof productNameInput !== 'string' || !productNameInput.trim()) {
+        notFoundInCatalog.push({
+          productName: productNameInput || '',
+          reason: 'Некорректное название товара'
+        });
+        continue;
+      }
+
+      // Извлекаем количество из названия
+      const requestedQuantity = extractQuantityFromText(productNameInput);
+      // Убираем количество из названия для поиска товара
+      let productNameForSearch = productNameInput.trim();
+      if (requestedQuantity) {
+        // Убираем количество из названия (например, "колы 10 бутылок" -> "колы")
+        productNameForSearch = productNameForSearch
+          .replace(new RegExp(`\\s*${requestedQuantity}\\s*(?:шт|штук|штука|штуки|единиц|единица|единицы|бутылок?|бутылк[иа]|банок?|банк[иа]|пачек?|пачк[иа]|упаковок?|упаковк[иа]|pieces?|pcs?|bottles?|cans?|packs?)`, 'gi'), '')
+          .replace(new RegExp(`(?:количество|нужно|хочу|куплю|купить)\\s*${requestedQuantity}`, 'gi'), '')
+          .trim();
+      }
+
+      try {
+        // Используем AI для поиска товара по названию
+        const aiResult = await getWappiChatAIResponse({
+          message: productNameForSearch,
+          products: productsWithCategory,
+          conversationContext: []
+        });
+
+        if (Array.isArray(aiResult.matchedProductIds) && aiResult.matchedProductIds.length > 0) {
+          const matchedIds = new Set(aiResult.matchedProductIds);
+          const matchedProducts = productsWithCategory.filter(p => matchedIds.has(p.id));
+
+          if (matchedProducts.length > 0) {
+            // Берем первый наиболее релевантный товар
+            productSearchResults.set(productNameInput.trim(), {
+              product: matchedProducts[0],
+              requestedQuantity: requestedQuantity || 1 // По умолчанию 1, если не указано
+            });
+            console.log(`[BATCH_SEARCH] Найден товар "${productNameForSearch}": ${matchedProducts[0].name} (${matchedProducts[0].id}), количество: ${requestedQuantity || 1}`);
+          } else {
+            notFoundInCatalog.push({
+              productName: productNameInput.trim(),
+              reason: 'Товар не найден в каталоге'
+            });
+          }
+        } else {
+          notFoundInCatalog.push({
+            productName: productNameInput.trim(),
+            reason: 'Товар не найден в каталоге'
+          });
+        }
+      } catch (error) {
+        console.error(`[BATCH_SEARCH] Ошибка при поиске товара "${productNameForSearch}":`, error);
+        notFoundInCatalog.push({
+          productName: productNameInput.trim(),
+          reason: 'Ошибка при поиске товара'
+        });
+      }
+    }
+
+    const products = Array.from(productSearchResults.values()).map(item => item.product);
+    const productQuantities = new Map(); // productId -> requestedQuantity
+    Array.from(productSearchResults.values()).forEach(item => {
+      productQuantities.set(item.product.id, item.requestedQuantity);
+    });
+    const foundProductIds = products.map(p => p.id);
+
+    // Ищем предложения для найденных товаров
+    const offers = await Offer.find({
+      productId: { $in: foundProductIds },
+      isAvailable: true
+    }).lean();
+
+    if (offers.length === 0) {
+      return res.json({
+        found: [],
+        notFound: [
+          ...notFoundInCatalog.map(id => ({ productId: id, reason: 'Товар не найден в каталоге' })),
+          ...foundProductIds.map(id => ({ productId: id, reason: 'Товар не найден в магазинах' }))
+        ]
+      });
+    }
+
+    // Получаем магазины
+    const storeIds = [...new Set(offers.map(offer => offer.storeId))];
+    const stores = await Store.find({ id: { $in: storeIds } }).lean();
+    const storeById = new Map(stores.map(store => [store.id, store]));
+
+    // Получаем категории для найденных товаров
+    const foundCategoryIds = [...new Set(products.map(product => product.categoryId))];
+    const foundCategories = foundCategoryIds.length > 0
+      ? await Category.find({ id: { $in: foundCategoryIds } }).lean()
+      : [];
+    const foundCategoryById = new Map(foundCategories.map(category => [category.id, category]));
+
+    // Функция для форматирования расстояния
+    const formatDistance = (meters) => {
+      if (meters < 1000) {
+        return `${Math.round(meters)} м`;
+      }
+      const km = (meters / 1000).toFixed(1);
+      return `${km} км`;
+    };
+
+    // Группируем предложения по товарам и вычисляем расстояния
+    const offersByProduct = new Map();
+
+    for (const offer of offers) {
+      const store = storeById.get(offer.storeId);
+      if (!store || !store.location) continue;
+
+      let coords = null;
+      let distance = null;
+      let distanceFormatted = null;
+
+      // Вычисляем расстояние
+      if (store.locationCoords && store.locationCoords.lat !== null && store.locationCoords.lng !== null) {
+        coords = { lat: store.locationCoords.lat, lon: store.locationCoords.lng };
+      } else {
+        coords = await getCoordinatesFromLink(store.location);
+        if (coords) {
+          await Store.updateOne(
+            { id: store.id },
+            { locationCoords: { lat: coords.lat, lng: coords.lon } }
+          );
+        }
+      }
+
+      if (coords) {
+        distance = calculateDistance(geo.lat, geo.lng, coords.lat, coords.lon);
+        distanceFormatted = formatDistance(Math.round(distance));
+      }
+
+      const mappedOffer = {
+        offerId: offer.id,
+        price: offer.price,
+        currency: offer.currency,
+        isAvailable: offer.isAvailable,
+        quantity: offer.quantity,
+        store: {
+          id: store.id,
+          name: store.name,
+          address: store.address,
+          location: store.location,
+          locationCoords: store.locationCoords || null,
+          distanceMeters: distance ? Math.round(distance) : null,
+          distanceFormatted: distanceFormatted
+        }
+      };
+
+      if (!offersByProduct.has(offer.productId)) {
+        offersByProduct.set(offer.productId, []);
+      }
+      offersByProduct.get(offer.productId).push(mappedOffer);
+    }
+
+    // Формируем результаты: найденные и ненайденные
+    const found = [];
+    const notFoundInStores = [];
+
+    for (const product of products) {
+      const requestedQuantity = productQuantities.get(product.id) || 1;
+      let productOffers = (offersByProduct.get(product.id) || [])
+        .sort((a, b) => {
+          // Сортируем по расстоянию (ближайшие первыми)
+          if (a.store.distanceMeters !== null && b.store.distanceMeters !== null) {
+            return a.store.distanceMeters - b.store.distanceMeters;
+          }
+          if (a.store.distanceMeters !== null) return -1;
+          if (b.store.distanceMeters !== null) return 1;
+          return (a.price || 0) - (b.price || 0);
+        });
+
+      const category = foundCategoryById.get(product.categoryId) || null;
+
+      if (productOffers.length > 0) {
+        // Распределяем запрошенное количество по магазинам
+        let distributedOffers = productOffers;
+        let fulfillmentInfo = null;
+
+        if (requestedQuantity && requestedQuantity > 1) {
+          console.log(`[BATCH_SEARCH] Запрошено ${requestedQuantity} шт. товара "${product.name}"`);
+
+          let remainingQuantity = requestedQuantity;
+          const selectedOffers = [];
+
+          // Проходим по магазинам (уже отсортированы по расстоянию)
+          for (const offer of productOffers) {
+            if (remainingQuantity <= 0) break;
+
+            const availableInStore = offer.quantity || 0;
+            if (availableInStore > 0) {
+              const quantityFromStore = Math.min(remainingQuantity, availableInStore);
+
+              selectedOffers.push({
+                ...offer,
+                allocatedQuantity: quantityFromStore
+              });
+
+              console.log(`[BATCH_SEARCH] Магазин "${offer.store.name}": выделено ${quantityFromStore} из ${availableInStore} шт.`);
+
+              remainingQuantity -= quantityFromStore;
+            }
+          }
+
+          if (selectedOffers.length > 0) {
+            distributedOffers = selectedOffers;
+            fulfillmentInfo = {
+              requestedQuantity: requestedQuantity,
+              fulfilledQuantity: requestedQuantity - remainingQuantity,
+              remainingQuantity: remainingQuantity,
+              storesCount: selectedOffers.length,
+              isFullyFulfilled: remainingQuantity === 0
+            };
+
+            console.log(`[BATCH_SEARCH] Итого: выполнено ${fulfillmentInfo.fulfilledQuantity} из ${requestedQuantity} шт. в ${selectedOffers.length} магазинах`);
+          }
+        }
+
+        // Товар найден в магазинах - находим оригинальное название из запроса
+        const originalNameEntry = Array.from(productSearchResults.entries())
+          .find(([name, item]) => item.product.id === product.id);
+        const originalName = originalNameEntry ? originalNameEntry[0] : product.name;
+
+        found.push({
+          requestedName: originalName, // Оригинальное название из запроса
+          requestedQuantity: requestedQuantity, // Запрошенное количество
+          product: {
+            id: product.id,
+            name: product.name,
+            description: product.description,
+            images: product.images,
+            category: category ? { id: category.id, name: category.name } : null,
+            sku: product.sku,
+            brandName: product.brandName,
+            packageInfo: product.packageInfo,
+            brandId: product.brandId
+          },
+          offers: distributedOffers,
+          totalOffers: distributedOffers.length,
+          fulfillmentInfo: fulfillmentInfo, // Информация о распределении количества
+          nearestStore: distributedOffers.length > 0 ? {
+            name: distributedOffers[0].store.name,
+            distance: distributedOffers[0].store.distanceFormatted,
+            distanceMeters: distributedOffers[0].store.distanceMeters,
+            address: distributedOffers[0].store.address,
+            location: distributedOffers[0].store.location
+          } : null
+        });
+      } else {
+        // Товар не найден в магазинах - находим оригинальное название из запроса
+        const originalNameEntry = Array.from(productSearchResults.entries())
+          .find(([name, item]) => item.product.id === product.id);
+        const originalName = originalNameEntry ? originalNameEntry[0] : product.name;
+        const requestedQuantity = productQuantities.get(product.id) || 1;
+
+        notFoundInStores.push({
+          productName: originalName,
+          productId: product.id,
+          foundProductName: product.name,
+          requestedQuantity: requestedQuantity,
+          reason: 'Товар не найден в магазинах'
+        });
+      }
+    }
+
+    // Сортируем найденные товары по расстоянию до ближайшего магазина
+    found.sort((a, b) => {
+      const aDist = a.nearestStore?.distanceMeters;
+      const bDist = b.nearestStore?.distanceMeters;
+
+      if (aDist !== null && aDist !== undefined && bDist !== null && bDist !== undefined) {
+        return aDist - bDist;
+      }
+      if (aDist !== null && aDist !== undefined) return -1;
+      if (bDist !== null && bDist !== undefined) return 1;
+      return (b.totalOffers || 0) - (a.totalOffers || 0);
+    });
+
+    // Формируем список ненайденных товаров
+    const notFound = [
+      ...notFoundInCatalog,
+      ...notFoundInStores
+    ];
+
+    res.json({
+      found,
+      notFound
+    });
+  } catch (error) {
+    console.error('Ошибка при поиске списка товаров:', error);
+    res.status(500).json({ error: 'Ошибка при поиске товаров' });
+  }
+}
+
 module.exports = {
   upload,
   createSession,
@@ -2528,6 +2877,7 @@ module.exports = {
   getHistory,
   exportHistory,
   deleteHistory,
-  handleCustomerFAQ
+  handleCustomerFAQ,
+  searchBatchProducts
 };
 
